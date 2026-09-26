@@ -1,0 +1,25 @@
+[project]
+name = "wh-ai"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=1.0.0",
+    "logzero>=1.7.0",
+    "pandas==2.3.3",
+    "pandas-ta>=0.4.71b0; python_version < '3.14'",
+    "plotly>=5.0.0",
+    "pyotp>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "smartapi-python>=1.5.5",
+    "streamlit>=1.37.0",
+    "upstox-python-sdk>=2.30.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wealth_home_ai*"]

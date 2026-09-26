@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.wealth_home_oauth.sqlite3
+.wealth_home_oauth.sqlite3-shm
+.wealth_home_oauth.sqlite3-wal
+.streamlit/secrets.toml

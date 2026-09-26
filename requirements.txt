@@ -1,0 +1,12 @@
+# The official PyPI distribution imports as upstox_client.
+upstox-python-sdk>=2.30.0
+streamlit>=1.37.0
+pandas==2.3.3
+pandas-ta>=0.4.71b0; python_version < "3.14"
+plotly>=5.0.0
+logzero>=1.7.0
+requests>=2.31.0
+google-genai>=1.0.0
+smartapi-python>=1.5.5
+pyotp>=2.9.0
+python-dotenv>=1.0.0
