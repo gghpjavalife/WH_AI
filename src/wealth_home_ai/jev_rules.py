@@ -142,12 +142,12 @@ class JevRuleEngine:
         confidence_passed = [
             candidate
             for candidate in candidates
-            if candidate["Confidence_Score"] >= 90
+            if candidate["Confidence_Score"] >= 70
         ]
         self.audit_trail.append(
             "Rule 1 (Confidence Boundary): "
             f"{len(confidence_passed)} of {len(candidates)} valid target(s) "
-            "passed the 90% minimum."
+            "passed the 70% minimum."
         )
         if not confidence_passed:
             self.audit_trail.append("Evaluation stopped: no high-confidence candidates.")

@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import hashlib
-import io
 import json
-from datetime import datetime, time, timedelta
-from html import escape
+from datetime import datetime, timedelta
 from math import isfinite
-from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import streamlit as st
-from dotenv import load_dotenv
 from google.genai.errors import APIError
 
 from .broker_factory import (
@@ -25,20 +20,36 @@ from .broker_factory import (
     BrokerCapabilityError,
     BrokerFactory,
     BrokerInterface,
+    DhanAdapter,
     MUTUAL_FUND_COLUMNS,
     TICKER_MAP,
+    UpstoxAdapter,
+    ZerodhaAdapter,
 )
 from .jev_rules import JevRuleEngine, SECTOR_BY_TICKER
-from .oauth_state_store import consume_oauth_state, create_oauth_state
+from .features.analysis import render_analysis_panel
+from .features.home import render_home_dashboard
+from .features.operations.debt import render_debt
+from .features.operations.derivatives import render_derivatives
+from .features.operations.equity import render_equity
+from .features.operations.mutual_funds import (
+    render_mutual_funds,
+    validate_mutual_funds,
+)
+from .features.operations.trading import render_trading
+from .features.portfolio import empty_debt_holdings
+from .oauth_state_store import consume_oauth_state_context, create_oauth_state
+from .settings import settings
+from .ui_helpers import broker_connect_button_css, same_tab_link_html
 from .upstox_helper import (
+    LLMProviderError,
     ask_llm_agent,
     send_telegram_alert,
 )
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-
-APP_TITLE = "🏡 Wealth Home: Safe Multi-Broker Portfolio & AI Companion"
+APP_TITLE = settings.app_title
 PORTFOLIO_COLUMNS = ["Ticker", "Qty", "Avg_Price", "LTP"]
+
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -58,6 +69,7 @@ st.session_state.setdefault(
 st.session_state.setdefault(
     "mutual_funds", pd.DataFrame(columns=MUTUAL_FUND_COLUMNS)
 )
+st.session_state.setdefault("debt_holdings", empty_debt_holdings())
 st.session_state.setdefault("mutual_fund_error", None)
 st.session_state.setdefault("mutual_fund_updated_at", None)
 st.session_state.setdefault("mutual_fund_manual_import", False)
@@ -71,15 +83,29 @@ st.session_state.setdefault("alerted_risk_tickers", [])
 st.session_state.setdefault("risk_high_water", {})
 st.session_state.setdefault("risk_alerts", [])
 st.session_state.setdefault("risk_errors", [])
+st.session_state.setdefault("telegram_bot_token", "")
 st.session_state.setdefault("telegram_chat_id", "")
 st.session_state.setdefault("analysis_result", None)
+st.session_state.setdefault("analysis_results", {})
+st.session_state.setdefault("analysis_errors", {})
+st.session_state.setdefault("analysis_price_errors", {})
+st.session_state.setdefault("ai_settings_prompt", "")
+st.session_state.setdefault("llm_provider_settings", {})
 st.session_state.setdefault("planning_budget_inr", None)
 st.session_state.setdefault("analysis_live_prices", {})
 st.session_state.setdefault("analysis_live_prices_updated_at", None)
 st.session_state.setdefault("analysis_price_error", None)
 st.session_state.setdefault("approved_trades", [])
+st.session_state.setdefault("approved_trades_by_scope", {})
 st.session_state.setdefault("audit_trail", [])
+st.session_state.setdefault("audit_trails_by_scope", {})
 st.session_state.setdefault("login_error", None)
+st.session_state.setdefault("pending_broker_name", None)
+st.session_state.setdefault("pending_broker_adapter", None)
+st.session_state.setdefault("pending_login_url", None)
+st.session_state.setdefault("pending_redirect_url", None)
+st.session_state.setdefault("pending_oauth_fingerprint", None)
+st.session_state.setdefault("pending_oauth_expires_at", None)
 
 st.sidebar.title("🏡 Wealth Home AI")
 st.sidebar.caption("Private broker workspace")
@@ -87,25 +113,72 @@ st.sidebar.markdown("---")
 
 
 def _redirect_url() -> str:
-    configured = os.environ.get("UPSTOX_REDIRECT_URI", "").strip()
+    configured = settings.upstox_redirect_uri
     if configured:
         return configured
     current_url = str(st.context.url or "")
     if current_url:
         parts = urlsplit(current_url)
         return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
-    return "http://localhost:8501"
+    return settings.default_redirect_uri
+
+
+def _render_same_tab_link(label: str, url: str) -> None:
+    st.html(same_tab_link_html(label, url))
 
 
 def _is_trading_session() -> bool:
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    return now.weekday() < 5 and time(9, 15) <= now.time() <= time(15, 30)
+    now = datetime.now(ZoneInfo(settings.timezone))
+    return (
+        now.weekday() < 5
+        and settings.trading_session_start
+        <= now.time()
+        <= settings.trading_session_end
+    )
 
 
 def _fetch_market_risk(
     adapter: BrokerInterface, token: str, ticker: str
 ) -> dict[str, float]:
     return adapter.fetch_market_risk(token, ticker)
+
+
+def _render_telegram_controls() -> None:
+    with st.sidebar.expander(
+        "Telegram notifications", icon=":material/notifications:"
+    ):
+        st.caption(
+            "Bot credentials stay in this browser session and are not saved to "
+            "server configuration."
+        )
+        st.text_input(
+            "Telegram bot token",
+            type="password",
+            key="telegram_bot_token",
+            help="Create or manage a bot with BotFather. Do not share its token.",
+        )
+        st.text_input(
+            "Private Telegram chat ID",
+            key="telegram_chat_id",
+            help="The bot must be started by the recipient before it can send messages.",
+        )
+        effective_bot_token = str(st.session_state.telegram_bot_token).strip()
+        effective_chat_id = str(st.session_state.telegram_chat_id).strip()
+        if st.button(
+            "Send test notification",
+            key="telegram_test_notification",
+            disabled=not (effective_bot_token and effective_chat_id),
+        ):
+            try:
+                send_telegram_alert(
+                    "Wealth Home AI Telegram notifications are connected.",
+                    chat_id=effective_chat_id,
+                    bot_token=effective_bot_token,
+                )
+            except (requests.RequestException, RuntimeError):
+                st.error("Telegram could not deliver the test notification.")
+            else:
+                st.success("Test notification sent.")
 
 
 def _clear_sensitive_angel_inputs() -> None:
@@ -119,7 +192,111 @@ def _clear_sensitive_angel_inputs() -> None:
             del st.session_state[key]
 
 
+def _prepare_oauth_login(
+    broker_name: str, api_key: str, api_secret: str
+) -> tuple[str | None, str | None]:
+    redirect_url = _redirect_url()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            [broker_name, api_key, api_secret, redirect_url],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        st.session_state.pending_broker_name == broker_name
+        and st.session_state.get("pending_oauth_fingerprint") == fingerprint
+        and st.session_state.pending_login_url
+        and st.session_state.get("pending_oauth_expires_at", 0)
+        > datetime.now().timestamp()
+    ):
+        return st.session_state.pending_login_url, None
+
+    adapter = BrokerFactory.create_adapter(
+        broker_name, api_key=api_key, api_secret=api_secret
+    )
+    try:
+        login_url = adapter.get_login_url(redirect_url)
+        oauth_state = getattr(adapter, "oauth_state", None)
+        if not oauth_state:
+            raise ValueError(f"{broker_name} did not create an OAuth state.")
+        create_oauth_state(
+            oauth_state,
+            {
+                "broker": broker_name,
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "redirect_url": redirect_url,
+            },
+        )
+    except (BrokerAPIError, sqlite3.Error, OSError, ValueError):
+        st.session_state.pending_broker_name = None
+        st.session_state.pending_broker_adapter = None
+        st.session_state.pending_login_url = None
+        st.session_state.pending_redirect_url = None
+        st.session_state.pending_oauth_fingerprint = None
+        st.session_state.pending_oauth_expires_at = None
+        return None, (
+            f"Could not start {broker_name} sign-in. Check the app credentials, "
+            "registered callback URL, and OAuth state storage."
+        )
+
+    st.session_state.pending_broker_name = broker_name
+    st.session_state.pending_broker_adapter = adapter
+    st.session_state.pending_login_url = login_url
+    st.session_state.pending_redirect_url = redirect_url
+    st.session_state.pending_oauth_fingerprint = fingerprint
+    st.session_state.pending_oauth_expires_at = (
+        datetime.now().timestamp() + settings.oauth_state_ttl_seconds
+    )
+    return login_url, None
+
+
+def _clear_pending_login() -> None:
+    for key in (
+        "pending_broker_name",
+        "pending_broker_adapter",
+        "pending_login_url",
+        "pending_redirect_url",
+        "pending_oauth_fingerprint",
+        "pending_oauth_expires_at",
+    ):
+        st.session_state[key] = None
+
+
+def _clear_broker_login_inputs() -> None:
+    for key in (
+        "upstox_api_key",
+        "upstox_api_secret",
+        "angel_api_key",
+        "angel_client_id",
+        "angel_password",
+        "angel_totp_secret",
+        "zerodha_api_key",
+        "zerodha_api_secret",
+        "dhan_client_id",
+        "dhan_api_key",
+        "dhan_api_secret",
+    ):
+        st.session_state.pop(key, None)
+
+
 def _authenticate_angel_one() -> None:
+    required_fields = {
+        "angel_api_key": "API key",
+        "angel_client_id": "Client ID",
+        "angel_password": "password",
+        "angel_totp_secret": "TOTP secret",
+    }
+    missing_fields = [
+        label
+        for key, label in required_fields.items()
+        if not str(st.session_state.get(key, "")).strip()
+    ]
+    if missing_fields:
+        st.session_state.login_error = (
+            "Enter the required Angel One details: " + ", ".join(missing_fields) + "."
+        )
+        return
     adapter = BrokerFactory.create_adapter(
         "Angel One",
         api_key=st.session_state.get("angel_api_key") or None,
@@ -150,7 +327,83 @@ def _authenticate_angel_one() -> None:
         _clear_sensitive_angel_inputs()
 
 
-def _show_login() -> None:
+def _start_dhan_login() -> None:
+    client_id = str(st.session_state.get("dhan_client_id", "")).strip()
+    api_key = str(st.session_state.get("dhan_api_key", "")).strip()
+    api_secret = str(st.session_state.get("dhan_api_secret", "")).strip()
+    if not client_id or not api_key or not api_secret:
+        missing = []
+        if not client_id:
+            missing.append("Client ID")
+        if not api_key:
+            missing.append("API key")
+        if not api_secret:
+            missing.append("API secret")
+        st.session_state.login_error = "Enter the Dhan " + ", ".join(missing) + "."
+        return
+
+    adapter = DhanAdapter(
+        api_key=api_key, api_secret=api_secret, client_id=client_id
+    )
+    _clear_pending_login()
+    try:
+        redirect_url = _redirect_url()
+        login_url = adapter.get_login_url(redirect_url)
+    except (BrokerAPIError, requests.RequestException, ValueError):
+        st.session_state.login_error = (
+            "Could not start Dhan sign-in. Check your Dhan API credentials, "
+            "Client ID, and registered callback URL."
+        )
+    else:
+        st.session_state.pending_broker_name = "Dhan"
+        st.session_state.pending_broker_adapter = adapter
+        st.session_state.pending_login_url = login_url
+        st.session_state.pending_redirect_url = redirect_url
+        st.session_state.login_error = None
+    finally:
+        st.session_state.pop("dhan_api_secret", None)
+        st.session_state.pop("dhan_api_key", None)
+        st.session_state.pop("dhan_client_id", None)
+
+
+def _complete_broker_login(
+    broker_name: str, adapter: BrokerInterface, token: str
+) -> None:
+    st.session_state.token = token
+    st.session_state.broker_state = adapter
+    st.session_state.broker_name = broker_name
+    st.session_state.last_sync = None
+    st.session_state.last_sync_attempt = None
+    st.session_state.alerted_risk_tickers = []
+    st.session_state.risk_high_water = {}
+    st.session_state.analysis_result = None
+    st.session_state.analysis_results = {}
+    st.session_state.analysis_errors = {}
+    st.session_state.approved_trades = []
+    st.session_state.approved_trades_by_scope = {}
+    st.session_state.audit_trail = []
+    st.session_state.audit_trails_by_scope = {}
+    st.session_state.portfolio = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+    st.session_state.equity_holdings = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+    st.session_state.mutual_funds = pd.DataFrame(columns=MUTUAL_FUND_COLUMNS)
+    st.session_state.balance = 0.0
+    st.session_state.mutual_fund_manual_import = broker_name in {
+        "Angel One",
+        "Zerodha",
+        "Dhan",
+    }
+    st.session_state.mutual_fund_error = None
+    st.session_state.pending_broker_name = None
+    st.session_state.pending_broker_adapter = None
+    st.session_state.pending_login_url = None
+    st.session_state.pending_redirect_url = None
+    st.session_state.pending_oauth_fingerprint = None
+    st.session_state.pending_oauth_expires_at = None
+    st.session_state.login_error = None
+    _clear_broker_login_inputs()
+
+
+def _show_login_legacy() -> None:
     st.title(APP_TITLE)
     st.subheader("Onboarding portal")
     st.info(
@@ -158,9 +411,14 @@ def _show_login() -> None:
         "Broker/API availability, hosting quotas, and exchange or broker charges "
         "depend on their providers."
     )
+    st.caption(
+        "Enter credentials for the selected broker. Broker passwords, OTP/TOTP "
+        "secrets, and API keys are used only for this sign-in and are not saved "
+        "to server configuration."
+    )
     broker_choice = st.selectbox(
         "Select broker",
-        ["Upstox", "Angel One"],
+        ["Upstox", "Angel One", "Zerodha", "Dhan"],
         key="selected_broker",
     )
 
@@ -169,44 +427,68 @@ def _show_login() -> None:
         st.session_state.login_error = None
 
     if broker_choice == "Upstox":
-        adapter = BrokerFactory.create_adapter("Upstox")
-        if not adapter.configured:
-            st.warning(
-                "Configure UPSTOX_API_KEY and UPSTOX_API_SECRET in the server "
-                "environment before connecting."
-            )
-        else:
-            redirect_url = _redirect_url()
-            st.caption(f"Registered callback URL: {redirect_url}")
-            if st.button("Connect with Upstox", type="primary"):
-                try:
-                    login_url = adapter.get_login_url(redirect_url)
-                except ValueError as exc:
-                    st.error(str(exc))
-                else:
-                    try:
-                        if adapter.oauth_state is None:
-                            raise ValueError("Upstox did not create an OAuth state.")
-                        create_oauth_state(adapter.oauth_state)
-                    except (sqlite3.Error, OSError, ValueError):
-                        st.error(
-                            "Could not safely start Upstox sign-in. Check that the "
-                            "application can write its local OAuth state database."
-                        )
-                    else:
-                        st.html(
-                            "<a href=\""
-                            + escape(login_url, quote=True)
-                            + "\" target=\"_self\" rel=\"noopener noreferrer\">"
-                            "Continue to Upstox sign-in</a>"
-                        )
+        redirect_url = _redirect_url()
+        st.caption(f"Registered callback URL: {redirect_url}")
+        st.caption(
+            "Upstox API key and secret identify the developer app, not your personal "
+            "Upstox login. Each user authorizes their account on Upstox."
+        )
+        st.caption(
+            "To switch Upstox accounts, sign out of the current app session, then "
+            "authorize the other account on Upstox. If Upstox keeps the previous "
+            "login, sign out there or use a private browser window."
+        )
 
-            authorization_code = st.query_params.get("code")
-            oauth_error = st.query_params.get("error")
-            if oauth_error:
-                st.error("Upstox sign-in was cancelled or rejected.")
+        authorization_code = st.query_params.get("code")
+        oauth_error = st.query_params.get("error")
+        if oauth_error:
+            st.error("Upstox sign-in was cancelled or rejected.")
+            st.session_state.pending_broker_name = None
+            st.session_state.pending_broker_adapter = None
+            st.session_state.pending_login_url = None
+            st.session_state.pending_redirect_url = None
+            st.query_params.clear()
+        if (
+            st.session_state.pending_broker_name == "Upstox"
+            and st.session_state.pending_login_url
+        ):
+            st.html(
+                "<a href=\""
+                + escape(st.session_state.pending_login_url, quote=True)
+                + "\" target=\"_self\" rel=\"noopener noreferrer\">"
+                "Open Upstox sign-in</a>"
+            )
+        if authorization_code and not oauth_error:
+            pending_adapter = st.session_state.pending_broker_adapter
+            if (
+                st.session_state.pending_broker_name != "Upstox"
+                or not isinstance(pending_adapter, UpstoxAdapter)
+            ):
+                returned_state = st.query_params.get("state")
+                try:
+                    state_is_valid = consume_oauth_state(returned_state)
+                except (sqlite3.Error, OSError, ValueError):
+                    st.error(
+                        "Could not verify this Upstox callback. Start a new sign-in."
+                    )
+                    st.query_params.clear()
+                    return
+                if not state_is_valid:
+                    st.error(
+                        "This Upstox callback expired or was already used. Start a "
+                        "new sign-in."
+                    )
+                    st.query_params.clear()
+                    return
+                st.session_state.upstox_recovery_code = str(authorization_code)
+                st.session_state.upstox_recovery_redirect_url = redirect_url
+                st.info(
+                    "Upstox returned to a fresh browser session, so the temporary "
+                    "sign-in context was not available. Re-enter the same developer "
+                    "app credentials to finish this one-time authorization."
+                )
                 st.query_params.clear()
-            if authorization_code and not oauth_error:
+            else:
                 returned_state = st.query_params.get("state")
                 try:
                     state_is_valid = consume_oauth_state(returned_state)
@@ -215,6 +497,10 @@ def _show_login() -> None:
                         "Could not verify the Upstox callback because the local "
                         "OAuth state store is unavailable."
                     )
+                    st.session_state.pending_broker_name = None
+                    st.session_state.pending_broker_adapter = None
+                    st.session_state.pending_login_url = None
+                    st.session_state.pending_redirect_url = None
                     st.query_params.clear()
                 else:
                     if not state_is_valid:
@@ -223,42 +509,86 @@ def _show_login() -> None:
                             "verification may have expired or already been used. "
                             "Reconnect and complete sign-in within 10 minutes."
                         )
+                        st.session_state.pending_broker_name = None
+                        st.session_state.pending_broker_adapter = None
+                        st.session_state.pending_login_url = None
+                        st.session_state.pending_redirect_url = None
                         st.query_params.clear()
                     else:
                         try:
-                            token = adapter.authenticate(
-                                str(authorization_code), redirect_url
+                            token = pending_adapter.authenticate(
+                                str(authorization_code),
+                                str(
+                                    st.session_state.pending_redirect_url
+                                    or redirect_url
+                                ),
                             )
-                        except (BrokerAPIError, requests.RequestException, ValueError):
+                        except (
+                            BrokerAPIError,
+                            requests.RequestException,
+                            ValueError,
+                        ):
                             st.error(
                                 "Upstox authentication failed. Verify the registered "
                                 "callback URL and try again."
                             )
+                            st.session_state.pending_broker_name = None
+                            st.session_state.pending_broker_adapter = None
+                            st.session_state.pending_login_url = None
+                            st.session_state.pending_redirect_url = None
                             st.query_params.clear()
                         else:
-                            st.session_state.token = token
-                            st.session_state.broker_state = adapter
-                            st.session_state.broker_name = "Upstox"
-                            st.session_state.last_sync = None
-                            st.session_state.last_sync_attempt = None
-                            st.session_state.alerted_risk_tickers = []
-                            st.session_state.risk_high_water = {}
-                            st.session_state.analysis_result = None
-                            st.session_state.approved_trades = []
+                            _complete_broker_login("Upstox", pending_adapter, token)
                             st.query_params.clear()
                             st.rerun()
 
-    else:
+        if st.session_state.get("upstox_recovery_code"):
+            with st.form("upstox_recovery_login"):
+                st.text_input(
+                    "Upstox API key",
+                    key="upstox_api_key",
+                    type="password",
+                )
+                st.text_input(
+                    "Upstox API secret",
+                    key="upstox_api_secret",
+                    type="password",
+                )
+                st.form_submit_button(
+                    "Finish Upstox sign-in",
+                    type="primary",
+                    on_click=_complete_upstox_recovery,
+                )
+        else:
+            with st.form("upstox_login"):
+                st.text_input(
+                    "Upstox API key",
+                    key="upstox_api_key",
+                    type="password",
+                )
+                st.text_input(
+                    "Upstox API secret",
+                    key="upstox_api_secret",
+                    type="password",
+                )
+                st.form_submit_button(
+                    "Connect with Upstox",
+                    type="primary",
+                    on_click=_start_upstox_login,
+                )
+
+    elif broker_choice == "Angel One":
         st.caption(
             "Angel One uses programmatic SmartAPI sign-in. Your client ID, password, "
-            "and TOTP secret are cleared after login; the API key stays in this session."
+            "and TOTP secret are cleared after login."
         )
-        api_key_from_environment = os.environ.get("ANGEL_API_KEY", "").strip()
-        if api_key_from_environment:
-            st.caption("Angel One API key loaded from server environment.")
+        st.caption("All four fields are required to connect.")
         with st.form("angel_one_login"):
-            if not api_key_from_environment:
-                st.text_input("Angel One API key", type="password", key="angel_api_key")
+            st.text_input(
+                "Angel One API key",
+                type="password",
+                key="angel_api_key",
+            )
             st.text_input("Client ID", key="angel_client_id")
             st.text_input("Password", type="password", key="angel_password")
             st.text_input(
@@ -272,94 +602,462 @@ def _show_login() -> None:
                 type="primary",
                 on_click=_authenticate_angel_one,
             )
-
-
-def _position_pnl(portfolio: pd.DataFrame) -> tuple[float, float]:
-    if portfolio.empty:
-        return 0.0, 0.0
-    quantity = pd.to_numeric(portfolio["Qty"], errors="coerce").fillna(0.0)
-    average = pd.to_numeric(portfolio["Avg_Price"], errors="coerce").fillna(0.0)
-    ltp = pd.to_numeric(portfolio["LTP"], errors="coerce").fillna(0.0)
-    total_pnl = float((quantity * (ltp - average)).sum())
-    invested = float((quantity.abs() * average).sum())
-    return total_pnl, (total_pnl / invested * 100 if invested else 0.0)
-
-
-def _mutual_fund_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    if not set(("Fund", "Units", "Avg_NAV", "Latest_NAV")).issubset(frame.columns):
-        raise ValueError(
-            "The CSV must include Fund, Units, Avg_NAV, and Latest_NAV columns."
+    elif broker_choice == "Zerodha":
+        redirect_url = _redirect_url()
+        st.caption(f"Registered callback URL: {redirect_url}")
+        st.caption(
+            "Enter the API key and secret from your Kite Connect developer app. "
+            "Both are required; the secret is cleared after sign-in starts."
         )
-    normalized = frame.copy()
-    for column in ("Units", "Avg_NAV", "Latest_NAV"):
-        normalized[column] = pd.to_numeric(normalized[column], errors="raise")
-    if normalized["Fund"].isna().any() or normalized["Fund"].astype(str).str.strip().eq("").any():
-        raise ValueError("Every mutual-fund row must include a fund name.")
+        request_token = st.query_params.get("request_token")
+        if st.query_params.get("status") == "error":
+            st.error("Zerodha sign-in was cancelled or rejected.")
+            st.session_state.pending_broker_adapter = None
+            st.session_state.pending_broker_name = None
+            st.session_state.pending_login_url = None
+            st.query_params.clear()
+        if request_token:
+            pending_adapter = st.session_state.pending_broker_adapter
+            returned_state = st.query_params.get("state")
+            if (
+                st.session_state.pending_broker_name != "Zerodha"
+                or not isinstance(pending_adapter, ZerodhaAdapter)
+            ):
+                st.error(
+                    "This Zerodha callback has no matching sign-in in this browser "
+                    "session. Start a new connection."
+                )
+                st.query_params.clear()
+            else:
+                try:
+                    valid_state = consume_oauth_state(returned_state)
+                    if not valid_state:
+                        raise ValueError("Zerodha OAuth state did not match.")
+                    token = pending_adapter.authenticate(
+                        str(request_token),
+                        str(st.session_state.pending_redirect_url or redirect_url),
+                    )
+                except (
+                    BrokerAPIError,
+                    requests.RequestException,
+                    sqlite3.Error,
+                    OSError,
+                    ValueError,
+                ):
+                    st.error(
+                        "Zerodha sign-in failed or expired. Confirm the callback URL "
+                        "and credentials, then start a new connection."
+                    )
+                    st.session_state.pending_broker_adapter = None
+                    st.session_state.pending_broker_name = None
+                    st.session_state.pending_login_url = None
+                    st.query_params.clear()
+                else:
+                    _complete_broker_login("Zerodha", pending_adapter, token)
+                    st.query_params.clear()
+                    st.rerun()
+        with st.form("zerodha_login"):
+            st.text_input(
+                "Zerodha API key",
+                key="zerodha_api_key",
+                type="password",
+            )
+            st.text_input(
+                "Zerodha API secret",
+                key="zerodha_api_secret",
+                type="password",
+            )
+            st.form_submit_button(
+                "Continue to Zerodha",
+                type="primary",
+                on_click=_start_zerodha_login,
+            )
+        if (
+            st.session_state.pending_broker_name == "Zerodha"
+            and st.session_state.pending_login_url
+        ):
+            st.html(
+                "<a href=\""
+                + escape(st.session_state.pending_login_url, quote=True)
+                + "\" target=\"_self\" rel=\"noopener noreferrer\">"
+                "Open Zerodha sign-in</a>"
+            )
+    else:
+        st.caption(
+            "Dhan credentials must belong to the same account. Enter the Client ID, "
+            "API key, and API secret for the account you want to connect."
+        )
+        st.caption(
+            "Dhan may require you to subscribe to its Data APIs for live quotes and "
+            "allow-list a static server IP before API orders can be placed."
+        )
+        redirect_url = _redirect_url()
+        st.caption(
+            "Register this exact callback URL with the Dhan API app: "
+            + redirect_url
+        )
+        token_id = st.query_params.get("tokenId")
+        if st.query_params.get("error"):
+            st.error("Dhan sign-in was cancelled or rejected.")
+            st.session_state.pending_broker_adapter = None
+            st.session_state.pending_broker_name = None
+            st.session_state.pending_login_url = None
+            st.query_params.clear()
+        if token_id:
+            pending_adapter = st.session_state.pending_broker_adapter
+            if (
+                st.session_state.pending_broker_name != "Dhan"
+                or not isinstance(pending_adapter, DhanAdapter)
+            ):
+                st.error(
+                    "This Dhan callback has no matching authorization in this "
+                    "browser session. Start a new connection."
+                )
+                st.query_params.clear()
+            else:
+                try:
+                    token = pending_adapter.authenticate(
+                        str(token_id),
+                        str(st.session_state.pending_redirect_url or redirect_url),
+                    )
+                except (BrokerAPIError, requests.RequestException, ValueError):
+                    st.error(
+                        "Dhan sign-in failed or expired. Confirm your registered "
+                        "callback URL and start a new connection."
+                    )
+                    st.session_state.pending_broker_adapter = None
+                    st.session_state.pending_broker_name = None
+                    st.session_state.pending_login_url = None
+                    st.query_params.clear()
+                else:
+                    _complete_broker_login("Dhan", pending_adapter, token)
+                    st.query_params.clear()
+                    st.rerun()
+        with st.form("dhan_login"):
+            st.text_input("Dhan Client ID", key="dhan_client_id")
+            st.text_input(
+                "Dhan API key",
+                key="dhan_api_key",
+                type="password",
+            )
+            st.text_input(
+                "Dhan API secret",
+                key="dhan_api_secret",
+                type="password",
+            )
+            st.form_submit_button(
+                "Continue to Dhan",
+                type="primary",
+                on_click=_start_dhan_login,
+            )
+        if (
+            st.session_state.pending_broker_name == "Dhan"
+            and st.session_state.pending_login_url
+        ):
+            st.html(
+                "<a href=\""
+                + escape(st.session_state.pending_login_url, quote=True)
+                + "\" target=\"_self\" rel=\"noopener noreferrer\">"
+                "Open Dhan sign-in</a>"
+            )
+
+
+def _exchange_oauth_callback(
+    broker_name: str, code: str, returned_state: str | None
+) -> tuple[BrokerInterface, str]:
+    context = consume_oauth_state_context(returned_state)
     if (
-        not normalized[["Units", "Avg_NAV", "Latest_NAV"]]
-        .map(lambda value: pd.notna(value) and value < float("inf") and value > float("-inf"))
-        .all()
-        .all()
-        or normalized["Units"].lt(0).any()
-        or normalized["Avg_NAV"].lt(0).any()
-        or normalized["Latest_NAV"].le(0).any()
+        context is None
+        or context.get("broker") != broker_name
+        or not all(
+            isinstance(context.get(field), str) and context[field]
+            for field in ("api_key", "api_secret", "redirect_url")
+        )
     ):
-        raise ValueError("The CSV contains invalid units, cost NAV, or latest NAV.")
-    normalized["Folio"] = (
-        normalized["Folio"].fillna("").astype(str)
-        if "Folio" in normalized
-        else ""
+        raise ValueError(f"{broker_name} callback context is missing or expired.")
+    adapter = BrokerFactory.create_adapter(
+        broker_name,
+        api_key=context["api_key"],
+        api_secret=context["api_secret"],
     )
-    normalized["NAV_Date"] = (
-        normalized["NAV_Date"].fillna("").astype(str)
-        if "NAV_Date" in normalized
-        else ""
+    token = adapter.authenticate(code, context["redirect_url"])
+    return adapter, token
+
+
+def _show_login() -> None:
+    st.title(APP_TITLE)
+    st.html(broker_connect_button_css())
+    st.subheader("Onboarding portal")
+    st.info(
+        "AI suggestions are informational only and are not investment advice. "
+        "Broker/API availability, hosting quotas, and exchange or broker charges "
+        "depend on their providers."
     )
-    return normalized[MUTUAL_FUND_COLUMNS]
-
-
-def _decorate_equities(portfolio: pd.DataFrame) -> pd.DataFrame:
-    if portfolio.empty:
-        return portfolio.copy()
-    display = portfolio.copy()
-    display["Investment"] = display["Qty"].abs() * display["Avg_Price"]
-    display["Market_Value"] = display["Qty"] * display["LTP"]
-    display["P&L"] = display["Qty"] * (display["LTP"] - display["Avg_Price"])
-    display["Returns_%"] = display.apply(
-        lambda row: row["P&L"] / row["Investment"] * 100
-        if row["Investment"]
-        else 0.0,
-        axis=1,
+    st.caption(
+        "Broker credentials are used only for sign-in and are not saved to server "
+        "configuration."
     )
-    return display
+
+    if st.query_params.get("request_token") or st.query_params.get("status") == "error":
+        callback_broker = "Zerodha"
+    elif st.query_params.get("tokenId"):
+        callback_broker = "Dhan"
+    elif st.query_params.get("code") or (
+        st.query_params.get("error") and st.query_params.get("state")
+    ):
+        callback_broker = "Upstox"
+    elif st.query_params.get("error"):
+        callback_broker = "Dhan"
+    else:
+        callback_broker = None
+
+    if callback_broker:
+        broker_choice = callback_broker
+        st.caption(f"Completing {broker_choice} sign-in…")
+    else:
+        broker_choice = st.selectbox(
+            "Select broker",
+            ["Upstox", "Angel One", "Zerodha", "Dhan"],
+            key="selected_broker",
+        )
+
+    if st.session_state.login_error:
+        st.error(st.session_state.login_error)
+        st.session_state.login_error = None
+
+    if broker_choice in {"Upstox", "Zerodha"}:
+        redirect_url = _redirect_url()
+        if not callback_broker:
+            st.caption(f"Registered callback URL: {redirect_url}")
+        callback_error = st.query_params.get("error")
+        if callback_error or (
+            broker_choice == "Zerodha"
+            and st.query_params.get("status") == "error"
+        ):
+            st.error(f"{broker_choice} sign-in was cancelled or rejected.")
+            _clear_pending_login()
+            _clear_broker_login_inputs()
+            st.query_params.clear()
+        elif broker_choice == "Upstox" and st.query_params.get("code"):
+            try:
+                adapter, token = _exchange_oauth_callback(
+                    "Upstox",
+                    str(st.query_params["code"]),
+                    st.query_params.get("state"),
+                )
+            except (
+                BrokerAPIError,
+                requests.RequestException,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+            ):
+                st.error(
+                    "Upstox sign-in failed or expired. Check the registered callback "
+                    "URL and app credentials, then start a new connection."
+                )
+                _clear_pending_login()
+                _clear_broker_login_inputs()
+                st.query_params.clear()
+            else:
+                _complete_broker_login("Upstox", adapter, token)
+                st.query_params.clear()
+                st.rerun()
+        elif broker_choice == "Zerodha" and st.query_params.get("request_token"):
+            try:
+                adapter, token = _exchange_oauth_callback(
+                    "Zerodha",
+                    str(st.query_params["request_token"]),
+                    st.query_params.get("state"),
+                )
+            except (
+                BrokerAPIError,
+                requests.RequestException,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+            ):
+                st.error(
+                    "Zerodha sign-in failed or expired. Confirm the callback URL and "
+                    "credentials, then start a new connection."
+                )
+                _clear_pending_login()
+                _clear_broker_login_inputs()
+                st.query_params.clear()
+            else:
+                _complete_broker_login("Zerodha", adapter, token)
+                st.query_params.clear()
+                st.rerun()
+        elif not callback_broker:
+            if broker_choice == "Upstox":
+                api_key_key, api_secret_key = "upstox_api_key", "upstox_api_secret"
+                button_label = "Connect with Upstox"
+            else:
+                api_key_key, api_secret_key = (
+                    "zerodha_api_key",
+                    "zerodha_api_secret",
+                )
+                button_label = "Connect with Zerodha"
+            api_key = str(st.session_state.get(api_key_key, "")).strip()
+            api_secret = str(st.session_state.get(api_secret_key, "")).strip()
+            st.text_input(
+                f"{broker_choice} API key",
+                key=api_key_key,
+                type="password",
+                live=True,
+            )
+            st.text_input(
+                f"{broker_choice} API secret",
+                key=api_secret_key,
+                type="password",
+                live=True,
+            )
+            login_url = None
+            login_error = None
+            if api_key and api_secret:
+                login_url, login_error = _prepare_oauth_login(
+                    broker_choice, api_key, api_secret
+                )
+            if login_error:
+                st.error(login_error)
+            if api_key and api_secret and login_url:
+                _render_same_tab_link(button_label, login_url)
+            else:
+                st.button(
+                    button_label,
+                    key=f"connect_{broker_choice.lower()}",
+                    type="primary",
+                    disabled=True,
+                )
+
+    elif broker_choice == "Angel One":
+        if not callback_broker:
+            st.caption(
+                "Angel One requires its API key, Client ID, password, and TOTP secret."
+            )
+            st.text_input(
+                "Angel One API key",
+                type="password",
+                key="angel_api_key",
+                live=True,
+            )
+            st.text_input("Client ID", key="angel_client_id", live=True)
+            st.text_input(
+                "Password",
+                type="password",
+                key="angel_password",
+                live=True,
+            )
+            st.text_input(
+                "TOTP secret",
+                type="password",
+                key="angel_totp_secret",
+                help="The secret used to generate your current one-time password.",
+                live=True,
+            )
+            required = (
+                "angel_api_key",
+                "angel_client_id",
+                "angel_password",
+                "angel_totp_secret",
+            )
+            st.button(
+                "Connect with Angel One →",
+                key="connect_angel_one",
+                type="primary",
+                on_click=_authenticate_angel_one,
+                disabled=not all(
+                    str(st.session_state.get(key, "")).strip() for key in required
+                ),
+            )
+
+    else:
+        if not callback_broker:
+            st.caption(
+                "Dhan credentials must belong to the account you want to connect."
+            )
+            st.caption(
+                "Register this exact callback URL with the Dhan API app: "
+                + _redirect_url()
+            )
+            st.text_input("Dhan Client ID", key="dhan_client_id", live=True)
+            st.text_input(
+                "Dhan API key",
+                key="dhan_api_key",
+                type="password",
+                live=True,
+            )
+            st.text_input(
+                "Dhan API secret",
+                key="dhan_api_secret",
+                type="password",
+                live=True,
+            )
+            required = ("dhan_client_id", "dhan_api_key", "dhan_api_secret")
+            st.button(
+                "Connect with Dhan →",
+                key="connect_dhan",
+                type="primary",
+                on_click=_start_dhan_login,
+                disabled=not all(
+                    str(st.session_state.get(key, "")).strip() for key in required
+                ),
+            )
+            if (
+                st.session_state.pending_broker_name == "Dhan"
+                and st.session_state.pending_login_url
+            ):
+                _render_same_tab_link(
+                    "Open Dhan sign-in", st.session_state.pending_login_url
+                )
+        elif st.query_params.get("error"):
+            st.error("Dhan sign-in was cancelled or rejected.")
+            _clear_pending_login()
+            _clear_broker_login_inputs()
+            st.query_params.clear()
+        elif st.query_params.get("tokenId"):
+            adapter = st.session_state.pending_broker_adapter
+            if (
+                st.session_state.pending_broker_name != "Dhan"
+                or not isinstance(adapter, DhanAdapter)
+            ):
+                st.error(
+                    "This Dhan callback has no matching authorization in this "
+                    "browser session. Start a new connection in the same browser tab."
+                )
+                st.query_params.clear()
+            else:
+                try:
+                    token = adapter.authenticate(
+                        str(st.query_params["tokenId"]),
+                        str(st.session_state.pending_redirect_url or _redirect_url()),
+                    )
+                except (BrokerAPIError, requests.RequestException, ValueError):
+                    st.error(
+                        "Dhan sign-in failed or expired. Confirm your callback URL "
+                        "and start a new connection."
+                    )
+                    _clear_pending_login()
+                    _clear_broker_login_inputs()
+                    st.query_params.clear()
+                else:
+                    _complete_broker_login("Dhan", adapter, token)
+                    st.query_params.clear()
+                    st.rerun()
 
 
-def _decorate_mutual_funds(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return frame.copy()
-    display = frame.copy()
-    display["Invested_Value"] = display["Units"] * display["Avg_NAV"]
-    display["Current_Value"] = display["Units"] * display["Latest_NAV"]
-    display["P&L"] = display["Current_Value"] - display["Invested_Value"]
-    display["Returns_%"] = display.apply(
-        lambda row: row["P&L"] / row["Invested_Value"] * 100
-        if row["Invested_Value"]
-        else 0.0,
-        axis=1,
-    )
-    return display
-
-
-@st.fragment(run_every=300)
+@st.fragment(run_every=settings.dashboard_poll_seconds)
 def polling_sequence() -> None:
     token = st.session_state.token
     adapter = st.session_state.broker_state
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    now = datetime.now(ZoneInfo(settings.timezone))
     should_sync = token and adapter and (
         st.session_state.last_sync_attempt is None
         or (
             _is_trading_session()
-            and now - st.session_state.last_sync_attempt >= timedelta(minutes=5)
+            and now - st.session_state.last_sync_attempt >= timedelta(
+                minutes=settings.sync_interval_minutes
+            )
         )
     )
     if should_sync:
@@ -374,7 +1072,7 @@ def polling_sequence() -> None:
             st.session_state.balance = balance
             st.session_state.portfolio = portfolio
             st.session_state.equity_holdings = equity_holdings
-            st.session_state.last_sync = datetime.now(ZoneInfo("Asia/Kolkata"))
+            st.session_state.last_sync = datetime.now(ZoneInfo(settings.timezone))
             st.session_state.sync_failed = False
             try:
                 mutual_funds = adapter.fetch_mutual_fund_holdings(token)
@@ -392,7 +1090,7 @@ def polling_sequence() -> None:
                     "Mutual-fund holdings are temporarily unavailable from this broker."
                 )
             else:
-                broker_funds = _mutual_fund_frame(mutual_funds)
+                broker_funds = validate_mutual_funds(mutual_funds)
                 if broker_funds.empty:
                     st.session_state.mutual_fund_error = (
                         "The broker returned no mutual-fund rows. You can still add "
@@ -404,71 +1102,19 @@ def polling_sequence() -> None:
                     st.session_state.mutual_fund_error = None
                     st.session_state.mutual_fund_manual_import = False
                     st.session_state.mutual_fund_updated_at = datetime.now(
-                        ZoneInfo("Asia/Kolkata")
+                        ZoneInfo(settings.timezone)
                     )
 
     balance = float(st.session_state.balance)
     portfolio = st.session_state.portfolio
     equity_holdings = st.session_state.equity_holdings
     mutual_funds = st.session_state.mutual_funds
-    holdings_pnl, holdings_return = _position_pnl(equity_holdings)
-    positions_pnl, positions_return = _position_pnl(portfolio)
-    mutual_funds_display = _decorate_mutual_funds(mutual_funds)
-    mutual_funds_pnl = (
-        float(mutual_funds_display["P&L"].sum())
-        if not mutual_funds_display.empty
-        else 0.0
-    )
-    total_pnl = holdings_pnl + positions_pnl + mutual_funds_pnl
-    equity_market_value = (
-        float((equity_holdings["Qty"] * equity_holdings["LTP"]).sum())
-        if not equity_holdings.empty
-        else 0.0
-    )
-    if not portfolio.empty:
-        equity_market_value += float((portfolio["Qty"] * portfolio["LTP"]).sum())
-    mutual_funds_market_value = (
-        float(mutual_funds_display["Current_Value"].sum())
-        if not mutual_funds_display.empty
-        else 0.0
-    )
-    total_market_value = equity_market_value + mutual_funds_market_value
-    invested_value = (
-        float((equity_holdings["Qty"].abs() * equity_holdings["Avg_Price"]).sum())
-        if not equity_holdings.empty
-        else 0.0
-    )
-    if not portfolio.empty:
-        invested_value += float(
-            (portfolio["Qty"].abs() * portfolio["Avg_Price"]).sum()
-        )
-    if not mutual_funds_display.empty:
-        invested_value += float(mutual_funds_display["Invested_Value"].sum())
-    total_return = total_pnl / invested_value * 100 if invested_value else 0.0
-    (
-        metric_balance,
-        metric_market_value,
-        metric_pnl,
-        metric_holdings,
-        metric_positions,
-        metric_mfs,
-    ) = st.columns(6)
-    metric_balance.metric("Available balance", f"₹{balance:,.2f}")
-    metric_market_value.metric("Invested market value", f"₹{total_market_value:,.2f}")
-    metric_pnl.metric(
-        "Live portfolio P&L",
-        f"₹{total_pnl:,.2f}",
-        delta=f"{total_return:.2f}% absolute return",
-    )
-    metric_holdings.metric("Equity holdings", len(equity_holdings))
-    metric_positions.metric("Trading positions", len(portfolio))
-    metric_mfs.metric("Mutual funds", len(mutual_funds))
-
-    st.caption(
-        f"Equity P&L: ₹{holdings_pnl + positions_pnl:,.2f} "
-        f"(holdings {holdings_return:.2f}%, trading positions {positions_return:.2f}%) "
-        f"· Mutual-fund P&L: ₹{mutual_funds_pnl:,.2f}. "
-        "Equity LTPs are broker quotes; mutual funds use their latest reported NAV."
+    render_home_dashboard(
+        balance,
+        equity_holdings,
+        portfolio,
+        mutual_funds,
+        st.session_state.debt_holdings,
     )
 
     if st.session_state.sync_failed:
@@ -479,24 +1125,7 @@ def polling_sequence() -> None:
             f"{st.session_state.last_sync.strftime('%d %b %Y, %H:%M:%S IST')}"
         )
 
-    if not equity_holdings.empty:
-        st.subheader("Long-term equity holdings")
-        st.dataframe(_decorate_equities(equity_holdings), hide_index=True)
-    if not portfolio.empty:
-        st.subheader("Trading positions")
-        st.dataframe(_decorate_equities(portfolio), hide_index=True)
-    if not mutual_funds_display.empty:
-        st.subheader("Mutual-fund holdings")
-        st.dataframe(mutual_funds_display, hide_index=True)
-        st.caption(
-            "Mutual-fund valuation uses the broker's latest reported NAV, which "
-            "may be from the previous valuation day rather than a live quote."
-        )
-    if st.session_state.mutual_fund_error:
-        st.info(st.session_state.mutual_fund_error)
-    elif mutual_funds_display.empty:
-        st.info("No mutual-fund holdings were returned by the connected broker.")
-
+    _render_telegram_controls()
     risk_rows = st.session_state.risk_alerts
     risk_errors = st.session_state.risk_errors
     high_water = st.session_state.risk_high_water
@@ -547,7 +1176,9 @@ def polling_sequence() -> None:
                 float(high_water.get(ticker, market_risk["LTP"])),
                 market_risk["LTP"],
             )
-            risk_boundary = high_water[ticker] - 3 * market_risk["ATR"]
+            risk_boundary = (
+                high_water[ticker] - settings.atr_multiplier * market_risk["ATR"]
+            )
             if market_risk["LTP"] < risk_boundary:
                 risk_rows.append((ticker, float(row.Qty), risk_boundary))
         st.session_state.risk_alerts = risk_rows
@@ -560,7 +1191,8 @@ def polling_sequence() -> None:
         )
     st.caption(
         "Risk boundary: highest observed price in this session minus 3 × "
-        "14-trading-day ATR. A failed candle/quote request is not treated as a breach."
+        f"{settings.atr_period}-trading-day ATR. A failed candle/quote request "
+        "is not treated as a breach."
     )
 
     breached_tickers = {ticker for ticker, _, _ in risk_rows}
@@ -578,14 +1210,18 @@ def polling_sequence() -> None:
             private_chat_id = str(
                 st.session_state.get("telegram_chat_id", "")
             ).strip()
-            if os.environ.get("TELEGRAM_BOT_TOKEN") and private_chat_id:
+            telegram_bot_token = str(
+                st.session_state.get("telegram_bot_token", "")
+            ).strip()
+            if telegram_bot_token and private_chat_id:
                 try:
                     send_telegram_alert(
                         f"Market Exit warning: {ticker} fell below its 3-ATR "
                         f"risk boundary of INR {boundary:.2f}.",
                         chat_id=private_chat_id,
+                        bot_token=telegram_bot_token,
                     )
-                except (requests.RequestException, RuntimeError):
+                except (requests.RequestException, RuntimeError, ValueError):
                     st.caption(f"Telegram alert could not be delivered for {ticker}.")
                 else:
                     st.session_state.alerted_risk_tickers.append(ticker)
@@ -613,12 +1249,74 @@ def polling_sequence() -> None:
                 st.rerun()
 
 
-def _run_analysis() -> None:
+def _run_analysis(scope: str = "all") -> None:
+    scope_titles = {
+        "all": "entire portfolio",
+        "equity": "equity holdings",
+        "debt": "debt holdings",
+        "trading": "trading positions",
+        "options": "options",
+        "futures": "futures",
+        "mutual_funds": "mutual funds",
+    }
+    if scope not in scope_titles:
+        raise ValueError(f"Unsupported analysis scope: {scope}")
+
+    def fail(message: str) -> None:
+        st.session_state.analysis_errors[scope] = message
+        st.session_state.analysis_results.pop(scope, None)
+        st.session_state.approved_trades_by_scope[scope] = []
+
+    provider = str(st.session_state.get("llm_provider", "Gemini"))
+    provider_slug = provider.lower().replace(" ", "_").replace("-", "_")
+    api_key_widget = (
+        "user_gemini_api_key"
+        if provider == "Gemini"
+        else f"user_llm_api_key_{provider_slug}"
+    )
+    api_key = str(st.session_state.get(api_key_widget) or "").strip()
+    if not api_key:
+        fail(f"Enter an API key for {provider} beside the AI analysis button.")
+        st.session_state.ai_settings_prompt = (
+            f"Analysis needs a {provider} API key. Enter it beside the Run AI "
+            "analysis button, then try again."
+        )
+        st.rerun()
+    model_choice = str(
+        st.session_state.get(
+            f"llm_model_selection_{provider_slug}",
+            settings.llm_provider_models[provider][0]
+            if settings.llm_provider_models.get(provider)
+            else "",
+        )
+    ).strip()
+    configured_models = settings.llm_provider_models.get(provider, ())
+    if not model_choice or (
+        provider != "Custom OpenAI-compatible"
+        and model_choice not in configured_models
+    ):
+        fail(f"Select a model configured for {provider}.")
+        return
+    selected_model = model_choice
+    provider_base_url = (
+        str(
+            st.session_state.get("llm_custom_base_url")
+            or settings.llm_custom_base_url
+        ).strip()
+        if provider == "Custom OpenAI-compatible"
+        else None
+    )
+    if provider == "Custom OpenAI-compatible" and not provider_base_url:
+        fail("Enter the API base URL for the selected custom provider.")
+        st.session_state.ai_settings_prompt = (
+            "Analysis needs an API base URL for the custom provider. Add it beside "
+            "the model selector or configure LLM_CUSTOM_BASE_URL."
+        )
+        st.rerun()
+
     raw_budget = st.session_state.get("planning_budget_inr")
     if isinstance(raw_budget, bool):
-        st.session_state.analysis_error = "Enter a valid positive scenario budget."
-        st.session_state.analysis_result = None
-        st.session_state.approved_trades = []
+        fail("Enter a valid positive scenario budget.")
         return
     try:
         planning_budget = float(raw_budget)
@@ -629,68 +1327,91 @@ def _run_analysis() -> None:
         or planning_budget <= 0
         or planning_budget > 100_000_000
     ):
-        st.session_state.analysis_error = (
+        fail(
             "Enter a scenario budget between ₹1 and ₹10 crore before running analysis."
         )
-        st.session_state.analysis_result = None
-        st.session_state.approved_trades = []
-        st.session_state.audit_trail = []
         return
 
     positions = st.session_state.portfolio
     equity_holdings = st.session_state.equity_holdings
     mutual_funds = st.session_state.mutual_funds
-    portfolio = pd.concat(
+    debt_holdings = st.session_state.debt_holdings
+    equity_and_positions = pd.concat(
         [equity_holdings, positions], ignore_index=True
     ).drop_duplicates(subset=["Ticker", "Qty", "Avg_Price"], keep="last")
-    summary = json.dumps(
-        {
+    summary_by_scope = {
+        "all": {
             "long_term_equity_holdings": equity_holdings.to_dict(orient="records"),
             "open_trading_positions": positions.to_dict(orient="records"),
+            "debt_holdings": debt_holdings.to_dict(orient="records"),
             "mutual_fund_holdings": mutual_funds.to_dict(orient="records"),
         },
-        ensure_ascii=True,
-    )
+        "equity": {"equity_holdings": equity_holdings.to_dict(orient="records")},
+        "debt": {"debt_holdings": debt_holdings.to_dict(orient="records")},
+        "trading": {"trading_positions": positions.to_dict(orient="records")},
+        "options": {"options_positions": []},
+        "futures": {"futures_positions": []},
+        "mutual_funds": {"mutual_fund_holdings": mutual_funds.to_dict(orient="records")},
+    }
+    scoped_portfolio = {
+        "all": equity_and_positions,
+        "equity": equity_holdings,
+        "trading": positions,
+    }.get(scope, pd.DataFrame(columns=PORTFOLIO_COLUMNS))
+    summary = json.dumps(summary_by_scope[scope], ensure_ascii=True)
     mode = st.session_state.get("analysis_mode", "Portfolio and cash review")
     context = (
-        f"Analysis mode: {mode}. Broker-reported equity holdings, trading "
-        "positions, mutual funds when available, actual broker cash, and a separate "
+        f"Analysis scope: {scope_titles[scope]}. Analysis mode: {mode}. "
+        "Consider only the supplied scoped records. "
+        "Broker-reported equity holdings, trading positions, manually provided "
+        "debt assets, mutual funds when available, actual broker cash, and a separate "
         f"user-selected hypothetical investment budget of INR {planning_budget:,.2f} "
         "are supplied. Size the scenario recommendations to the user-selected "
         "budget, not to broker cash. The scenario budget does not represent cash "
         "actually available in the brokerage account. "
         "Fund NAVs are the broker's last reported NAV and may not be live. "
-        "Do not claim news or data that the application did not supply."
+        "Do not claim news or data that the application did not supply. "
+        "For manually entered debt, do not invent rates, ratings, maturities, "
+        "or liquidity terms."
     )
-    try:
-        live_prices = st.session_state.broker_state.fetch_live_prices(
-            st.session_state.token
-        )
-    except (
-        BrokerAPIError,
-        requests.RequestException,
-        RuntimeError,
-        ValueError,
-    ):
-        live_prices = {}
+    if scope in {"all", "equity", "trading"}:
+        try:
+            live_prices = st.session_state.broker_state.fetch_live_prices(
+                st.session_state.token
+            )
+        except (
+            BrokerAPIError,
+            requests.RequestException,
+            RuntimeError,
+            ValueError,
+        ):
+            live_prices = {}
+            price_error = (
+                "Could not retrieve a fresh broker quote. Analysis will still run, "
+                "but the app will not submit unpriced recommendations."
+            )
+        else:
+            price_error = (
+                None
+                if live_prices
+                else "The broker returned no current prices; price-based deployments "
+                "remain disabled."
+            )
+        st.session_state.analysis_price_errors[scope] = price_error
+        if scope == "all":
+            st.session_state.analysis_price_error = price_error
         st.session_state.analysis_live_prices_updated_at = datetime.now(
-            ZoneInfo("Asia/Kolkata")
-        )
-        st.session_state.analysis_price_error = (
-            "Could not retrieve a fresh broker quote. Portfolio analysis will "
-            "still run, but the app will not submit unpriced recommendations."
+            ZoneInfo(settings.timezone)
         )
     else:
-        st.session_state.analysis_live_prices_updated_at = datetime.now(
-            ZoneInfo("Asia/Kolkata")
+        live_prices = {}
+        price_error = (
+            f"No live broker quote feed is configured for {scope_titles[scope]}; "
+            "this run is portfolio review only."
         )
-        st.session_state.analysis_price_error = (
-            None
-            if live_prices
-            else "The broker quote endpoint returned no current prices. Portfolio "
-            "analysis will still run; price-based deployments remain disabled."
-        )
-    st.session_state.analysis_live_prices = live_prices
+        st.session_state.analysis_price_errors[scope] = price_error
+    if scope in {"all", "equity", "trading"}:
+        st.session_state.analysis_live_prices = live_prices
     context += (
         "\nThe authenticated quote endpoint returned "
         + (
@@ -706,11 +1427,12 @@ def _run_analysis() -> None:
             available_cash=planning_budget,
             market_context=context,
             live_prices=live_prices,
+            api_key=api_key,
+            model=str(selected_model),
+            provider=provider,
+            base_url=provider_base_url,
         )
     except APIError as error:
-        st.session_state.analysis_result = None
-        st.session_state.approved_trades = []
-        st.session_state.audit_trail = []
         detail = error.details
         error_info = detail.get("error", detail) if isinstance(detail, dict) else {}
         error_details = error_info.get("details", [])
@@ -732,9 +1454,8 @@ def _run_analysis() -> None:
             "PERMISSION_DENIED",
         }:
             message = (
-                "Google rejected GEMINI_API_KEY. Create or copy a valid Gemini API "
-                "key from Google AI Studio, replace GEMINI_API_KEY in the server "
-                "environment or .env file, then restart Streamlit."
+                "Google rejected this Gemini key. Check the key and project access "
+                "in Google AI Studio, then update the key beside the AI analysis button."
             )
         elif http_code == 429 or status == "RESOURCE_EXHAUSTED":
             message = (
@@ -757,7 +1478,7 @@ def _run_analysis() -> None:
             )
         elif http_code == 404:
             message = (
-                "Gemini model gemini-3.8-flash is unavailable for this API key or "
+                f"Gemini model {selected_model} is unavailable for this API key or "
                 "project. Check model access and API enablement in Google AI Studio."
             )
         else:
@@ -765,42 +1486,44 @@ def _run_analysis() -> None:
                 f"Gemini API request failed (HTTP {http_code or 'unknown'}). Check the "
                 "API key, model access, project quota, and network connection."
             )
-        st.session_state.analysis_error = message
+        fail(message)
         return
-    except (RuntimeError, ValueError):
-        st.session_state.analysis_result = None
-        st.session_state.approved_trades = []
-        st.session_state.audit_trail = []
-        st.session_state.analysis_error = (
-            "Portfolio analysis failed while validating the Gemini response. "
-            "Retry, and verify that the Gemini service returned valid JSON."
-        )
+    except LLMProviderError as error:
+        fail(str(error))
+        return
+    except (RuntimeError, ValueError) as error:
+        fail(f"Portfolio analysis failed: {error}")
         return
 
     sectors_held = {
         SECTOR_BY_TICKER[ticker]
-        for ticker in portfolio["Ticker"].astype(str).str.upper()
+        for ticker in scoped_portfolio["Ticker"].astype(str).str.upper()
         if ticker in SECTOR_BY_TICKER
-    } if not portfolio.empty else set()
+    } if not scoped_portfolio.empty else set()
     engine = JevRuleEngine(
         {
             "cash_balance": planning_budget,
             "actual_broker_balance": float(st.session_state.balance),
             "live_prices": live_prices,
             "sector_holdings": sorted(sectors_held),
-            "portfolio": portfolio,
+            "portfolio": scoped_portfolio,
             "llm_targets": analysis["cash_deployment_list"],
         }
     )
     trades, audit_trail = engine.run()
-    st.session_state.analysis_result = analysis
-    st.session_state.approved_trades = trades
-    st.session_state.audit_trail = audit_trail
-    st.session_state.analysis_error = None
+    st.session_state.analysis_results[scope] = analysis
+    st.session_state.approved_trades_by_scope[scope] = trades
+    st.session_state.audit_trails_by_scope[scope] = audit_trail
+    st.session_state.analysis_errors.pop(scope, None)
+    if scope == "all":
+        st.session_state.analysis_result = analysis
+        st.session_state.approved_trades = trades
+        st.session_state.audit_trail = audit_trail
 
 
-def _show_approved_trades() -> None:
-    for index, trade in enumerate(st.session_state.approved_trades):
+def _show_approved_trades(scope: str) -> None:
+    approved_trades = st.session_state.approved_trades_by_scope.get(scope, [])
+    for index, trade in enumerate(approved_trades):
         ticker = trade["Ticker"]
         quantity = trade["Qty"]
         current_price = float(
@@ -852,7 +1575,7 @@ def _show_approved_trades() -> None:
                     )
             if st.button(
                 "⚡ Instant Deploy",
-                key=f"instant_deploy_{ticker}_{index}",
+                key=f"instant_deploy_{scope}_{ticker}_{index}",
                 type="primary",
                 disabled=not can_deploy_now,
                 help="Submits a live market buy order after rechecking available cash.",
@@ -889,21 +1612,23 @@ def _show_approved_trades() -> None:
                 else:
                     st.success(f"Market buy order submitted for {ticker}.")
                     st.write(result)
-                    st.session_state.approved_trades = [
+                    st.session_state.approved_trades_by_scope[scope] = [
                         item
-                        for item in st.session_state.approved_trades
+                        for item in approved_trades
                         if item["Ticker"] != ticker
                     ]
                     st.rerun()
 
 
 def _show_workspace() -> None:
-    st.title("🏡 Wealth Home AI")
-    st.header("Active workspace")
+    st.header("Wealth Home AI", icon=":material/account_balance_wallet:")
+    st.badge(
+        f"{st.session_state.broker_name} connected",
+        icon=":material/check_circle:",
+        color="green",
+    )
     st.caption(
-        "Recommendations are AI-generated and require your explicit order action. "
-        "The scenario budget sizes a hypothetical plan and is separate from actual "
-        "broker cash. Market orders can execute at prices different from displayed prices."
+        "Portfolio overview, AI insights, and broker actions in one workspace."
     )
     polling_sequence()
     if st.session_state.planning_budget_inr is None:
@@ -913,77 +1638,6 @@ def _show_workspace() -> None:
     with st.sidebar:
         st.subheader("Connected broker")
         st.write(st.session_state.broker_name)
-        prompt_mode = st.selectbox(
-            "Analysis mode",
-            ["Portfolio and cash review", "Risk-aware deployment review"],
-            key="analysis_mode",
-        )
-        st.caption(
-            "Gemini analysis is advisory. Rule-engine checks do not guarantee "
-            "profit or prevent investment loss."
-        )
-        st.number_input(
-            "Scenario budget for recommendations (INR)",
-            min_value=1.0,
-            max_value=100_000_000.0,
-            step=10_000.0,
-            format="%.2f",
-            key="planning_budget_inr",
-            help=(
-                "Used only to size a hypothetical recommendation plan. It does not "
-                "change your broker balance or authorize an order."
-            ),
-        )
-        st.caption(
-            f"Actual broker cash: ₹{float(st.session_state.balance):,.2f}. "
-            "A larger scenario budget is for planning only; live orders still "
-            "require sufficient actual broker cash."
-        )
-        st.caption(
-            "Candidates below 90% confidence can appear in the analysis, but the "
-            "rule engine will not approve them for a deployment plan."
-        )
-        telegram_chat_id = st.text_input(
-            "Private Telegram chat ID",
-            key="telegram_chat_id",
-            help="Used only in this browser session for your alerts.",
-        )
-        if not os.environ.get("TELEGRAM_BOT_TOKEN"):
-            st.caption(
-                "Telegram alerts require TELEGRAM_BOT_TOKEN in the server environment."
-            )
-        elif not telegram_chat_id.strip():
-            st.caption("Add your chat ID to receive alerts privately.")
-        st.caption(
-            "If the broker does not return funds, import a statement CSV with "
-            "Fund, Units, Avg_NAV, Latest_NAV; Folio and NAV_Date are optional."
-        )
-        mutual_fund_file = st.file_uploader(
-            "Mutual-fund statement CSV",
-            type=["csv"],
-            key="mutual_fund_csv",
-        )
-        if mutual_fund_file is not None:
-            csv_bytes = mutual_fund_file.getvalue()
-            digest = hashlib.sha256(csv_bytes).hexdigest()
-            if digest != st.session_state.mutual_fund_upload_digest:
-                try:
-                    uploaded_frame = pd.read_csv(io.BytesIO(csv_bytes))
-                    st.session_state.mutual_funds = _mutual_fund_frame(
-                        uploaded_frame
-                    )
-                except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
-                    st.session_state.mutual_fund_upload_error = (
-                        "CSV import failed. Use numeric values and the required "
-                        "Fund, Units, Avg_NAV, Latest_NAV columns."
-                    )
-                else:
-                    st.session_state.mutual_fund_upload_digest = digest
-                    st.session_state.mutual_fund_upload_error = None
-                    st.rerun()
-        if st.session_state.mutual_fund_upload_error:
-            st.error(st.session_state.mutual_fund_upload_error)
-
     if st.session_state.analysis_live_prices:
         with st.expander("Live NSE quotes used for AI recommendations"):
             if st.session_state.analysis_live_prices_updated_at:
@@ -1005,85 +1659,104 @@ def _show_workspace() -> None:
             )
             st.dataframe(prices, hide_index=True)
 
-    st.divider()
-    st.button(
-        "🔮 Run LLM Portfolio Analysis",
-        type="primary",
-        on_click=_run_analysis,
+    st.subheader("AI portfolio review", divider="gray")
+    st.caption(
+        "A single run reviews equity, trading, debt and mutual-fund records together. "
+        "Scoped AI reviews are also available in each workspace tab."
+    )
+    analysis_mode_descriptions = {
+        "Portfolio and cash review": (
+            "Reviews your holdings, diversification, and cash position. It does not "
+            "build an order deployment plan."
+        ),
+        "Risk-aware deployment review": (
+            "Reviews your portfolio and creates a hypothetical, risk-aware plan "
+            "within the scenario budget. It does not submit orders."
+        ),
+    }
+    mode_column, budget_column = st.columns([1, 1.25])
+    with mode_column:
+        selected_analysis_mode = st.selectbox(
+            "Analysis mode",
+            ["Portfolio and cash review", "Risk-aware deployment review"],
+            key="analysis_mode",
+            help=(
+                "Choose whether AI reviews portfolio conditions only or also "
+                "builds a hypothetical deployment plan."
+            ),
+        )
+    with budget_column:
+        st.number_input(
+            "Scenario budget for recommendations (INR)",
+            min_value=1.0,
+            max_value=100_000_000.0,
+            step=10_000.0,
+            format="%.2f",
+            key="planning_budget_inr",
+            help=(
+                "Used only to size a hypothetical recommendation plan. It does not "
+                "change your broker balance or authorize an order."
+            ),
+        )
+    st.caption(analysis_mode_descriptions[selected_analysis_mode])
+    st.caption(
+        f"Actual broker cash: ₹{float(st.session_state.balance):,.2f}. "
+        "Scenario budget is for planning only; live orders require sufficient "
+        "actual cash. Candidates below 90% confidence will not be approved."
+    )
+    render_analysis_panel(
+        "all", "your full portfolio", _run_analysis, _show_approved_trades
     )
 
-    if st.session_state.get("analysis_error"):
-        st.error(st.session_state.analysis_error)
-    if st.session_state.analysis_price_error:
-        st.warning(st.session_state.analysis_price_error)
-    analysis = st.session_state.analysis_result
-    if analysis:
-        st.subheader("Portfolio analysis")
-        st.caption(
-            f"Scenario recommendations were sized for "
-            f"₹{float(st.session_state.planning_budget_inr):,.2f}; actual broker "
-            f"cash is ₹{float(st.session_state.balance):,.2f}."
+    st.subheader("Investment workspaces", divider="gray")
+    equity_tab, debt_tab, trading_tab, options_tab, futures_tab, mf_tab = st.tabs(
+        [
+            ":material/show_chart: Equities",
+            ":material/account_balance: Debt",
+            ":material/swap_vert: Trading",
+            ":material/tune: Options",
+            ":material/candlestick_chart: Futures",
+            ":material/pie_chart: Mutual funds",
+        ]
+    )
+    with equity_tab:
+        render_equity(st.session_state.equity_holdings)
+        render_analysis_panel("equity", "equity", _run_analysis, _show_approved_trades)
+    with debt_tab:
+        render_debt(st.session_state.debt_holdings)
+        render_analysis_panel("debt", "debt", _run_analysis, _show_approved_trades)
+    with trading_tab:
+        render_trading(st.session_state.portfolio)
+        render_analysis_panel("trading", "trading", _run_analysis, _show_approved_trades)
+    with options_tab:
+        render_derivatives("Options")
+        render_analysis_panel("options", "options", _run_analysis, _show_approved_trades)
+    with futures_tab:
+        render_derivatives("Futures")
+        render_analysis_panel("futures", "futures", _run_analysis, _show_approved_trades)
+    with mf_tab:
+        render_mutual_funds(
+            st.session_state.mutual_funds,
+            st.session_state.mutual_fund_error,
         )
-        st.text(analysis["analysis"])
-        candidates = analysis["cash_deployment_list"]
-        if candidates:
-            st.subheader("AI candidate recommendations")
-            st.caption(
-                "These are analysis candidates, not orders. The rule engine "
-                "filters by confidence, available balance, and sector."
-            )
-            st.dataframe(
-                pd.DataFrame(candidates),
-                hide_index=True,
-            )
-        with st.expander("JevRuleEngine audit trail"):
-            st.code("\n".join(st.session_state.audit_trail))
-        if st.session_state.approved_trades:
-            st.subheader("Verified candidate deployments")
-            st.warning(
-                f"Analysis mode selected: {prompt_mode}. Review each live market "
-                "order before submitting."
-            )
-            _show_approved_trades()
-        else:
-            high_confidence_candidates = [
-                candidate
-                for candidate in candidates
-                if candidate["Confidence_Score"] >= 90
-            ]
-            if high_confidence_candidates and all(
-                candidate["Target_Price"] > float(st.session_state.balance)
-                for candidate in high_confidence_candidates
-            ):
-                st.info(
-                    "No whole share from the high-confidence candidates fits the "
-                    f"available ₹{float(st.session_state.balance):,.2f} balance. "
-                    "The analysis is shown, but no order was approved."
-                )
-            elif (
-                st.session_state.analysis_live_prices
-                and float(st.session_state.balance)
-                < min(st.session_state.analysis_live_prices.values())
-            ):
-                lowest_quote = min(
-                    st.session_state.analysis_live_prices.values()
-                )
-                st.info(
-                    f"Analysis completed, but the available "
-                    f"₹{float(st.session_state.balance):,.2f} is below the lowest "
-                    f"supported live share price (₹{lowest_quote:,.2f}). "
-                    "No whole-share order can be approved."
-                )
-            else:
-                st.info(
-                    "The rule engine approved no trades for the current facts. "
-                    "Review its audit trail for the confidence or budget check."
-                )
+        render_analysis_panel(
+            "mutual_funds", "mutual funds", _run_analysis, _show_approved_trades
+        )
 
-    st.sidebar.button("Log out", on_click=_logout)
+    st.sidebar.button("Disconnect broker / switch account", on_click=_logout)
 
 
 def _logout() -> None:
+    llm_session_keys = tuple(
+        key
+        for key in st.session_state
+        if key.startswith(
+            (
+                "user_llm_api_key_",
+                "llm_model_selection_",
+            )
+        )
+    )
     for key in (
         "token",
         "broker_state",
@@ -1092,6 +1765,7 @@ def _logout() -> None:
         "portfolio",
         "equity_holdings",
         "mutual_funds",
+        "debt_holdings",
         "mutual_fund_error",
         "mutual_fund_updated_at",
         "mutual_fund_manual_import",
@@ -1101,30 +1775,66 @@ def _logout() -> None:
         "last_sync_attempt",
         "sync_failed",
         "analysis_result",
+        "analysis_results",
+        "analysis_errors",
+        "ai_settings_prompt",
+        "analysis_price_errors",
         "planning_budget_inr",
         "analysis_live_prices",
         "analysis_live_prices_updated_at",
         "analysis_price_error",
         "approved_trades",
+        "approved_trades_by_scope",
         "audit_trail",
+        "audit_trails_by_scope",
         "analysis_error",
         "alerted_risk_tickers",
         "risk_high_water",
         "risk_alerts",
         "risk_errors",
+        "user_gemini_api_key",
+        "llm_model_selection",
+        "llm_custom_model",
+        "llm_custom_base_url",
+        "upstox_api_key",
+        "upstox_api_secret",
+        "zerodha_api_key",
+        "zerodha_api_secret",
+        "dhan_api_key",
+        "dhan_api_secret",
+        "dhan_client_id",
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "pending_broker_name",
+        "pending_broker_adapter",
+        "pending_login_url",
+        "pending_redirect_url",
+        "pending_oauth_fingerprint",
+        "pending_oauth_expires_at",
+        *llm_session_keys,
     ):
         st.session_state[key] = None
+    _clear_broker_login_inputs()
+    st.session_state.llm_provider_settings = {}
     st.session_state.portfolio = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
     st.session_state.equity_holdings = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
     st.session_state.mutual_funds = pd.DataFrame(columns=MUTUAL_FUND_COLUMNS)
+    st.session_state.debt_holdings = empty_debt_holdings()
     st.session_state.balance = 0.0
     st.session_state.alerted_risk_tickers = []
     st.session_state.risk_high_water = {}
     st.session_state.risk_alerts = []
     st.session_state.risk_errors = []
+    st.session_state.analysis_results = {}
+    st.session_state.analysis_errors = {}
+    st.session_state.analysis_price_errors = {}
+    st.session_state.pop("telegram_bot_token", None)
+    st.session_state.pop("telegram_chat_id", None)
+    st.session_state.approved_trades_by_scope = {}
+    st.session_state.audit_trails_by_scope = {}
+    if "debt_holdings_editor" in st.session_state:
+        del st.session_state["debt_holdings_editor"]
     st.session_state.last_sync_attempt = None
-    if "telegram_chat_id" in st.session_state:
-        del st.session_state["telegram_chat_id"]
 
 
 if st.session_state.token is None:

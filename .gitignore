@@ -8,4 +8,5 @@ dist/
 .wealth_home_oauth.sqlite3
 .wealth_home_oauth.sqlite3-shm
 .wealth_home_oauth.sqlite3-wal
+.wealth_home_oauth.sqlite3.key
 .streamlit/secrets.toml

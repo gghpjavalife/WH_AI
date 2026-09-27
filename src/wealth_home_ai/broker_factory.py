@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import abc
-import os
+import csv
+import hashlib
+import io
 import secrets
 from datetime import datetime, timedelta
 from math import isfinite
@@ -26,6 +28,8 @@ from upstox_client import (
     UserApi,
 )
 from upstox_client.rest import ApiException
+
+from .settings import settings
 
 PORTFOLIO_COLUMNS = ["Ticker", "Qty", "Avg_Price", "LTP"]
 MUTUAL_FUND_COLUMNS = [
@@ -176,12 +180,14 @@ class UpstoxAdapter(BrokerInterface):
     """Upstox OAuth 2.0 and official Python SDK adapter."""
 
     TICKER_MAP = TICKER_MAP
-    LOGIN_URL = "https://api.upstox.com/v2/login/authorization/dialog"
-    TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
+    LOGIN_URL = settings.upstox_login_url
+    TOKEN_URL = settings.upstox_token_url
 
-    def __init__(self) -> None:
-        self.api_key = os.environ.get("UPSTOX_API_KEY", "").strip()
-        self.api_secret = os.environ.get("UPSTOX_API_SECRET", "").strip()
+    def __init__(
+        self, api_key: str | None = None, api_secret: str | None = None
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.api_secret = api_secret or ""
         self.oauth_state: str | None = None
         self._instrument_keys_by_ticker: dict[str, str] = {}
 
@@ -220,7 +226,10 @@ class UpstoxAdapter(BrokerInterface):
                 "grant_type": "authorization_code",
             },
             headers={"Accept": "application/json"},
-            timeout=(5, 20),
+            timeout=(
+                settings.http_connect_timeout_seconds,
+                settings.http_read_timeout_seconds,
+            ),
         )
         response.raise_for_status()
         token = response.json().get("access_token")
@@ -476,6 +485,698 @@ class UpstoxAdapter(BrokerInterface):
             raise BrokerAPIError("Upstox rejected the market order.") from exc
 
 
+class ZerodhaAdapter(BrokerInterface):
+    """Kite Connect adapter for Zerodha accounts."""
+
+    LOGIN_URL = settings.zerodha_login_url
+    API_BASE = settings.zerodha_api_base
+
+    def __init__(self, api_key: str | None = None, api_secret: str | None = None):
+        self.api_key = (api_key or "").strip()
+        self.api_secret = api_secret or ""
+        self.oauth_state: str | None = None
+        self._instrument_tokens: dict[str, str] = {}
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.api_secret)
+
+    def get_login_url(self, redirect_url: str) -> str:
+        if not self.configured:
+            raise ValueError("A Zerodha API key and API secret are required.")
+        if not redirect_url.strip():
+            raise ValueError("A Zerodha callback URL is required.")
+        self.oauth_state = secrets.token_urlsafe(32)
+        params = urlencode(
+            {
+                "v": "3",
+                "api_key": self.api_key,
+                "redirect_params": urlencode({"state": self.oauth_state}),
+            }
+        )
+        return f"{self.LOGIN_URL}?{params}"
+
+    def authenticate(self, code: str | None, redirect_url: str) -> str:
+        if not self.configured:
+            raise ValueError("A Zerodha API key and API secret are required.")
+        if not code:
+            raise ValueError("Zerodha did not return a request token.")
+        checksum = hashlib.sha256(
+            f"{self.api_key}{code}{self.api_secret}".encode("utf-8")
+        ).hexdigest()
+        try:
+            response = requests.post(
+                f"{self.API_BASE}/session/token",
+                data={
+                    "api_key": self.api_key,
+                    "request_token": code,
+                    "checksum": checksum,
+                },
+                headers={"X-Kite-Version": "3"},
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise BrokerAPIError("Unable to exchange the Zerodha request token.") from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            raise BrokerAPIError("Zerodha did not return an access token.")
+        self.api_secret = ""
+        return token
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        token: str,
+        *,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> Any:
+        if not token:
+            raise ValueError("A Zerodha access token is required.")
+        try:
+            response = requests.request(
+                method,
+                f"{self.API_BASE}{path}",
+                headers={
+                    "X-Kite-Version": "3",
+                    "Authorization": f"token {self.api_key}:{token}",
+                },
+                params=params,
+                data=data,
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise BrokerAPIError(f"Zerodha request failed: {path}.") from exc
+        except ValueError as exc:
+            raise BrokerAPIError("Zerodha returned an invalid response.") from exc
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            raise BrokerAPIError(f"Zerodha rejected the request: {path}.")
+        return payload.get("data") or {}
+
+    def fetch_balance(self, token: str) -> float:
+        data = self._request("GET", "/user/margins/equity", token)
+        available = data.get("available") or {}
+        balance = available.get("cash", available.get("live_balance"))
+        if balance is None:
+            raise BrokerAPIError("Zerodha returned no available-cash balance.")
+        return _number(balance, "available cash")
+
+    def fetch_positions(self, token: str) -> pd.DataFrame:
+        data = self._request("GET", "/portfolio/positions", token)
+        rows = []
+        for position in data.get("net") or []:
+            if str(position.get("exchange", "")).upper() != "NSE":
+                continue
+            quantity = _number(position.get("quantity"), "position quantity")
+            if quantity == 0:
+                continue
+            ticker = str(position.get("tradingsymbol", "")).strip().upper()
+            ltp = _number(position.get("last_price"), "last price")
+            if ticker and ltp > 0:
+                rows.append(
+                    {
+                        "Ticker": ticker,
+                        "Qty": quantity,
+                        "Avg_Price": _number(
+                            position.get("average_price"), "average price"
+                        ),
+                        "LTP": ltp,
+                    }
+                )
+        return _portfolio_frame(rows)
+
+    def fetch_holdings(self, token: str) -> pd.DataFrame:
+        holdings = self._request("GET", "/portfolio/holdings", token)
+        rows = []
+        for holding in holdings:
+            if str(holding.get("exchange", "")).upper() != "NSE":
+                continue
+            quantity = _number(holding.get("quantity"), "holding quantity")
+            ltp = _number(holding.get("last_price"), "last price")
+            if quantity <= 0 or ltp <= 0:
+                continue
+            rows.append(
+                {
+                    "Ticker": holding.get("tradingsymbol"),
+                    "Qty": quantity,
+                    "Avg_Price": _number(
+                        holding.get("average_price"), "average purchase price"
+                    ),
+                    "LTP": ltp,
+                }
+            )
+        return _portfolio_frame(rows)
+
+    def fetch_mutual_fund_holdings(self, token: str) -> pd.DataFrame:
+        raise BrokerCapabilityError(
+            "Kite Connect does not expose a mutual-fund holdings endpoint. "
+            "Import a current mutual-fund statement CSV to include these assets."
+        )
+
+    def fetch_live_prices(
+        self, token: str, tickers: list[str] | None = None
+    ) -> dict[str, float]:
+        symbols = sorted(
+            {ticker.strip().upper() for ticker in tickers}
+            if tickers is not None
+            else set(TICKER_MAP)
+        )
+        unsupported = [symbol for symbol in symbols if symbol not in TICKER_MAP]
+        if unsupported:
+            raise ValueError("Live quotes are limited to supported NSE tickers.")
+        if not symbols:
+            return {}
+        data = self._request(
+            "GET",
+            "/quote/ltp",
+            token,
+            params={"i": [f"NSE:{symbol}" for symbol in symbols]},
+        )
+        prices = {}
+        for symbol in symbols:
+            quote = data.get(f"NSE:{symbol}")
+            if isinstance(quote, dict):
+                price = _number(quote.get("last_price"), "live quote")
+                if price > 0:
+                    prices[symbol] = price
+        return prices
+
+    def _instrument_token(self, token: str, ticker: str) -> str:
+        if not self._instrument_tokens:
+            try:
+                response = requests.get(
+                    f"{self.API_BASE}/instruments/NSE",
+                    headers={
+                        "X-Kite-Version": "3",
+                        "Authorization": f"token {self.api_key}:{token}",
+                    },
+                    timeout=(
+                        settings.http_connect_timeout_seconds,
+                        settings.http_read_timeout_seconds,
+                    ),
+                )
+                response.raise_for_status()
+                instruments = csv.DictReader(io.StringIO(response.text))
+                self._instrument_tokens = {
+                    row["tradingsymbol"].strip().upper(): row["instrument_token"]
+                    for row in instruments
+                    if row.get("exchange") == "NSE"
+                    and row.get("instrument_type") == "EQ"
+                    and row.get("tradingsymbol")
+                    and row.get("instrument_token")
+                }
+            except (requests.RequestException, KeyError, csv.Error) as exc:
+                raise BrokerAPIError(
+                    "Could not load the Zerodha NSE instrument list."
+                ) from exc
+        instrument_token = self._instrument_tokens.get(ticker)
+        if not instrument_token:
+            raise BrokerAPIError(f"Zerodha has no NSE equity instrument for {ticker}.")
+        return instrument_token
+
+    def fetch_market_risk(self, token: str, ticker: str) -> dict[str, float]:
+        symbol = ticker.strip().upper()
+        if symbol not in TICKER_MAP:
+            raise ValueError("Risk checks are limited to supported NSE tickers.")
+        instrument_token = self._instrument_token(token, symbol)
+        now = datetime.now(ZoneInfo(settings.timezone))
+        start = now - timedelta(days=settings.market_lookback_days)
+        data = self._request(
+            "GET",
+            f"/instruments/historical/{instrument_token}/day",
+            token,
+            params={
+                "from": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "to": now.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        candles = data.get("candles") or []
+        if len(candles) < settings.atr_period + 1:
+            raise BrokerAPIError(f"Insufficient Zerodha candles for {symbol}.")
+        frame = pd.DataFrame(
+            candles,
+            columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"],
+        ).sort_values("Timestamp")
+        from .upstox_helper import calculate_atr
+
+        atr = calculate_atr(frame["High"], frame["Low"], frame["Close"])
+        quote = self._request(
+            "GET",
+            "/quote/ltp",
+            token,
+            params={"i": f"NSE:{symbol}"},
+        )
+        quote_data = quote.get(f"NSE:{symbol}") or {}
+        ltp = _number(quote_data.get("last_price"), "live price")
+        if ltp <= 0:
+            raise BrokerAPIError(f"Zerodha returned an invalid live price for {symbol}.")
+        return {
+            "LTP": ltp,
+            "ATR": atr,
+            "Risk_Boundary": ltp - settings.atr_multiplier * atr,
+        }
+
+    def place_order(
+        self, token: str, ticker: str, qty: int, transaction_type: str
+    ) -> Any:
+        symbol = ticker.strip().upper()
+        if symbol not in TICKER_MAP:
+            raise ValueError("Orders are limited to supported NSE tickers.")
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+            raise ValueError("Order quantity must be a positive whole number.")
+        side = transaction_type.strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("Transaction type must be BUY or SELL.")
+        return self._request(
+            "POST",
+            "/orders/regular",
+            token,
+            data={
+                "exchange": "NSE",
+                "tradingsymbol": symbol,
+                "transaction_type": side,
+                "order_type": "MARKET",
+                "quantity": qty,
+                "product": "CNC",
+                "validity": "DAY",
+                "market_protection": -1,
+                "tag": "WealthHomeAI",
+            },
+        )
+
+
+class DhanAdapter(BrokerInterface):
+    """DhanHQ adapter using each account's Dhan API key and secret."""
+
+    AUTH_BASE = settings.dhan_auth_base
+    API_BASE = settings.dhan_api_base
+    INSTRUMENTS_URL = settings.dhan_instruments_url
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        client_id: str | None = None,
+    ):
+        self.api_key = (api_key or "").strip()
+        self.api_secret = api_secret or ""
+        self.client_id = (client_id or "").strip()
+        self._consent_id: str | None = None
+        self._security_ids_by_ticker: dict[str, str] = {}
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.api_secret and self.client_id)
+
+    def get_login_url(self, redirect_url: str) -> str:
+        if not self.configured:
+            raise ValueError(
+                "Dhan requires your Client ID, API key, and API secret."
+            )
+        if not redirect_url.strip():
+            raise ValueError("Register and enter a Dhan callback URL.")
+        try:
+            response = requests.post(
+                f"{self.AUTH_BASE}/app/generate-consent",
+                params={"client_id": self.client_id},
+                headers={
+                    "app_id": self.api_key,
+                    "app_secret": self.api_secret,
+                },
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise BrokerAPIError("Could not start Dhan account authorization.") from exc
+        except ValueError as exc:
+            raise BrokerAPIError("Dhan returned an invalid consent response.") from exc
+        consent_id = payload.get("consentAppId") if isinstance(payload, dict) else None
+        if not isinstance(consent_id, str) or not consent_id:
+            raise BrokerAPIError("Dhan did not create an authorization session.")
+        self._consent_id = consent_id
+        return (
+            f"{self.AUTH_BASE}/login/consentApp-login?"
+            + urlencode({"consentAppId": consent_id})
+        )
+
+    def authenticate(self, code: str | None, redirect_url: str) -> str:
+        if not self.configured or not self._consent_id:
+            raise ValueError("Start a Dhan authorization before exchanging its token.")
+        if not code:
+            raise ValueError("Dhan did not return a consent token.")
+        try:
+            response = requests.get(
+                f"{self.AUTH_BASE}/app/consumeApp-consent",
+                params={"tokenId": code},
+                headers={
+                    "app_id": self.api_key,
+                    "app_secret": self.api_secret,
+                },
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise BrokerAPIError("Could not exchange the Dhan consent token.") from exc
+        except ValueError as exc:
+            raise BrokerAPIError("Dhan returned an invalid access-token response.") from exc
+        token = payload.get("accessToken") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token:
+            raise BrokerAPIError("Dhan did not return an access token.")
+        response_client_id = str(payload.get("dhanClientId") or "").strip()
+        if response_client_id and response_client_id != self.client_id:
+            raise BrokerAPIError("Dhan returned a different client ID than expected.")
+        self.api_secret = ""
+        self._consent_id = None
+        return token
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        token: str,
+        *,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> Any:
+        if not token or not self.client_id:
+            raise ValueError("A Dhan client ID and access token are required.")
+        try:
+            response = requests.request(
+                method,
+                f"{self.API_BASE}{path}",
+                headers={
+                    "access-token": token,
+                    "client-id": self.client_id,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                params=params,
+                json=body,
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise BrokerAPIError(f"Dhan request failed: {path}.") from exc
+        except ValueError as exc:
+            raise BrokerAPIError("Dhan returned an invalid response.") from exc
+        if isinstance(payload, dict) and payload.get("errorCode"):
+            raise BrokerAPIError(
+                str(payload.get("errorMessage") or "Dhan rejected the request.")
+            )
+        return payload
+
+    def fetch_balance(self, token: str) -> float:
+        payload = self._request("GET", "/fundlimit", token)
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict):
+            raise BrokerAPIError("Dhan returned no available-funds record.")
+        balance = next(
+            (
+                payload[key]
+                for key in (
+                    "availableBalance",
+                    "availabelBalance",
+                    "withdrawableBalance",
+                    "sodLimit",
+                )
+                if payload.get(key) is not None
+            ),
+            None,
+        )
+        if balance is None:
+            raise BrokerAPIError("Dhan returned no available-cash balance.")
+        return _number(balance, "available cash")
+
+    def _load_instruments(self, token: str) -> None:
+        if self._security_ids_by_ticker:
+            return
+        try:
+            response = requests.get(
+                self.INSTRUMENTS_URL,
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            response.raise_for_status()
+            instruments = pd.read_csv(
+                io.StringIO(response.text),
+                usecols=[
+                    "EXCH_ID",
+                    "SEGMENT",
+                    "SECURITY_ID",
+                    "ISIN",
+                    "INSTRUMENT",
+                    "SERIES",
+                    "SYMBOL_NAME",
+                ],
+                dtype=str,
+            )
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            raise BrokerAPIError("Could not load the Dhan NSE instrument list.") from exc
+        isin_to_ticker = {
+            _normalize_instrument_key(key).split("|")[-1]: ticker
+            for ticker, key in TICKER_MAP.items()
+        }
+        nse_equities = instruments[
+            instruments["EXCH_ID"].str.upper().eq("NSE")
+            & instruments["SEGMENT"].str.upper().eq("E")
+            & instruments["INSTRUMENT"].str.upper().eq("EQUITY")
+        ]
+        for row in nse_equities.itertuples(index=False):
+            ticker = isin_to_ticker.get(_normalize_instrument_key(row.ISIN))
+            if ticker is None and str(row.SERIES).upper() == "EQ":
+                ticker = str(row.SYMBOL_NAME).strip().upper()
+            if ticker and str(row.SECURITY_ID).strip().isdigit():
+                self._security_ids_by_ticker[ticker] = str(row.SECURITY_ID).strip()
+        if not self._security_ids_by_ticker:
+            raise BrokerAPIError("The Dhan instrument list had no supported NSE equities.")
+
+    def fetch_live_prices(
+        self, token: str, tickers: list[str] | None = None
+    ) -> dict[str, float]:
+        self._load_instruments(token)
+        requested_symbols = (
+            {ticker.strip().upper() for ticker in tickers}
+            if tickers is not None
+            else set(TICKER_MAP)
+        )
+        unsupported = sorted(
+            requested_symbols - self._security_ids_by_ticker.keys()
+        )
+        if unsupported:
+            if tickers is not None:
+                raise ValueError("Live quotes are limited to supported Dhan NSE tickers.")
+        symbols = sorted(requested_symbols & self._security_ids_by_ticker.keys())
+        if not symbols:
+            return {}
+        payload = self._request(
+            "POST",
+            "/marketfeed/ltp",
+            token,
+            body={
+                "NSE_EQ": [
+                    int(self._security_ids_by_ticker[symbol]) for symbol in symbols
+                ]
+            },
+        )
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        quotes = data.get("NSE_EQ", {}) if isinstance(data, dict) else {}
+        prices = {}
+        for symbol in symbols:
+            quote = quotes.get(self._security_ids_by_ticker[symbol])
+            if isinstance(quote, dict):
+                price = _number(quote.get("last_price"), "live quote")
+                if price > 0:
+                    prices[symbol] = price
+        return prices
+
+    def fetch_positions(self, token: str) -> pd.DataFrame:
+        self._load_instruments(token)
+        positions = self._request("GET", "/positions", token)
+        if not isinstance(positions, list):
+            raise BrokerAPIError("Dhan returned an invalid positions response.")
+        symbols = {
+            str(position.get("tradingSymbol", "")).strip().upper()
+            for position in positions
+            if str(position.get("exchangeSegment", "")).upper() == "NSE_EQ"
+            and _number(position.get("netQty", 0), "position quantity") != 0
+        }
+        mapped_symbols = sorted(symbols & self._security_ids_by_ticker.keys())
+        prices = self.fetch_live_prices(token, mapped_symbols) if mapped_symbols else {}
+        rows = []
+        for position in positions:
+            if str(position.get("exchangeSegment", "")).upper() != "NSE_EQ":
+                continue
+            ticker = str(position.get("tradingSymbol", "")).strip().upper()
+            quantity = _number(position.get("netQty", 0), "position quantity")
+            if quantity == 0 or ticker not in prices:
+                continue
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Qty": quantity,
+                    "Avg_Price": _number(
+                        position.get("buyAvg", position.get("costPrice")),
+                        "average price",
+                    ),
+                    "LTP": prices[ticker],
+                }
+            )
+        return _portfolio_frame(rows)
+
+    def fetch_holdings(self, token: str) -> pd.DataFrame:
+        self._load_instruments(token)
+        holdings = self._request("GET", "/holdings", token)
+        if not isinstance(holdings, list):
+            raise BrokerAPIError("Dhan returned an invalid holdings response.")
+        rows = []
+        for holding in holdings:
+            ticker = str(holding.get("tradingSymbol", "")).strip().upper()
+            quantity = _number(holding.get("totalQty", 0), "holding quantity")
+            if quantity <= 0 or ticker not in self._security_ids_by_ticker:
+                continue
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Qty": quantity,
+                    "Avg_Price": _number(
+                        holding.get("avgCostPrice"), "average purchase price"
+                    ),
+                    "LTP": 1.0,
+                }
+            )
+        if not rows:
+            return _empty_portfolio()
+        prices = self.fetch_live_prices(
+            token, [str(row["Ticker"]) for row in rows]
+        )
+        for row in rows:
+            price = prices.get(str(row["Ticker"]))
+            if price is None:
+                raise BrokerAPIError(
+                    f"Dhan returned no current market quote for {row['Ticker']}."
+                )
+            row["LTP"] = price
+        return _portfolio_frame(rows)
+
+    def fetch_mutual_fund_holdings(self, token: str) -> pd.DataFrame:
+        raise BrokerCapabilityError(
+            "DhanHQ does not expose a mutual-fund holdings endpoint. "
+            "Import a current mutual-fund statement CSV to include these assets."
+        )
+
+    def fetch_market_risk(self, token: str, ticker: str) -> dict[str, float]:
+        symbol = ticker.strip().upper()
+        if symbol not in TICKER_MAP:
+            raise ValueError("Risk checks are limited to supported NSE tickers.")
+        self._load_instruments(token)
+        security_id = self._security_ids_by_ticker.get(symbol)
+        if not security_id:
+            raise BrokerAPIError(f"Dhan has no NSE equity instrument for {symbol}.")
+        now = datetime.now(ZoneInfo(settings.timezone))
+        start = now.date() - timedelta(days=settings.market_lookback_days)
+        candles = self._request(
+            "POST",
+            "/charts/historical",
+            token,
+            body={
+                "securityId": security_id,
+                "exchangeSegment": "NSE_EQ",
+                "instrument": "EQUITY",
+                "expiryCode": 0,
+                "oi": False,
+                "fromDate": start.isoformat(),
+                "toDate": now.date().isoformat(),
+            },
+        )
+        if not isinstance(candles, dict):
+            raise BrokerAPIError("Dhan returned invalid historical candle data.")
+        frame = pd.DataFrame(
+            {
+                "High": candles.get("high", []),
+                "Low": candles.get("low", []),
+                "Close": candles.get("close", []),
+            }
+        )
+        from .upstox_helper import calculate_atr
+
+        atr = calculate_atr(frame["High"], frame["Low"], frame["Close"])
+        prices = self.fetch_live_prices(token, [symbol])
+        ltp = prices.get(symbol)
+        if ltp is None or ltp <= 0:
+            raise BrokerAPIError(f"Dhan returned no valid live price for {symbol}.")
+        return {
+            "LTP": ltp,
+            "ATR": atr,
+            "Risk_Boundary": ltp - settings.atr_multiplier * atr,
+        }
+
+    def place_order(
+        self, token: str, ticker: str, qty: int, transaction_type: str
+    ) -> Any:
+        symbol = ticker.strip().upper()
+        if symbol not in TICKER_MAP:
+            raise ValueError("Orders are limited to supported NSE tickers.")
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+            raise ValueError("Order quantity must be a positive whole number.")
+        side = transaction_type.strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("Transaction type must be BUY or SELL.")
+        self._load_instruments(token)
+        security_id = self._security_ids_by_ticker.get(symbol)
+        if not security_id:
+            raise BrokerAPIError(f"Dhan has no NSE equity instrument for {symbol}.")
+        payload = self._request(
+            "POST",
+            "/orders",
+            token,
+            body={
+                "dhanClientId": self.client_id,
+                "correlationId": "WealthHomeAI",
+                "transactionType": side,
+                "exchangeSegment": "NSE_EQ",
+                "productType": "CNC",
+                "orderType": "MARKET",
+                "validity": "DAY",
+                "securityId": security_id,
+                "quantity": qty,
+                "disclosedQuantity": 0,
+                "price": 0,
+                "triggerPrice": 0,
+                "afterMarketOrder": False,
+            },
+        )
+        if not isinstance(payload, dict) or not payload.get("orderId"):
+            raise BrokerAPIError("Dhan did not acknowledge the market order.")
+        return payload
+
+
 class AngelOneAdapter(BrokerInterface):
     """Angel One SmartAPI adapter using session-scoped account credentials."""
 
@@ -486,7 +1187,7 @@ class AngelOneAdapter(BrokerInterface):
         password: str | None = None,
         totp_secret: str | None = None,
     ) -> None:
-        self.api_key = (api_key or os.environ.get("ANGEL_API_KEY", "")).strip()
+        self.api_key = (api_key or "").strip()
         self.client_id = (client_id or "").strip()
         self._password = password or ""
         self._totp_secret = totp_secret or ""
@@ -648,11 +1349,11 @@ class AngelOneAdapter(BrokerInterface):
         return prices
 
     def fetch_market_risk(self, token: str, ticker: str) -> dict[str, float]:
-        """Return Angel One's live price and daily 14-period ATR floor."""
+        """Return Angel One's live price and configured ATR risk floor."""
         client = self._client(token)
         trading_symbol, symbol_token = self._symbol_details(client, ticker)
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
-        start = now - timedelta(days=60)
+        now = datetime.now(ZoneInfo(settings.timezone))
+        start = now - timedelta(days=settings.market_lookback_days)
         response = client.getCandleData(
             {
                 "exchange": "NSE",
@@ -683,7 +1384,11 @@ class AngelOneAdapter(BrokerInterface):
         ltp = _number((quote.get("data") or {}).get("ltp"), "last price")
         if atr <= 0 or ltp <= 0:
             raise BrokerAPIError(f"Angel One returned an invalid ATR for {ticker}.")
-        return {"LTP": ltp, "ATR": atr, "Risk_Boundary": ltp - 3 * atr}
+        return {
+            "LTP": ltp,
+            "ATR": atr,
+            "Risk_Boundary": ltp - settings.atr_multiplier * atr,
+        }
 
     def place_order(
         self, token: str, ticker: str, qty: int, transaction_type: str
@@ -722,7 +1427,31 @@ class BrokerFactory:
 
     @overload
     @staticmethod
-    def create_adapter(broker_name: Literal["Upstox"]) -> UpstoxAdapter: ...
+    def create_adapter(
+        broker_name: Literal["Upstox"],
+        *,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+    ) -> UpstoxAdapter: ...
+
+    @overload
+    @staticmethod
+    def create_adapter(
+        broker_name: Literal["Zerodha"],
+        *,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+    ) -> ZerodhaAdapter: ...
+
+    @overload
+    @staticmethod
+    def create_adapter(
+        broker_name: Literal["Dhan"],
+        *,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        client_id: str | None = None,
+    ) -> DhanAdapter: ...
 
     @overload
     @staticmethod
@@ -740,9 +1469,30 @@ class BrokerFactory:
         broker_name: str, **credentials: str | None
     ) -> BrokerInterface:
         if broker_name == "Upstox":
-            if credentials:
-                raise ValueError("Upstox credentials are read from the environment.")
-            return UpstoxAdapter()
+            unexpected = set(credentials) - {"api_key", "api_secret"}
+            if unexpected:
+                raise ValueError("Unsupported Upstox credential field.")
+            return UpstoxAdapter(
+                api_key=credentials.get("api_key"),
+                api_secret=credentials.get("api_secret"),
+            )
+        if broker_name == "Zerodha":
+            unexpected = set(credentials) - {"api_key", "api_secret"}
+            if unexpected:
+                raise ValueError("Unsupported Zerodha credential field.")
+            return ZerodhaAdapter(
+                api_key=credentials.get("api_key"),
+                api_secret=credentials.get("api_secret"),
+            )
+        if broker_name == "Dhan":
+            unexpected = set(credentials) - {"api_key", "api_secret", "client_id"}
+            if unexpected:
+                raise ValueError("Unsupported Dhan credential field.")
+            return DhanAdapter(
+                api_key=credentials.get("api_key"),
+                api_secret=credentials.get("api_secret"),
+                client_id=credentials.get("client_id"),
+            )
         if broker_name == "Angel One":
             unexpected = set(credentials) - {
                 "api_key",

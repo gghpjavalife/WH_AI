@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -17,9 +16,14 @@ from google.genai import types
 
 from .broker_factory import TICKER_MAP
 from .jev_rules import SECTOR_BY_TICKER
+from .settings import LLM_PROVIDER_BASE_URLS, settings
 
 GLOBAL_TICKER_MAP = TICKER_MAP
-UPSTOX_API_BASE = "https://api.upstox.com"
+
+
+class LLMProviderError(RuntimeError):
+    """A provider request failed before a valid analysis response was returned."""
+
 
 try:
     import pandas_ta as ta
@@ -36,11 +40,21 @@ def ask_llm_agent(
     available_cash: float,
     market_context: str,
     live_prices: dict[str, float],
+    api_key: str | None = None,
+    model: str | None = None,
+    provider: str = "Gemini",
+    base_url: str | None = None,
 ) -> dict[str, Any]:
-    """Return validated scenario recommendations from Gemini 3.8 Flash."""
-    api_key = os.environ.get("GEMINI_API_KEY")
+    """Return validated scenario recommendations from the selected LLM provider."""
+    api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError("Set GEMINI_API_KEY to enable portfolio analysis.")
+        raise RuntimeError(f"Enter an API key for {provider} beside the analysis button.")
+    if provider not in LLM_PROVIDER_BASE_URLS:
+        raise ValueError(f"Unsupported LLM provider: {provider}.")
+    provider_models = settings.llm_provider_models.get(provider, ())
+    selected_model = (model or (provider_models[0] if provider_models else "")).strip()
+    if not selected_model:
+        raise ValueError(f"Select or enter a model ID for {provider}.")
 
     prompt = f"""
 Act as a cautious quantitative portfolio analyst for Indian NSE equities. Treat
@@ -58,7 +72,7 @@ Broker-quoted NSE tickers (recommend only from this priced list):
 If the authenticated live-price list is empty, explain that current prices are
 unavailable and return an empty cash_deployment_list. Never produce an
 actionable candidate without a current price.
-Otherwise, assess up to 5 suitable, distinct NSE stocks from only the quoted
+Otherwise, assess up to {settings.llm_max_recommendations} suitable, distinct NSE stocks from only the quoted
 tickers. Make recommendations relevant to the user's scenario budget, portfolio
 concentration and diversification. State uncertainty and never promise returns.
 
@@ -89,43 +103,142 @@ The application's quoted LTP is the current reference, not an estimated price.
 Do not recommend symbols missing from the broker-quoted list.
 Do not wrap the JSON in Markdown fences or add text outside the object.
 """
-    with genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            retry_options=types.HttpRetryOptions(
-                attempts=4,
-                initial_delay=1.0,
-                max_delay=6.0,
-                exp_base=2.0,
-                jitter=0.2,
-                http_status_codes=[408, 429, 500, 502, 503, 504],
-            )
-        ),
-    ) as client:
-        chat = client.chats.create(
-            model="gemini-3.8-flash",
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
+    if provider == "Gemini":
+        with genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(
+                    attempts=settings.llm_retry_attempts,
+                    initial_delay=settings.llm_retry_initial_delay_seconds,
+                    max_delay=settings.llm_retry_max_delay_seconds,
+                    exp_base=settings.llm_retry_exponent,
+                    jitter=settings.llm_retry_jitter,
+                    http_status_codes=[408, 429, 500, 502, 503, 504],
+                )
             ),
+        ) as client:
+            chat = client.chats.create(
+                model=selected_model,
+                config=types.GenerateContentConfig(
+                    temperature=settings.llm_temperature,
+                    response_mime_type="application/json",
+                ),
+            )
+            response = chat.send_message(prompt)
+        content = response.text
+    else:
+        endpoint = (
+            base_url or LLM_PROVIDER_BASE_URLS[provider]
         )
-        response = chat.send_message(prompt)
-    content = response.text
+        if not endpoint:
+            raise ValueError(f"Enter an API base URL for {provider}.")
+        endpoint = endpoint.strip().rstrip("/")
+        parsed_endpoint = urlsplit(endpoint)
+        is_local_http = parsed_endpoint.hostname in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }
+        if (
+            not parsed_endpoint.hostname
+            or parsed_endpoint.username
+            or parsed_endpoint.password
+            or (
+                parsed_endpoint.scheme != "https"
+                and not (parsed_endpoint.scheme == "http" and is_local_http)
+            )
+        ):
+            raise ValueError(
+                "Use a secure HTTPS API base URL (HTTP is allowed for localhost)."
+            )
+        if provider == "Anthropic":
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": selected_model,
+                "max_tokens": 4096,
+                "temperature": settings.llm_temperature,
+                "system": (
+                    "Return only a JSON object matching the requested schema. "
+                    "Do not include Markdown fences."
+                ),
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            response_path = ("content", 0, "text")
+        else:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": selected_model,
+                "temperature": settings.llm_temperature,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            response_path = ("choices", 0, "message", "content")
+        try:
+            provider_response = requests.post(
+                f"{endpoint}/"
+                + ("messages" if provider == "Anthropic" else "chat/completions"),
+                headers=headers,
+                json=payload,
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+            )
+            provider_response.raise_for_status()
+            response_data = provider_response.json()
+        except ValueError as exc:
+            raise LLMProviderError(
+                f"{provider} returned a response that was not valid JSON."
+            ) from exc
+        except requests.RequestException as exc:
+            status_code = (
+                exc.response.status_code if getattr(exc, "response", None) else None
+            )
+            if status_code == 401:
+                detail = "The API key was rejected."
+            elif status_code == 429:
+                detail = "The provider rate limit or quota was reached."
+            elif status_code == 404:
+                detail = "The model or API endpoint was not found."
+            else:
+                detail = "Check the provider endpoint and network connection."
+            status = f" (HTTP {status_code})" if status_code else ""
+            raise LLMProviderError(
+                f"{provider} request failed{status}. {detail}"
+            ) from exc
+        try:
+            response_node: Any = response_data
+            for path_part in response_path:
+                response_node = response_node[path_part]
+            content = (
+                response_node
+                if isinstance(response_node, str)
+                else None
+            )
+        except (IndexError, KeyError, TypeError):
+            content = None
     if not content:
-        raise RuntimeError("Gemini returned an empty analysis response.")
+        raise RuntimeError(f"{provider} returned an empty analysis response.")
     try:
         result = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Gemini returned invalid JSON.") from exc
+        raise RuntimeError(f"{provider} returned invalid JSON.") from exc
     if not isinstance(result, dict) or not isinstance(
         result.get("cash_deployment_list"), list
     ):
-        raise RuntimeError("Gemini response is missing the required JSON fields.")
+        raise RuntimeError(f"{provider} response is missing the required JSON fields.")
     if set(result) != {"analysis", "cash_deployment_list"}:
-        raise RuntimeError("Gemini returned unexpected top-level JSON fields.")
+        raise RuntimeError(f"{provider} returned unexpected top-level JSON fields.")
     analysis = result.get("analysis")
     if not isinstance(analysis, str):
-        raise RuntimeError("Gemini analysis must be a string.")
+        raise RuntimeError(f"{provider} analysis must be a string.")
 
     targets = []
     seen_tickers: set[str] = set()
@@ -140,7 +253,7 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
     priced_tickers = set(normalized_live_prices)
     for target in result["cash_deployment_list"]:
         if not isinstance(target, dict):
-            raise RuntimeError("Gemini returned a malformed trade target.")
+            raise RuntimeError(f"{provider} returned a malformed trade target.")
         ticker = str(target.get("Ticker", "")).strip().upper()
         try:
             target_price = float(target.get("Target_Price"))
@@ -150,7 +263,7 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
             score = float(target.get("Confidence_Score"))
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
-                "Gemini returned invalid entry, target, stop, risk/reward, "
+                f"{provider} returned invalid entry, target, stop, risk/reward, "
                 "or confidence values."
             ) from exc
         if ticker not in priced_tickers:
@@ -175,7 +288,9 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
             or not isinstance(target.get("Risk_Rationale"), str)
             or not isinstance(target.get("Holding_Period"), str)
         ):
-            raise RuntimeError("Gemini returned an unsupported or invalid trade target.")
+            raise RuntimeError(
+                f"{provider} returned an unsupported or invalid trade target."
+            )
         seen_tickers.add(ticker)
         calculated_risk_reward = (target_price - entry_price) / (
             entry_price - stop_loss
@@ -208,9 +323,11 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
 
 
 def calculate_atr(
-    high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    length: int | None = None,
 ) -> float:
     """Compute the latest Wilder ATR, preferring pandas-ta when installed."""
+    length = settings.atr_period if length is None else length
     high = pd.to_numeric(high, errors="coerce")
     low = pd.to_numeric(low, errors="coerce")
     close = pd.to_numeric(close, errors="coerce")
@@ -260,15 +377,18 @@ def fetch_atr_and_ltp(
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}",
     }
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    from_date = today - timedelta(days=60)
+    today = datetime.now(ZoneInfo(settings.timezone)).date()
+    from_date = today - timedelta(days=settings.market_lookback_days)
     encoded_key = quote(resolved_key, safe="")
 
     candle_response = requests.get(
-        f"{UPSTOX_API_BASE}/v3/historical-candle/{encoded_key}/days/1/"
+        f"{settings.upstox_api_base}/v3/historical-candle/{encoded_key}/days/1/"
         f"{today.isoformat()}/{from_date.isoformat()}",
         headers=headers,
-        timeout=(5, 20),
+        timeout=(
+            settings.http_connect_timeout_seconds,
+            settings.http_read_timeout_seconds,
+        ),
     )
     candle_response.raise_for_status()
     candle_payload = candle_response.json()
@@ -285,10 +405,13 @@ def fetch_atr_and_ltp(
     )
 
     quote_response = requests.get(
-        f"{UPSTOX_API_BASE}/v2/market-quote/ltp",
+        f"{settings.upstox_api_base}/v2/market-quote/ltp",
         params={"instrument_key": resolved_key},
         headers=headers,
-        timeout=(5, 20),
+        timeout=(
+            settings.http_connect_timeout_seconds,
+            settings.http_read_timeout_seconds,
+        ),
     )
     quote_response.raise_for_status()
     quote_payload = quote_response.json()
@@ -300,23 +423,38 @@ def fetch_atr_and_ltp(
         raise ValueError(f"Upstox returned no valid live price for {symbol}.") from exc
     if not isfinite(ltp) or ltp <= 0:
         raise ValueError(f"Upstox returned no valid live price for {symbol}.")
-    return {"LTP": ltp, "ATR": atr, "Risk_Boundary": ltp - 3 * atr}
+    return {
+        "LTP": ltp,
+        "ATR": atr,
+        "Risk_Boundary": ltp - settings.atr_multiplier * atr,
+    }
 
 
-def send_telegram_alert(message: str, chat_id: str | None = None) -> None:
+def send_telegram_alert(
+    message: str,
+    *,
+    chat_id: str,
+    bot_token: str,
+) -> None:
     """Send an alert to the configured Telegram bot and chat."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    destination = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    token = bot_token.strip()
+    destination = chat_id.strip()
     if not token:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN to enable Telegram alerts.")
     if not destination:
         raise RuntimeError("Set a Telegram chat ID to enable Telegram alerts.")
     response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"{settings.telegram_api_base}/bot{token}/sendMessage",
         json={"chat_id": destination, "text": message},
-        timeout=(5, 15),
+        timeout=(
+            settings.http_connect_timeout_seconds,
+            settings.telegram_read_timeout_seconds,
+        ),
     )
     response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Telegram returned an invalid response.") from exc
+    if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError("Telegram did not accept the alert.")
