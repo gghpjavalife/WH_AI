@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -17,7 +18,6 @@ LLM_PROVIDER_BASE_URLS = {
     "Gemini": None,
     "OpenAI": "https://api.openai.com/v1",
     "Anthropic": "https://api.anthropic.com/v1",
-    "OpenRouter": "https://openrouter.ai/api/v1",
     "Groq": "https://api.groq.com/openai/v1",
     "Together AI": "https://api.together.xyz/v1",
     "Mistral": "https://api.mistral.ai/v1",
@@ -37,11 +37,6 @@ DEFAULT_LLM_PROVIDER_MODELS = {
         "claude-3-7-sonnet-latest",
         "claude-sonnet-4-20250514",
     ),
-    "OpenRouter": (
-        "openai/gpt-4o-mini",
-        "anthropic/claude-3.5-haiku",
-        "google/gemini-2.5-flash",
-    ),
     "Groq": (
         "llama-3.3-70b-versatile",
         "deepseek-r1-distill-llama-70b",
@@ -58,19 +53,48 @@ DEFAULT_LLM_PROVIDER_MODELS = {
 }
 
 
-def _int_env(name: str, default: int) -> int:
+def configured_value(name: str, default: Any = "") -> Any:
+    """Read a deployment setting from environment variables or Streamlit secrets."""
     value = os.environ.get(name)
+    if value is not None:
+        return value
+    try:
+        import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+
+        if not st.runtime.exists():
+            return default
+        return st.secrets.get(name, default)
+    except (StreamlitSecretNotFoundError, RuntimeError):
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    value = configured_value(name, None)
     return default if value is None else int(value)
 
 
 def _float_env(name: str, default: float) -> float:
-    value = os.environ.get(name)
+    value = configured_value(name, None)
     return default if value is None else float(value)
+
+
+def _dynamic_broker_hosts() -> tuple[str, ...]:
+    configured = configured_value("DYNAMIC_BROKER_ALLOWED_HOSTS", "")
+    values = configured.split(",") if isinstance(configured, str) else configured
+    if not isinstance(values, (list, tuple)):
+        return ()
+    return tuple(str(host).strip().lower() for host in values if str(host).strip())
+
+
+APP_BRAND = "GGHP"
+APP_BRAND_EXPANSION = "Governed Growth & Hedged Portfolios"
+APP_BRAND_DESCRIPTION = "Governed multi-broker portfolio companion"
 
 
 @dataclass(frozen=True)
 class Settings:
-    app_title: str = "🏡 Wealth Home: Safe Multi-Broker Portfolio & AI Companion"
+    app_title: str = f"{APP_BRAND} | Governed Portfolio Companion"
     timezone: str = "Asia/Kolkata"
     default_redirect_uri: str = "http://localhost:8501"
     upstox_redirect_uri: str = ""
@@ -84,12 +108,10 @@ class Settings:
     dhan_instruments_url: str = (
         "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
     )
-    telegram_api_base: str = "https://api.telegram.org"
     oauth_database_path: str = str(PROJECT_ROOT / ".wealth_home_oauth.sqlite3")
     oauth_credential_encryption_key: str = ""
     http_connect_timeout_seconds: int = 5
     http_read_timeout_seconds: int = 20
-    telegram_read_timeout_seconds: int = 15
     database_timeout_seconds: int = 10
     oauth_state_ttl_seconds: int = 600
     market_lookback_days: int = 60
@@ -110,12 +132,17 @@ class Settings:
     llm_retry_max_delay_seconds: float = 6.0
     llm_retry_exponent: float = 2.0
     llm_retry_jitter: float = 0.2
+    resend_api_key: str = ""
+    resend_sender: str = ""
+    turso_primary_db_url: str = ""
+    turso_auth_token: str = ""
+    dynamic_broker_allowed_hosts: tuple[str, ...] = ()
+    require_login: bool = False
 
     def __post_init__(self) -> None:
         positive_values = (
             self.http_connect_timeout_seconds,
             self.http_read_timeout_seconds,
-            self.telegram_read_timeout_seconds,
             self.database_timeout_seconds,
             self.oauth_state_ttl_seconds,
             self.market_lookback_days,
@@ -173,7 +200,7 @@ class Settings:
                     dict.fromkeys(model.strip() for model in models)
                 )
         return cls(
-            app_title=os.environ.get("APP_TITLE", defaults.app_title),
+            app_title=os.environ.get("APP_TITLE", "").strip() or defaults.app_title,
             timezone=os.environ.get("APP_TIMEZONE", defaults.timezone),
             default_redirect_uri=os.environ.get(
                 "DEFAULT_REDIRECT_URI", defaults.default_redirect_uri
@@ -201,9 +228,6 @@ class Settings:
             dhan_instruments_url=os.environ.get(
                 "DHAN_INSTRUMENTS_URL", defaults.dhan_instruments_url
             ),
-            telegram_api_base=os.environ.get(
-                "TELEGRAM_API_BASE", defaults.telegram_api_base
-            ),
             oauth_database_path=(
                 os.environ.get("WEALTH_HOME_OAUTH_DB", "").strip()
                 or defaults.oauth_database_path
@@ -217,10 +241,6 @@ class Settings:
             ),
             http_read_timeout_seconds=_int_env(
                 "HTTP_READ_TIMEOUT_SECONDS", defaults.http_read_timeout_seconds
-            ),
-            telegram_read_timeout_seconds=_int_env(
-                "TELEGRAM_READ_TIMEOUT_SECONDS",
-                defaults.telegram_read_timeout_seconds,
             ),
             database_timeout_seconds=_int_env(
                 "DATABASE_TIMEOUT_SECONDS", defaults.database_timeout_seconds
@@ -276,6 +296,17 @@ class Settings:
             llm_retry_jitter=_float_env(
                 "LLM_RETRY_JITTER", defaults.llm_retry_jitter
             ),
+            resend_api_key=str(configured_value("RESEND_API_KEY", "")).strip(),
+            resend_sender=str(configured_value("RESEND_SENDER", "")).strip(),
+            turso_primary_db_url=str(
+                configured_value("TURSO_PRIMARY_DB_URL", "")
+            ).strip(),
+            turso_auth_token=str(configured_value("TURSO_AUTH_TOKEN", "")).strip(),
+            dynamic_broker_allowed_hosts=_dynamic_broker_hosts(),
+            require_login=str(
+                configured_value("WEALTH_HOME_REQUIRE_LOGIN", "false")
+            ).strip().lower()
+            in {"1", "true", "yes"},
         )
 
 

@@ -13,7 +13,6 @@ from .portfolio import calculate_allocation
 ALLOCATION_DESCRIPTIONS = {
     "Equity": "Broker-reported long-term equity holdings",
     "Trading": "Open broker-reported trading positions (gross exposure)",
-    "Debt": "Debt assets entered by you in this workspace",
     "Mutual funds": "Units valued at each fund's latest reported NAV",
     "Options": "Not separately classified by the current broker adapter",
     "Futures": "Not separately classified by the current broker adapter",
@@ -22,18 +21,16 @@ ALLOCATION_COLORS = {
     "dark": {
         "Equity": "#2563EB",
         "Trading": "#7C3AED",
-        "Debt": "#0F766E",
         "Mutual funds": "#B45309",
-        "Options": "#475569",
-        "Futures": "#334155",
+        "Options": "#BE185D",
+        "Futures": "#475569",
     },
     "light": {
         "Equity": "#1D4ED8",
         "Trading": "#6D28D9",
-        "Debt": "#047857",
-        "Mutual funds": "#92400E",
-        "Options": "#475569",
-        "Futures": "#334155",
+        "Mutual funds": "#B45309",
+        "Options": "#BE185D",
+        "Futures": "#475569",
     },
 }
 
@@ -47,6 +44,8 @@ def build_allocation_chart(
     total = metrics["total_investments"]
     chart = go.Figure()
     for asset_name, value in metrics["allocation"].items():
+        if value <= 0:
+            continue
         share = value / total * 100 if total else 0.0
         chart.add_trace(
             go.Bar(
@@ -56,7 +55,14 @@ def build_allocation_chart(
                 orientation="h",
                 marker={
                     "color": palette[asset_name],
-                    "line": {"color": "rgba(255,255,255,0.82)", "width": 1.5},
+                    "line": {
+                        "color": (
+                            "rgba(255,255,255,0.24)"
+                            if theme_type == "dark"
+                            else "rgba(15,23,42,0.18)"
+                        ),
+                        "width": 1,
+                    },
                 },
                 customdata=[
                     [
@@ -93,6 +99,7 @@ def build_allocation_chart(
         },
         barmode="stack",
         barnorm="percent",
+        transition={"duration": 650, "easing": "cubic-in-out"},
         height=135,
         margin={"l": 8, "r": 8, "t": 0, "b": 0},
         showlegend=True,
@@ -103,6 +110,7 @@ def build_allocation_chart(
             "xanchor": "left",
             "font": {"size": 12, "color": font_color},
             "itemsizing": "constant",
+            "traceorder": "normal",
         },
         xaxis={
             "visible": False,
@@ -123,16 +131,13 @@ def render_home_dashboard(
     equity_holdings: pd.DataFrame,
     trading_positions: pd.DataFrame,
     mutual_funds: pd.DataFrame,
-    debt_holdings: pd.DataFrame,
 ) -> dict[str, Any]:
     metrics = calculate_allocation(
         balance,
         equity_holdings,
         trading_positions,
         mutual_funds,
-        debt_holdings,
     )
-    st.subheader("Your portfolio at a glance", divider="gray")
     with st.container(horizontal=True):
         st.metric(
             "Invested",
@@ -168,12 +173,12 @@ def render_home_dashboard(
             chart = build_allocation_chart(metrics, theme_type)
             st.plotly_chart(chart, width="stretch", key="portfolio_allocation")
         else:
-            st.info("Connect and sync a broker, or add debt assets, to see allocation.")
+            st.info("Connect and sync a broker to see allocation.")
 
     st.caption(
         "Hover any segment for value, share, position count, and P&L. Cash is "
-        "separate; mutual funds use the latest reported NAV and debt values are "
-        "user-entered. Options and futures are not separately classified by the "
+        "separate; mutual funds use the latest reported NAV. "
+        "Options and futures are not separately classified by the "
         "connected broker yet."
     )
     return metrics

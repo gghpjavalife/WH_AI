@@ -1,2 +1,58 @@
 [client]
 toolbarMode = "viewer"
+
+[theme]
+base = "light"
+primaryColor = "#1D4ED8"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#172033"
+borderColor = "#C9A227"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
+linkUnderline = false
+redColor = "#B42318"
+orangeColor = "#B45309"
+yellowColor = "#B8860B"
+greenColor = "#16803C"
+blueColor = "#1D4ED8"
+violetColor = "#6D28D9"
+grayColor = "#57606A"
+chartCategoricalColors = ["#1D4ED8", "#6D28D9", "#047857", "#B45309", "#BE185D", "#475569"]
+
+[theme.light]
+primaryColor = "#1D4ED8"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#172033"
+borderColor = "#C9A227"
+chartCategoricalColors = ["#2563EB", "#7C3AED", "#0F766E", "#B45309", "#BE185D", "#475569"]
+
+[theme.dark]
+primaryColor = "#60A5FA"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#151F30"
+textColor = "#E5EDF7"
+borderColor = "#D4AF37"
+redColor = "#F97066"
+orangeColor = "#F79009"
+yellowColor = "#FEC84B"
+greenColor = "#32D583"
+blueColor = "#60A5FA"
+violetColor = "#A78BFA"
+grayColor = "#98A2B3"
+chartCategoricalColors = ["#1D4ED8", "#6D28D9", "#047857", "#B45309", "#BE185D", "#475569"]
+
+[theme.light.sidebar]
+backgroundColor = "#F1F5F9"
+secondaryBackgroundColor = "#E8EEF6"
+textColor = "#172033"
+borderColor = "#C9A227"
+
+[theme.dark.sidebar]
+backgroundColor = "#101A2B"
+secondaryBackgroundColor = "#19263A"
+textColor = "#E5EDF7"
+borderColor = "#D4AF37"

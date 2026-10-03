@@ -1,4 +1,4 @@
-"""AI analysis, Upstox market data, and Telegram notifications."""
+"""AI analysis and Upstox market data helpers."""
 
 from __future__ import annotations
 
@@ -12,17 +12,76 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 from google import genai
+from google.genai.errors import APIError
 from google.genai import types
 
 from .broker_factory import TICKER_MAP
+from .cloud_services import execute_turso_query, send_resend_email
 from .jev_rules import SECTOR_BY_TICKER
-from .settings import LLM_PROVIDER_BASE_URLS, settings
+from .settings import LLM_PROVIDER_BASE_URLS, configured_value, settings
 
 GLOBAL_TICKER_MAP = TICKER_MAP
 
-
 class LLMProviderError(RuntimeError):
     """A provider request failed before a valid analysis response was returned."""
+
+
+def _whatsapp_configuration(
+    configuration: dict[str, str] | None = None,
+) -> dict[str, str]:
+    supplied = configuration or {}
+    result: dict[str, str] = {}
+    for name, environment_name in (
+        ("account_sid", "TWILIO_ACCOUNT_SID"),
+        ("auth_token", "TWILIO_AUTH_TOKEN"),
+        ("sender", "TWILIO_WHATSAPP_SENDER"),
+        ("recipient", "TWILIO_WHATSAPP_RECIPIENT"),
+    ):
+        result[name] = str(supplied.get(name, "")).strip() or str(
+            configured_value(environment_name, "")
+        ).strip()
+    return result
+
+
+def whatsapp_update_is_configured(
+    configuration: dict[str, str] | None = None,
+) -> bool:
+    return all(_whatsapp_configuration(configuration).values())
+
+
+def send_whatsapp_update(
+    message: str,
+    configuration: dict[str, str] | None = None,
+) -> None:
+    """Send a WhatsApp update using explicitly supplied or server-secret settings."""
+    from .notifications import send_whatsapp_alert
+
+    values = _whatsapp_configuration(configuration)
+    send_whatsapp_alert(
+        message,
+        account_sid=values.get("account_sid", ""),
+        auth_token=values.get("auth_token", ""),
+        sender=values.get("sender", ""),
+        recipient=values.get("recipient", ""),
+    )
+
+
+def send_email_update(
+    subject: str,
+    html_content: str,
+    user_email: str,
+    *,
+    api_key: str | None = None,
+    sender: str | None = None,
+) -> str:
+    """Send an HTML notification via Resend using a session/server-held key."""
+    return send_resend_email(
+        subject,
+        html_content,
+        user_email,
+        api_key=api_key,
+        sender=sender,
+    )
 
 
 try:
@@ -36,16 +95,26 @@ def _ticker_universe() -> str:
 
 
 def ask_llm_agent(
-    portfolio_summary: str,
-    available_cash: float,
-    market_context: str,
-    live_prices: dict[str, float],
+    user_key: str | None = None,
+    portfolio_summary: str = "",
+    available_cash: float = 0.0,
+    market_context: str = "",
+    live_prices: dict[str, float] | None = None,
+    candidate_tickers: list[str] | None = None,
     api_key: str | None = None,
     model: str | None = None,
-    provider: str = "Gemini",
+    provider: str | None = None,
     base_url: str | None = None,
 ) -> dict[str, Any]:
     """Return validated scenario recommendations from the selected LLM provider."""
+    provider = provider or "Gemini"
+    api_key = api_key or user_key
+    live_prices = live_prices or {}
+    allowed_candidates = (
+        {str(ticker).strip().upper() for ticker in candidate_tickers}
+        if candidate_tickers is not None
+        else None
+    )
     api_key = (api_key or "").strip()
     if not api_key:
         raise RuntimeError(f"Enter an API key for {provider} beside the analysis button.")
@@ -75,6 +144,9 @@ actionable candidate without a current price.
 Otherwise, assess up to {settings.llm_max_recommendations} suitable, distinct NSE stocks from only the quoted
 tickers. Make recommendations relevant to the user's scenario budget, portfolio
 concentration and diversification. State uncertainty and never promise returns.
+When a rules-based scan candidate list is supplied, recommend only tickers in that
+list; it contains only Strong Buy/Buy stocks and their indicator-check scores.
+If that list is empty, return an empty cash_deployment_list.
 
 Return a JSON object with exactly these top-level properties:
 {{
@@ -269,6 +341,9 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
         if ticker not in priced_tickers:
             rejected_targets += 1
             continue
+        if allowed_candidates is not None and ticker not in allowed_candidates:
+            rejected_targets += 1
+            continue
         if ticker in seen_tickers:
             rejected_targets += 1
             continue
@@ -428,33 +503,3 @@ def fetch_atr_and_ltp(
         "ATR": atr,
         "Risk_Boundary": ltp - settings.atr_multiplier * atr,
     }
-
-
-def send_telegram_alert(
-    message: str,
-    *,
-    chat_id: str,
-    bot_token: str,
-) -> None:
-    """Send an alert to the configured Telegram bot and chat."""
-    token = bot_token.strip()
-    destination = chat_id.strip()
-    if not token:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN to enable Telegram alerts.")
-    if not destination:
-        raise RuntimeError("Set a Telegram chat ID to enable Telegram alerts.")
-    response = requests.post(
-        f"{settings.telegram_api_base}/bot{token}/sendMessage",
-        json={"chat_id": destination, "text": message},
-        timeout=(
-            settings.http_connect_timeout_seconds,
-            settings.telegram_read_timeout_seconds,
-        ),
-    )
-    response.raise_for_status()
-    try:
-        result = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Telegram returned an invalid response.") from exc
-    if not isinstance(result, dict) or not result.get("ok"):
-        raise RuntimeError("Telegram did not accept the alert.")

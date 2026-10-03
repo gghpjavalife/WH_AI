@@ -5,12 +5,13 @@ from __future__ import annotations
 import abc
 import csv
 import hashlib
+import ipaddress
 import io
 import secrets
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any, Literal, overload
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -35,6 +36,7 @@ PORTFOLIO_COLUMNS = ["Ticker", "Qty", "Avg_Price", "LTP"]
 MUTUAL_FUND_COLUMNS = [
     "Fund",
     "Folio",
+    "ISIN",
     "Units",
     "Avg_NAV",
     "Latest_NAV",
@@ -147,6 +149,10 @@ class BrokerInterface(abc.ABC):
     def fetch_balance(self, token: str) -> float:
         """Return available cash/margin in INR."""
 
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        """Return safe, non-sensitive profile fields when supported."""
+        raise BrokerCapabilityError("This broker does not expose a profile endpoint.")
+
     @abc.abstractmethod
     def fetch_positions(self, token: str) -> pd.DataFrame:
         """Return positions using PORTFOLIO_COLUMNS."""
@@ -246,10 +252,19 @@ class UpstoxAdapter(BrokerInterface):
         configuration.access_token = token
         return ApiClient(configuration)
 
+    @staticmethod
+    def _request_timeout() -> tuple[int, int]:
+        return (
+            settings.http_connect_timeout_seconds,
+            settings.http_read_timeout_seconds,
+        )
+
     def fetch_balance(self, token: str) -> float:
         try:
             response = UserApi(self._api_client(token)).get_user_fund_margin(
-                api_version="2.0", segment="SEC"
+                api_version="2.0",
+                segment="SEC",
+                _request_timeout=self._request_timeout(),
             )
         except ApiException as exc:
             raise BrokerAPIError("Unable to retrieve the Upstox cash balance.") from exc
@@ -260,10 +275,27 @@ class UpstoxAdapter(BrokerInterface):
             raise BrokerAPIError("Upstox returned no available-margin value.")
         return _number(balance, "available margin")
 
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        try:
+            response = UserApi(self._api_client(token)).get_profile(
+                api_version="2.0",
+                _request_timeout=self._request_timeout(),
+            )
+        except ApiException as exc:
+            raise BrokerAPIError("Unable to retrieve the Upstox profile.") from exc
+        data = _field(response, "data", {}) or {}
+        return {
+            "name": str(
+                _field(data, "user_name", _field(data, "user_shortname", "")) or ""
+            ),
+            "user_id": str(_field(data, "user_id", "") or ""),
+        }
+
     def fetch_positions(self, token: str) -> pd.DataFrame:
         try:
             response = PortfolioApi(self._api_client(token)).get_positions(
-                api_version="2.0"
+                api_version="2.0",
+                _request_timeout=self._request_timeout(),
             )
         except ApiException as exc:
             raise BrokerAPIError("Unable to retrieve Upstox positions.") from exc
@@ -298,7 +330,8 @@ class UpstoxAdapter(BrokerInterface):
     def fetch_holdings(self, token: str) -> pd.DataFrame:
         try:
             response = PortfolioApi(self._api_client(token)).get_holdings(
-                api_version="2.0"
+                api_version="2.0",
+                _request_timeout=self._request_timeout(),
             )
         except ApiException as exc:
             raise BrokerAPIError("Unable to retrieve Upstox equity holdings.") from exc
@@ -336,7 +369,8 @@ class UpstoxAdapter(BrokerInterface):
         if instrument_tickers:
             try:
                 quote_response = MarketQuoteV3Api(self._api_client(token)).get_ltp(
-                    instrument_key=",".join(instrument_tickers)
+                    instrument_key=",".join(instrument_tickers),
+                    _request_timeout=self._request_timeout(),
                 )
             except ApiException as exc:
                 raise BrokerAPIError(
@@ -364,7 +398,9 @@ class UpstoxAdapter(BrokerInterface):
 
     def fetch_mutual_fund_holdings(self, token: str) -> pd.DataFrame:
         try:
-            response = MutualFundApi(self._api_client(token)).get_mutual_fund_holdings()
+            response = MutualFundApi(self._api_client(token)).get_mutual_fund_holdings(
+                _request_timeout=self._request_timeout()
+            )
         except ApiException as exc:
             raise BrokerAPIError(
                 "Unable to retrieve Upstox mutual-fund holdings."
@@ -387,6 +423,7 @@ class UpstoxAdapter(BrokerInterface):
                 {
                     "Fund": str(_field(holding, "fund", "Unknown fund")),
                     "Folio": str(_field(holding, "folio", "") or ""),
+                    "ISIN": str(_field(holding, "instrument_key", "") or ""),
                     "Units": units,
                     "Avg_NAV": average_nav,
                     "Latest_NAV": nav,
@@ -402,18 +439,24 @@ class UpstoxAdapter(BrokerInterface):
             **self.TICKER_MAP,
             **self._instrument_keys_by_ticker,
         }
+        if tickers is not None:
+            try:
+                from .market_research import fetch_nse_equity_master
+
+                nse_master = fetch_nse_equity_master()
+                for row in nse_master.itertuples(index=False):
+                    symbol = str(row.Symbol).strip().upper()
+                    isin = str(row.ISIN).strip().upper()
+                    if symbol and isin:
+                        available_instruments.setdefault(symbol, f"NSE_EQ|{isin}")
+            except (BrokerAPIError, requests.RequestException, RuntimeError, ValueError):
+                pass
         symbols = (
             sorted({ticker.strip().upper() for ticker in tickers})
             if tickers is not None
             else sorted(available_instruments)
         )
-        unsupported = [
-            symbol for symbol in symbols if symbol not in available_instruments
-        ]
-        if unsupported:
-            raise ValueError(
-                "Live quotes are limited to known Upstox NSE instrument keys."
-            )
+        symbols = [symbol for symbol in symbols if symbol in available_instruments]
         if not symbols:
             return {}
         instrument_keys = ",".join(
@@ -421,7 +464,8 @@ class UpstoxAdapter(BrokerInterface):
         )
         try:
             response = MarketQuoteV3Api(self._api_client(token)).get_ltp(
-                instrument_key=instrument_keys
+                instrument_key=instrument_keys,
+                _request_timeout=self._request_timeout(),
             )
         except ApiException as exc:
             raise BrokerAPIError("Unable to retrieve Upstox live market prices.") from exc
@@ -480,6 +524,7 @@ class UpstoxAdapter(BrokerInterface):
                     is_amo=False,
                 ),
                 api_version="2.0",
+                _request_timeout=self._request_timeout(),
             )
         except ApiException as exc:
             raise BrokerAPIError("Upstox rejected the market order.") from exc
@@ -593,6 +638,13 @@ class ZerodhaAdapter(BrokerInterface):
             raise BrokerAPIError("Zerodha returned no available-cash balance.")
         return _number(balance, "available cash")
 
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        data = self._request("GET", "/user/profile", token)
+        return {
+            "name": str(data.get("user_name") or data.get("user_shortname") or ""),
+            "user_id": str(data.get("user_id") or ""),
+        }
+
     def fetch_positions(self, token: str) -> pd.DataFrame:
         data = self._request("GET", "/portfolio/positions", token)
         rows = []
@@ -640,10 +692,38 @@ class ZerodhaAdapter(BrokerInterface):
         return _portfolio_frame(rows)
 
     def fetch_mutual_fund_holdings(self, token: str) -> pd.DataFrame:
-        raise BrokerCapabilityError(
-            "Kite Connect does not expose a mutual-fund holdings endpoint. "
-            "Import a current mutual-fund statement CSV to include these assets."
-        )
+        holdings = self._request("GET", "/mf/holdings", token)
+        if not isinstance(holdings, list):
+            raise BrokerAPIError(
+                "Zerodha returned an invalid mutual-fund holdings response."
+            )
+        rows = []
+        for holding in holdings:
+            if not isinstance(holding, dict):
+                raise BrokerAPIError(
+                    "Zerodha returned an invalid mutual-fund holding."
+                )
+            units = _number(holding.get("quantity"), "mutual-fund units")
+            latest_nav = _number(holding.get("last_price"), "latest mutual-fund NAV")
+            average_nav = _number(
+                holding.get("average_price"), "average mutual-fund NAV"
+            )
+            if units < 0 or latest_nav <= 0 or average_nav < 0:
+                raise BrokerAPIError(
+                    "Zerodha returned invalid mutual-fund holding values."
+                )
+            rows.append(
+                {
+                    "Fund": str(holding.get("fund") or "Unknown fund"),
+                    "Folio": str(holding.get("folio") or ""),
+                    "ISIN": str(holding.get("tradingsymbol") or ""),
+                    "Units": units,
+                    "Avg_NAV": average_nav,
+                    "Latest_NAV": latest_nav,
+                    "NAV_Date": str(holding.get("last_price_date") or ""),
+                }
+            )
+        return pd.DataFrame(rows, columns=MUTUAL_FUND_COLUMNS)
 
     def fetch_live_prices(
         self, token: str, tickers: list[str] | None = None
@@ -653,9 +733,6 @@ class ZerodhaAdapter(BrokerInterface):
             if tickers is not None
             else set(TICKER_MAP)
         )
-        unsupported = [symbol for symbol in symbols if symbol not in TICKER_MAP]
-        if unsupported:
-            raise ValueError("Live quotes are limited to supported NSE tickers.")
         if not symbols:
             return {}
         data = self._request(
@@ -932,6 +1009,19 @@ class DhanAdapter(BrokerInterface):
             raise BrokerAPIError("Dhan returned no available-cash balance.")
         return _number(balance, "available cash")
 
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        payload = self._request("GET", "/profile", token)
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict):
+            raise BrokerAPIError("Dhan returned an invalid profile response.")
+        return {
+            "name": str(payload.get("dhanClientName") or payload.get("name") or ""),
+            "user_id": str(
+                payload.get("dhanClientId") or payload.get("clientId") or ""
+            ),
+        }
+
     def _load_instruments(self, token: str) -> None:
         if self._security_ids_by_ticker:
             return
@@ -989,9 +1079,6 @@ class DhanAdapter(BrokerInterface):
         unsupported = sorted(
             requested_symbols - self._security_ids_by_ticker.keys()
         )
-        if unsupported:
-            if tickers is not None:
-                raise ValueError("Live quotes are limited to supported Dhan NSE tickers.")
         symbols = sorted(requested_symbols & self._security_ids_by_ticker.keys())
         if not symbols:
             return {}
@@ -1233,6 +1320,16 @@ class AngelOneAdapter(BrokerInterface):
             raise BrokerAPIError("Angel One returned no available-cash value.")
         return _number(balance, "available cash")
 
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        response = self._client(token).getProfile(token)
+        if not isinstance(response, dict) or not response.get("status"):
+            raise BrokerAPIError("Unable to retrieve the Angel One profile.")
+        data = response.get("data") or {}
+        return {
+            "name": str(data.get("name") or data.get("clientName") or ""),
+            "user_id": str(data.get("clientcode") or self.client_id or ""),
+        }
+
     @staticmethod
     def _symbol_details(client: SmartConnect, ticker: str) -> tuple[str, str]:
         symbol = ticker.upper().removesuffix("-EQ")
@@ -1329,13 +1426,13 @@ class AngelOneAdapter(BrokerInterface):
             if tickers is not None
             else sorted(TICKER_MAP)
         )
-        unsupported = [symbol for symbol in symbols if symbol not in TICKER_MAP]
-        if unsupported:
-            raise ValueError("Live quotes are limited to supported NSE tickers.")
         client = self._client(token)
         prices: dict[str, float] = {}
         for ticker in symbols:
-            trading_symbol, symbol_token = self._symbol_details(client, ticker)
+            try:
+                trading_symbol, symbol_token = self._symbol_details(client, ticker)
+            except BrokerAPIError:
+                continue
             response = client.ltpData("NSE", trading_symbol, symbol_token)
             if not isinstance(response, dict) or not response.get("status"):
                 raise BrokerAPIError(
@@ -1420,6 +1517,203 @@ class AngelOneAdapter(BrokerInterface):
         if not response:
             raise BrokerAPIError("Angel One did not acknowledge the market order.")
         return response
+
+
+class GenericDynamicAdapter(BrokerInterface):
+    """Tenant-configured, read-only adapter for approved HTTPS REST APIs.
+
+    Endpoint hosts must be explicitly allow-listed by the server operator. This
+    adapter never places orders and never accepts endpoint hosts from the client.
+    """
+
+    supports_live_orders = False
+
+    def __init__(self, configuration: dict[str, Any]) -> None:
+        base_url = str(configuration.get("api_base", "")).strip().rstrip("/")
+        parsed = urlsplit(base_url)
+        allowed_hosts = set(settings.dynamic_broker_allowed_hosts)
+        hostname = (parsed.hostname or "").lower()
+        try:
+            is_ip_address = bool(hostname and ipaddress.ip_address(hostname))
+        except ValueError:
+            is_ip_address = False
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+            or parsed.query
+            or parsed.fragment
+            or is_ip_address
+            or hostname not in allowed_hosts
+        ):
+            raise ValueError(
+                "Custom broker APIs must use an operator-allow-listed HTTPS hostname."
+            )
+        endpoint_config = configuration.get("endpoints")
+        if not isinstance(endpoint_config, dict):
+            raise ValueError("Custom broker endpoint paths are required.")
+        self.api_base = base_url
+        self.name = str(configuration.get("name", "Custom broker")).strip()
+        self.endpoints: dict[str, str] = {}
+        for key in ("balance", "positions", "holdings", "profile", "live_prices"):
+            path = str(endpoint_config.get(key, "")).strip()
+            if not path:
+                continue
+            if (
+                not path.startswith("/")
+                or path.startswith("//")
+                or "://" in path
+                or "?" in path
+                or "#" in path
+                or "\\" in path
+                or any(part == ".." for part in path.split("/"))
+            ):
+                raise ValueError(f"Custom broker {key} endpoint must be a safe path.")
+            self.endpoints[key] = path
+        if not {"balance", "positions", "holdings"}.issubset(self.endpoints):
+            raise ValueError(
+                "Custom broker must define balance, positions, and holdings paths."
+            )
+
+    def get_login_url(self, redirect_url: str) -> None:
+        return None
+
+    def authenticate(self, code: str | None, redirect_url: str) -> str:
+        token = (code or "").strip()
+        if not token:
+            raise ValueError("Enter a bearer token for this custom broker.")
+        if len(token) > 4096:
+            raise ValueError("Custom broker bearer token exceeds the allowed length.")
+        return token
+
+    def _get_json(
+        self, endpoint: str, token: str, *, params: dict[str, str] | None = None
+    ) -> Any:
+        path = self.endpoints.get(endpoint)
+        if path is None:
+            raise BrokerCapabilityError(
+                f"{self.name} does not define a {endpoint.replace('_', ' ')} endpoint."
+            )
+        try:
+            response = requests.get(
+                f"{self.api_base}{path}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+                params=params,
+                timeout=(
+                    settings.http_connect_timeout_seconds,
+                    settings.http_read_timeout_seconds,
+                ),
+                allow_redirects=False,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            raise BrokerAPIError(
+                f"Custom broker {endpoint.replace('_', ' ')} request failed."
+            ) from exc
+        except ValueError as exc:
+            raise BrokerAPIError("Custom broker returned invalid JSON.") from exc
+
+    @staticmethod
+    def _data(payload: Any, expected_type: type) -> Any:
+        if isinstance(payload, expected_type):
+            return payload
+        if isinstance(payload, dict):
+            value = payload.get("data")
+            if isinstance(value, expected_type):
+                return value
+            for key in ("balance", "positions", "holdings", "prices"):
+                value = payload.get(key)
+                if isinstance(value, expected_type):
+                    return value
+        raise BrokerAPIError("Custom broker response does not match the required schema.")
+
+    def fetch_balance(self, token: str) -> float:
+        payload = self._get_json("balance", token)
+        if isinstance(payload, dict):
+            if "data" in payload and isinstance(payload["data"], dict):
+                payload = payload["data"]
+            balance = payload.get("balance", payload.get("available_cash"))
+        else:
+            balance = payload
+        return _number(balance, "available cash")
+
+    @staticmethod
+    def _portfolio(payload: Any) -> pd.DataFrame:
+        items = GenericDynamicAdapter._data(payload, list)
+        rows = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise BrokerAPIError("Custom broker returned an invalid position row.")
+            rows.append(
+                {
+                    "Ticker": item.get("Ticker", item.get("ticker")),
+                    "Qty": item.get("Qty", item.get("qty", item.get("quantity"))),
+                    "Avg_Price": item.get(
+                        "Avg_Price", item.get("avg_price", item.get("average_price"))
+                    ),
+                    "LTP": item.get("LTP", item.get("ltp", item.get("last_price"))),
+                }
+            )
+        return _portfolio_frame(rows)
+
+    def fetch_positions(self, token: str) -> pd.DataFrame:
+        return self._portfolio(self._get_json("positions", token))
+
+    def fetch_holdings(self, token: str) -> pd.DataFrame:
+        return self._portfolio(self._get_json("holdings", token))
+
+    def fetch_mutual_fund_holdings(self, token: str) -> pd.DataFrame:
+        return pd.DataFrame(columns=MUTUAL_FUND_COLUMNS)
+
+    def fetch_profile(self, token: str) -> dict[str, str]:
+        if "profile" not in self.endpoints:
+            return {"name": self.name, "user_id": ""}
+        payload = self._get_json("profile", token)
+        if not isinstance(payload, dict):
+            raise BrokerAPIError("Custom broker returned an invalid profile.")
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            raise BrokerAPIError("Custom broker returned an invalid profile.")
+        return {
+            "name": str(data.get("name") or data.get("display_name") or ""),
+            "user_id": str(data.get("user_id") or data.get("client_id") or ""),
+        }
+
+    def fetch_live_prices(
+        self, token: str, tickers: list[str] | None = None
+    ) -> dict[str, float]:
+        symbols = sorted({symbol.strip().upper() for symbol in tickers or []})
+        if not symbols:
+            return {}
+        payload = self._get_json(
+            "live_prices", token, params={"tickers": ",".join(symbols)}
+        )
+        data = self._data(payload, dict)
+        prices: dict[str, float] = {}
+        for ticker in symbols:
+            if ticker in data:
+                price = _number(data[ticker], "live quote")
+                if price > 0:
+                    prices[ticker] = price
+        return prices
+
+    def fetch_market_risk(self, token: str, ticker: str) -> dict[str, float]:
+        raise BrokerCapabilityError(
+            "Custom read-only broker does not provide verified ATR candle data."
+        )
+
+    def place_order(
+        self, token: str, ticker: str, qty: int, transaction_type: str
+    ) -> Any:
+        raise BrokerCapabilityError(
+            "Custom dynamic brokers are read-only; live order placement is disabled."
+        )
 
 
 class BrokerFactory:
@@ -1509,3 +1803,10 @@ class BrokerFactory:
                 totp_secret=credentials.get("totp_secret"),
             )
         raise ValueError(f"Unsupported broker: {broker_name}")
+
+    @staticmethod
+    def create_dynamic_adapter(
+        configuration: dict[str, Any],
+    ) -> GenericDynamicAdapter:
+        """Construct a validated, read-only adapter from a tenant registry record."""
+        return GenericDynamicAdapter(configuration)

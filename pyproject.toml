@@ -13,7 +13,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
     "smartapi-python>=1.5.5",
-    "streamlit>=1.37.0",
+    "streamlit[auth]>=1.57.0",
     "upstox-python-sdk>=2.30.0",
 ]
 

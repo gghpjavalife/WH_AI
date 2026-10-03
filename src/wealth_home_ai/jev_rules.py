@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, time, timedelta
 from math import floor, isfinite
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .broker_factory import TICKER_MAP
 
@@ -44,12 +46,60 @@ def _finite_number(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def buy_execution_block_reason(
+    realized_daily_loss_pct: float,
+    buy_lock_until: datetime | None,
+    active_positions_count: int,
+    now: datetime | None = None,
+) -> tuple[str | None, datetime | None]:
+    """Recheck time, circuit-breaker, and focus-cap rules at order submission."""
+    current_time = now or datetime.now(ZoneInfo("Asia/Kolkata"))
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    else:
+        current_time = current_time.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    if isinstance(buy_lock_until, datetime):
+        if buy_lock_until.tzinfo is None:
+            buy_lock_until = buy_lock_until.replace(
+                tzinfo=ZoneInfo("Asia/Kolkata")
+            )
+        else:
+            buy_lock_until = buy_lock_until.astimezone(ZoneInfo("Asia/Kolkata"))
+        if buy_lock_until > current_time:
+            return (
+                f"New buys are locked until {buy_lock_until:%Y-%m-%d %H:%M} IST.",
+                buy_lock_until,
+            )
+    else:
+        buy_lock_until = None
+
+    if realized_daily_loss_pct <= -3.0:
+        lock_until = current_time + timedelta(hours=24)
+        return (
+            "New buys are locked for 24 hours because reported realized daily "
+            "loss reached -3%.",
+            lock_until,
+        )
+    if current_time.weekday() >= 5 or not (
+        time(9, 45) <= current_time.time() <= time(15, 0)
+    ):
+        return (
+            "Live buys are allowed only Monday–Friday, 09:45–15:00 IST.",
+            None,
+        )
+    if active_positions_count >= 8:
+        return ("New buys are blocked at the limit of eight active positions.", None)
+    return None, None
+
+
 class JevRuleEngine:
     """Evaluate candidates in fixed order and retain a human-readable audit trail."""
 
     def __init__(self, facts: dict[str, Any]) -> None:
         self.facts = facts
         self.audit_trail: list[str] = []
+        self.steps: list[str] = self.audit_trail
         self.approved_trades: list[dict[str, Any]] = []
 
     def _existing_sectors(self) -> set[str]:
@@ -136,8 +186,100 @@ class JevRuleEngine:
 
     def run(self) -> tuple[list[dict[str, Any]], list[str]]:
         self.audit_trail = ["Starting deterministic forward-chaining evaluation."]
+        self.steps = self.audit_trail
         self.approved_trades = []
         candidates = self._validated_candidates()
+
+        now = self.facts.get("now")
+        if not isinstance(now, datetime):
+            now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        else:
+            now = now.astimezone(ZoneInfo("Asia/Kolkata"))
+
+        loss_pct = _finite_number(
+            self.facts.get("realized_daily_loss_pct", 0.0)
+        )
+        loss_pct = loss_pct if loss_pct is not None else 0.0
+        buy_lock_until = self.facts.get("buy_lock_until")
+        if isinstance(buy_lock_until, datetime):
+            if buy_lock_until.tzinfo is None:
+                buy_lock_until = buy_lock_until.replace(
+                    tzinfo=ZoneInfo("Asia/Kolkata")
+                )
+            else:
+                buy_lock_until = buy_lock_until.astimezone(
+                    ZoneInfo("Asia/Kolkata")
+                )
+        else:
+            buy_lock_until = None
+        if loss_pct <= -3:
+            if buy_lock_until is None or buy_lock_until <= now:
+                buy_lock_until = now + timedelta(hours=24)
+            self.facts["buy_lock_until"] = buy_lock_until
+            self.audit_trail.append(
+                "Rule A (Portfolio Circuit Breaker): realized daily loss is "
+                f"{loss_pct:.2f}% (at or below -3%); BUY execution is locked "
+                f"until {buy_lock_until.isoformat()}."
+            )
+            self.audit_trail.append(
+                "Evaluation stopped: the portfolio circuit breaker blocks new buys."
+            )
+            return self.approved_trades.copy(), self.audit_trail.copy()
+        if buy_lock_until is not None and buy_lock_until > now:
+            self.facts["buy_lock_until"] = buy_lock_until
+            self.audit_trail.append(
+                "Rule A (Portfolio Circuit Breaker): existing BUY lock remains "
+                f"active until {buy_lock_until.isoformat()}."
+            )
+            return self.approved_trades.copy(), self.audit_trail.copy()
+        self.facts["buy_lock_until"] = None
+        self.audit_trail.append(
+            "Rule A (Portfolio Circuit Breaker): no active daily-loss lock."
+        )
+
+        trading_open = (
+            now.weekday() < 5
+            and time(9, 45) <= now.time() <= time(15, 0)
+        )
+        if not trading_open:
+            self.audit_trail.append(
+                "Rule B (Trading Window Guard): closed; new trades are allowed "
+                "only Monday–Friday, 09:45–15:00 Asia/Kolkata."
+            )
+            self.audit_trail.append(
+                "Evaluation stopped: outside the configured trading window."
+            )
+            return self.approved_trades.copy(), self.audit_trail.copy()
+        self.audit_trail.append(
+            "Rule B (Trading Window Guard): current IST time is inside the "
+            "Monday–Friday 09:45–15:00 window."
+        )
+
+        portfolio = self.facts.get("portfolio")
+        supplied_count = self.facts.get("active_positions_count")
+        if supplied_count is None and portfolio is not None:
+            try:
+                active_positions = portfolio.loc[portfolio["Qty"].ne(0)]
+                supplied_count = len(active_positions)
+            except (AttributeError, KeyError, TypeError):
+                supplied_count = 0
+        position_count = _finite_number(supplied_count)
+        position_count = max(int(position_count or 0), 0)
+        if position_count >= 8:
+            self.audit_trail.append(
+                "Rule C (Focus Cap): "
+                f"{position_count} active positions meet/exceed the limit of 8; "
+                "new trades are blocked."
+            )
+            self.audit_trail.append(
+                "Evaluation stopped: the active-position focus cap is reached."
+            )
+            return self.approved_trades.copy(), self.audit_trail.copy()
+        self.audit_trail.append(
+            f"Rule C (Focus Cap): {position_count} of 8 active positions."
+        )
 
         confidence_passed = [
             candidate
@@ -145,7 +287,7 @@ class JevRuleEngine:
             if candidate["Confidence_Score"] >= 70
         ]
         self.audit_trail.append(
-            "Rule 1 (Confidence Boundary): "
+            "Rule D (Confidence Boundary): "
             f"{len(confidence_passed)} of {len(candidates)} valid target(s) "
             "passed the 70% minimum."
         )
@@ -157,24 +299,44 @@ class JevRuleEngine:
             self.facts.get("cash_balance", self.facts.get("available_cash", 0))
         )
         cash = max(cash or 0.0, 0.0)
+        limits = self.facts.get("user_allocation_limits") or {}
+        cap_value = (
+            limits.get("max_allocation_pct", 100.0)
+            if isinstance(limits, dict)
+            else self.facts.get("max_allocation_pct", 100.0)
+        )
+        allocation_cap_pct = _finite_number(
+            self.facts.get("max_allocation_pct", cap_value)
+        )
+        if allocation_cap_pct is None or not 0 <= allocation_cap_pct <= 100:
+            self.audit_trail.append(
+                "Rule E/F (Allocation Limit): invalid allocation cap; no trades "
+                "were approved."
+            )
+            return self.approved_trades.copy(), self.audit_trail.copy()
+        allocatable_cash = cash * allocation_cap_pct / 100
         if cash > 20_000:
             self.audit_trail.append(
-                "Rule 2 (Capital Adequacy Check): abundant cash; equal-weight "
-                f"allocation budget is INR {cash / len(confidence_passed):,.2f} per target."
+                "Rule E (Capital Adequacy Check): abundant cash; equal-weight "
+                f"allocation uses {allocation_cap_pct:.1f}% cap "
+                f"(INR {allocatable_cash:,.2f} total)."
             )
-            allocation = cash / len(confidence_passed)
+            allocation = allocatable_cash / len(confidence_passed)
             for candidate in confidence_passed:
                 quantity = floor(allocation / candidate["Entry_Price"])
-                if quantity > 0:
+                if quantity > 0 and (
+                    quantity * candidate["Entry_Price"] <= allocatable_cash
+                ):
                     self.approved_trades.append({**candidate, "Qty": quantity})
             self.audit_trail.append(
-                f"Rule 2 approved {len(self.approved_trades)} affordable equal-weight allocation(s)."
+                f"Rule E approved {len(self.approved_trades)} affordable "
+                "equal-weight allocation(s) within the cap."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
 
         self.audit_trail.append(
-            "Rule 3 (Ordinal Triage Filter): scarce cash; prioritizing "
-            "unheld sectors, then confidence, within the wallet budget."
+            "Rule F (Ordinal Triage Filter): scarce cash; prioritizing "
+            "unheld sectors, then confidence, within the capped wallet budget."
         )
         held_sectors = self._existing_sectors()
         ranked = sorted(
@@ -192,20 +354,21 @@ class JevRuleEngine:
             (
                 candidate
                 for candidate in ranked
-                if candidate["Entry_Price"] <= cash
+                if candidate["Entry_Price"] <= allocatable_cash
             ),
             None,
         )
         if selected is None:
             self.audit_trail.append(
-                "Rule 3 selected no target: none of the ranked candidates fit the wallet."
+                "Rule F selected no target: none of the ranked candidates fit the "
+                "allocation cap and wallet budget."
             )
         else:
-            quantity = floor(cash / selected["Entry_Price"])
+            quantity = floor(allocatable_cash / selected["Entry_Price"])
             if quantity > 0:
                 self.approved_trades = [{**selected, "Qty": quantity}]
                 self.audit_trail.append(
-                    f"Rule 3 approved {selected['Ticker']} ({selected.get('Sector') or 'unknown sector'}), "
+                    f"Rule F approved {selected['Ticker']} ({selected.get('Sector') or 'unknown sector'}), "
                     f"confidence {selected['Confidence_Score']:.1f}%, quantity {quantity}."
                 )
         return self.approved_trades.copy(), self.audit_trail.copy()

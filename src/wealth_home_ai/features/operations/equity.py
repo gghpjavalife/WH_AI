@@ -3,6 +3,8 @@
 import pandas as pd
 import streamlit as st
 
+from .performance import style_returns
+
 
 def render_equity(holdings: pd.DataFrame) -> None:
     if holdings.empty:
@@ -18,4 +20,5 @@ def render_equity(holdings: pd.DataFrame) -> None:
         else 0.0,
         axis=1,
     )
-    st.dataframe(display, hide_index=True)
+    theme = getattr(st.context.theme, "type", "light")
+    st.dataframe(style_returns(display, theme=theme), hide_index=True)

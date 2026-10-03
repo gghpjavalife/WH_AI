@@ -7,6 +7,19 @@ import streamlit as st
 
 from ..settings import LLM_PROVIDER_BASE_URLS, settings
 
+LLM_KEY_GUIDES = {
+    "Gemini": ("Google AI Studio", "https://aistudio.google.com/app/apikey"),
+    "OpenAI": ("OpenAI platform", "https://platform.openai.com/api-keys"),
+    "Anthropic": ("Anthropic console", "https://console.anthropic.com/settings/keys"),
+    "Groq": ("Groq console", "https://console.groq.com/keys"),
+    "Together AI": (
+        "Together AI settings",
+        "https://api.together.xyz/settings/api-keys",
+    ),
+    "Mistral": ("Mistral console", "https://console.mistral.ai/api-keys/"),
+    "DeepSeek": ("DeepSeek platform", "https://platform.deepseek.com/api_keys"),
+}
+
 
 def _remember_provider_setting(
     provider: str, setting_name: str, widget_key: str
@@ -15,6 +28,32 @@ def _remember_provider_setting(
     provider_settings.setdefault(provider, {})[setting_name] = st.session_state.get(
         widget_key, ""
     )
+
+
+def _render_guided_field_label(
+    label: str,
+    *,
+    why: str,
+    how: str,
+    link_label: str | None = None,
+    link_url: str | None = None,
+) -> None:
+    with st.container(
+        horizontal=True,
+        width="content",
+        vertical_alignment="center",
+        gap="xxsmall",
+    ):
+        st.markdown(label, width="content")
+        with st.popover(
+            ":material/help:",
+            type="tertiary",
+            help=f"Why this field is needed and how to set it: {label}",
+        ):
+            st.markdown(f"**Why you need this**\n\n{why}")
+            st.markdown(f"**How to set it**\n\n{how}")
+            if link_label and link_url:
+                st.markdown(f"[{link_label} ↗]({link_url})")
 
 
 def render_analysis_panel(
@@ -35,11 +74,16 @@ def render_analysis_panel(
             vertical_alignment="bottom",
         )
         with provider_column:
+            _render_guided_field_label(
+                "AI provider",
+                why="Selects which AI service receives your analysis request.",
+                how="Choose a provider for which you have an API key.",
+            )
             selected_provider = st.selectbox(
                 "AI provider",
                 provider_options,
                 key="llm_provider",
-                help="Select the service for your analysis.",
+                label_visibility="collapsed",
             )
         provider_slug = selected_provider.lower().replace(" ", "_").replace("-", "_")
         provider_settings = st.session_state.llm_provider_settings.setdefault(
@@ -55,18 +99,33 @@ def render_analysis_panel(
                 provider_settings.get("api_key", "")
             )
         with key_column:
-            st.text_input(
-                (
-                    f"{selected_provider} API key — required"
-                    if st.session_state.ai_settings_prompt
-                    else "API key"
+            api_key_label = (
+                f"{selected_provider} API key — required"
+                if st.session_state.ai_settings_prompt
+                else "API key"
+            )
+            key_guide = LLM_KEY_GUIDES.get(selected_provider)
+            _render_guided_field_label(
+                api_key_label,
+                why=(
+                    "Authorizes the selected AI provider to analyze your portfolio "
+                    "and answer companion questions."
                 ),
+                how=(
+                    f"Create an API key in the {selected_provider} developer "
+                    "console and paste it into this field."
+                    if key_guide
+                    else "Create a key in your custom endpoint provider's "
+                    "developer console. The key is sent only to the configured endpoint."
+                ),
+                link_label=key_guide[0] + " key guide" if key_guide else None,
+                link_url=key_guide[1] if key_guide else None,
+            )
+            st.text_input(
+                api_key_label,
                 type="password",
                 key=api_key_widget,
-                help=(
-                    "Used only for this browser session. It is not read from or "
-                    "written to server configuration."
-                ),
+                label_visibility="collapsed",
                 on_change=_remember_provider_setting,
                 args=(selected_provider, "api_key", api_key_widget),
             )
@@ -85,11 +144,16 @@ def render_analysis_panel(
                 "model_selection", default_model
             )
         if selected_provider == "Custom OpenAI-compatible":
+            _render_guided_field_label(
+                "Model ID",
+                why="Selects which model receives your analysis request.",
+                how="Copy the exact model ID supported by your custom endpoint.",
+            )
             st.text_input(
                 "Model ID",
                 key=model_selection_key,
                 placeholder="Enter the model ID supported by your endpoint",
-                help="Custom endpoints do not use a predefined model list.",
+                label_visibility="collapsed",
                 on_change=_remember_provider_setting,
                 args=(selected_provider, "model_selection", model_selection_key),
             )
@@ -97,11 +161,16 @@ def render_analysis_panel(
             if st.session_state[model_selection_key] not in model_options:
                 st.session_state[model_selection_key] = model_options[0]
             with model_column:
+                _render_guided_field_label(
+                    "Model",
+                    why="Selects which AI model receives the analysis request.",
+                    how="Choose a model enabled for your selected provider account.",
+                )
                 st.selectbox(
                     "Model",
                     model_options,
                     key=model_selection_key,
-                    help="Choose a model supported by the selected provider.",
+                    label_visibility="collapsed",
                     on_change=_remember_provider_setting,
                     args=(selected_provider, "model_selection", model_selection_key),
                 )
@@ -112,14 +181,19 @@ def render_analysis_panel(
                         "base_url", settings.llm_custom_base_url
                     )
                 )
+            _render_guided_field_label(
+                "API base URL",
+                why="Routes the analysis request to your custom AI endpoint.",
+                how=(
+                    "Copy the HTTPS base URL from your provider's API "
+                    "documentation, including its version path when specified."
+                ),
+            )
             st.text_input(
                 "API base URL",
                 key="llm_custom_base_url",
                 placeholder="https://api.example.com/v1",
-                help=(
-                    "Required for custom endpoints. You can set a deployment "
-                    "default with LLM_CUSTOM_BASE_URL."
-                ),
+                label_visibility="collapsed",
                 on_change=_remember_provider_setting,
                 args=(
                     selected_provider,
@@ -129,7 +203,7 @@ def render_analysis_panel(
             )
         with button_column:
             if st.button(
-                "Run AI analysis",
+                "🔮 Run LLM Portfolio Analysis",
                 type="primary",
                 key=f"run_analysis_{scope}",
                 width="stretch",
@@ -142,6 +216,19 @@ def render_analysis_panel(
         key=f"run_analysis_{scope}",
     ):
         run_analysis(scope)
+
+    if scope in {"all", "equity", "trading"}:
+        candidate_count = len(st.session_state.get("market_ai_candidates", []))
+        if candidate_count:
+            st.caption(
+                f"AI candidate pool: {candidate_count} NSE Strong Buy/Buy stocks "
+                "from the latest equity scan; broker quotes are refreshed when analysis runs."
+            )
+        else:
+            st.caption(
+                "Run an equity market scan first. Only broker-quoted NSE Strong Buy/Buy "
+                "stocks from that scan can be recommended for deployment."
+            )
 
     error = st.session_state.analysis_errors.get(scope)
     if error:

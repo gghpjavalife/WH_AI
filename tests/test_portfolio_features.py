@@ -2,6 +2,7 @@ import unittest
 import hashlib
 import secrets
 from pathlib import Path
+from threading import Barrier
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
@@ -9,19 +10,20 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from wealth_home_ai.features.operations.mutual_funds import validate_mutual_funds
-from wealth_home_ai.features.home import build_allocation_chart
+from wealth_home_ai.features.operations.performance import style_returns
+from wealth_home_ai.features.home import ALLOCATION_COLORS, build_allocation_chart
+from wealth_home_ai.diagnostics import diagnostic_summary, log_failure
 from wealth_home_ai.features.portfolio import (
     calculate_allocation,
-    empty_debt_holdings,
-    validate_debt_holdings,
 )
-from wealth_home_ai.settings import Settings
+from wealth_home_ai.settings import Settings, settings
 from wealth_home_ai.oauth_state_store import (
     consume_oauth_state,
     consume_oauth_state_context,
     create_oauth_state,
 )
-from wealth_home_ai.upstox_helper import ask_llm_agent, send_telegram_alert
+from wealth_home_ai.notifications import send_email_alert, send_whatsapp_alert
+from wealth_home_ai.upstox_helper import ask_llm_agent
 from wealth_home_ai.ui_helpers import (
     broker_connect_button_css,
     same_tab_link_html,
@@ -35,6 +37,43 @@ from wealth_home_ai.broker_factory import (
 
 
 class PortfolioFeatureTests(unittest.TestCase):
+    def test_diagnostics_report_safe_http_status_and_request_id(self):
+        api_error = RuntimeError("upstream response includes private content")
+        api_error.status = 403
+        api_error.reason = "Forbidden"
+        api_error.headers = {"X-Request-Id": "request-123"}
+        wrapped_error = RuntimeError("Broker API request failed")
+        wrapped_error.__cause__ = api_error
+
+        summary = diagnostic_summary("Upstox mutual-fund refresh", wrapped_error)
+        self.assertIn("HTTP 403", summary)
+        self.assertIn("Forbidden", summary)
+        self.assertIn("request_id=request-123", summary)
+        self.assertNotIn("private content", summary)
+
+        with self.assertLogs("wealth_home_ai", level="ERROR") as logs:
+            log_failure(
+                "Upstox mutual-fund refresh",
+                wrapped_error,
+                broker="Upstox",
+            )
+        self.assertIn("request_id=request-123", logs.output[0])
+
+    def test_return_table_backgrounds_distinguish_gains_losses_and_neutral(self):
+        frame = pd.DataFrame(
+            {
+                "Ticker": ["GAIN", "LOSS", "FLAT"],
+                "Returns_%": [25.0, -8.0, 0.0],
+            }
+        )
+
+        styled = style_returns(frame, theme="dark")
+        html = styled.to_html()
+
+        self.assertIn("background-color: #216B44", html)
+        self.assertIn("background-color: #64282F", html)
+        self.assertIn("background-color: #172334", html)
+
     def test_broker_sign_in_links_navigate_in_the_same_tab(self):
         markup = same_tab_link_html(
             "Connect with Upstox",
@@ -87,7 +126,18 @@ class PortfolioFeatureTests(unittest.TestCase):
                 app = AppTest.from_file(
                     str(Path(__file__).resolve().parents[1] / "app.py")
                 ).run()
-                app.selectbox[0].select(broker).run()
+                next(
+                    widget
+                    for widget in app.selectbox
+                    if widget.label == "Select broker"
+                ).select(broker).run()
+                callback_field = next(
+                    widget
+                    for widget in app.text_input
+                    if widget.label == "Callback URL"
+                )
+                self.assertEqual(callback_field.label, "Callback URL")
+                self.assertTrue(callback_field.disabled)
                 if element_type == "button":
                     button = next(
                         button
@@ -97,12 +147,20 @@ class PortfolioFeatureTests(unittest.TestCase):
                     self.assertTrue(button.disabled)
                 self.assertFalse(app.exception)
                 self.assertIsNone(app.session_state.get("pending_broker_name"))
+                self.assertFalse(
+                    any(widget.label == "OpenRouter API key" for widget in app.text_input)
+                )
+                self.assertGreaterEqual(len(app.get("popover")), 4)
 
     def test_connect_controls_update_when_credentials_are_entered(self):
         angel_app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         ).run()
-        angel_app.selectbox[0].select("Angel One").run()
+        next(
+            widget
+            for widget in angel_app.selectbox
+            if widget.label == "Select broker"
+        ).select("Angel One").run()
         for key, value in (
             ("angel_api_key", "api-key"),
             ("angel_client_id", "client-id"),
@@ -121,7 +179,11 @@ class PortfolioFeatureTests(unittest.TestCase):
         dhan_app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         ).run()
-        dhan_app.selectbox[0].select("Dhan").run()
+        next(
+            widget
+            for widget in dhan_app.selectbox
+            if widget.label == "Select broker"
+        ).select("Dhan").run()
         for key, value in (
             ("dhan_client_id", "client-id"),
             ("dhan_api_key", "api-key"),
@@ -159,42 +221,130 @@ class PortfolioFeatureTests(unittest.TestCase):
                 app.query_params.update(
                     {"code": "one-time-code", "state": oauth_state}
                 )
+                sync_barrier = Barrier(4)
+
+                def concurrent_result(value):
+                    def fetch(_token):
+                        sync_barrier.wait(timeout=3)
+                        return value
+
+                    return fetch
+
                 with (
                     patch(
                         "wealth_home_ai.broker_factory.UpstoxAdapter.authenticate",
                         return_value="access-token",
                     ),
                     patch(
+                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_profile",
+                        return_value={"name": "Test user", "user_id": "test-user"},
+                    ),
+                    patch(
                         "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_balance",
-                        return_value=0,
+                        side_effect=concurrent_result(0),
                     ),
                     patch(
                         "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_positions",
-                        return_value=pd.DataFrame(
-                            columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+                        side_effect=concurrent_result(
+                            pd.DataFrame(
+                                columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+                            )
                         ),
                     ),
                     patch(
                         "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_holdings",
-                        return_value=pd.DataFrame(
-                            columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+                        side_effect=concurrent_result(
+                            pd.DataFrame(
+                                columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+                            )
                         ),
                     ),
                     patch(
                         "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_mutual_fund_holdings",
-                        return_value=pd.DataFrame(
-                            columns=["Fund", "Folio", "Units", "Avg_NAV", "Latest_NAV"]
+                        side_effect=concurrent_result(
+                            pd.DataFrame(
+                                columns=[
+                                    "Fund",
+                                    "Folio",
+                                    "Units",
+                                    "Avg_NAV",
+                                    "Latest_NAV",
+                                ]
+                            )
                         ),
                     ),
                 ):
                     app.run()
-                app.run()
+                    connected_workspace_loaded = any(
+                        status.label == "Upstox data loaded" for status in app.status
+                    )
+                    app.run()
+                    app.session_state["app_navigation"] = "F&O"
+                    app.run()
+                    fno_analysis_actions_present = {
+                        button.key for button in app.button
+                    }.issuperset({"run_analysis_options", "run_analysis_futures"})
+                    app.session_state["app_navigation"] = "Home"
+                    app.run()
 
         self.assertFalse(app.exception)
         self.assertEqual(app.session_state["token"], "access-token")
         self.assertEqual(app.session_state["broker_name"], "Upstox")
         self.assertTrue(
-            any(header.value == "Wealth Home AI" for header in app.header)
+            any(
+                "GGHP" in item.value and "gghp-name" in item.value
+                for item in app.get("html")
+            )
+        )
+        self.assertFalse(app.sidebar.get("title"))
+        self.assertFalse(app.sidebar.get("caption"))
+        self.assertEqual(
+            app.session_state["app_navigation"],
+            "Home",
+        )
+        self.assertEqual(
+            [tab.label for tab in app.tabs],
+            [
+                "Home",
+                "Equities",
+                "Trades",
+                "F&O",
+                "Mutual Funds",
+            ],
+        )
+        self.assertFalse(
+            any(
+                title.value == "Welcome to Wealth Home AI"
+                for title in app.title
+            )
+        )
+        popovers = app.get("popover")
+        self.assertGreaterEqual(len(popovers), 3)
+        self.assertFalse(
+            any(
+                expander.label == "Share a portfolio update"
+                for expander in app.expander
+            )
+        )
+        self.assertTrue(
+            {"Email full portfolio report", "Share summary via WhatsApp"}.issubset(
+                {button.label for button in app.button}
+            )
+        )
+        self.assertFalse(
+            any(
+                header.value == "Your portfolio at a glance"
+                for header in app.subheader
+            )
+        )
+        self.assertTrue(connected_workspace_loaded)
+        self.assertTrue(fno_analysis_actions_present)
+        self.assertTrue(
+            {
+                widget.label for widget in app.number_input
+            }.issuperset(
+                {"Maximum scenario allocation (%)", "Realized daily loss (%)"}
+            )
         )
         self.assertFalse(
             any(button.label == "Finish Upstox sign-in" for button in app.button)
@@ -216,7 +366,11 @@ class PortfolioFeatureTests(unittest.TestCase):
                 app = AppTest.from_file(
                     str(Path(__file__).resolve().parents[1] / "app.py")
                 ).run()
-                app.selectbox[0].select("Upstox").run()
+                next(
+                    widget
+                    for widget in app.selectbox
+                    if widget.label == "Select broker"
+                ).select("Upstox").run()
                 app.text_input(key="upstox_api_key").set_value("app-key").run()
                 self.assertIsNone(app.session_state["pending_broker_name"])
 
@@ -251,6 +405,10 @@ class PortfolioFeatureTests(unittest.TestCase):
                     patch(
                         "wealth_home_ai.broker_factory.ZerodhaAdapter.authenticate",
                         return_value="kite-access-token",
+                    ),
+                    patch(
+                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_profile",
+                        return_value={"name": "Test user", "user_id": "test-user"},
                     ),
                     patch(
                         "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_balance",
@@ -291,31 +449,16 @@ class PortfolioFeatureTests(unittest.TestCase):
         mutual_funds = pd.DataFrame(
             [{"Units": 3, "Avg_NAV": 10, "Latest_NAV": 12}]
         )
-        debt = validate_debt_holdings(
-            pd.DataFrame(
-                [
-                    {
-                        "Instrument": "Bond",
-                        "Principal": 1000,
-                        "Current_Value": 1050,
-                        "Annual_Rate_%": 5,
-                        "Maturity_Date": "2030-01-01",
-                    }
-                ]
-            )
-        )
-
         summary = calculate_allocation(
-            200, equity, trading, mutual_funds, debt
+            200, equity, trading, mutual_funds
         )
 
-        self.assertEqual(summary["total_investments"], 1366)
-        self.assertEqual(summary["invested_amount"], 1280)
-        self.assertEqual(summary["total_portfolio_value"], 1566)
-        self.assertEqual(summary["total_pnl"], 106)
+        self.assertEqual(summary["total_investments"], 316)
+        self.assertEqual(summary["invested_amount"], 280)
+        self.assertEqual(summary["total_portfolio_value"], 516)
+        self.assertEqual(summary["total_pnl"], 56)
         self.assertEqual(summary["asset_counts"]["Equity"], 1)
         self.assertEqual(summary["asset_counts"]["Trading"], 1)
-        self.assertEqual(summary["asset_counts"]["Debt"], 1)
         self.assertEqual(summary["asset_counts"]["Mutual funds"], 1)
         self.assertEqual(summary["asset_counts"]["Options"], 0)
         self.assertEqual(summary["asset_counts"]["Futures"], 0)
@@ -323,8 +466,12 @@ class PortfolioFeatureTests(unittest.TestCase):
         self.assertEqual(summary["pnl_by_asset"]["Trading"], 10)
         self.assertEqual(summary["cash"], 200)
         chart = build_allocation_chart(summary)
-        self.assertEqual(len(chart.data), 6)
+        self.assertEqual(len(chart.data), 3)
         self.assertTrue(all(trace.type == "bar" for trace in chart.data))
+        self.assertEqual(
+            {trace.name for trace in chart.data},
+            {"Equity", "Trading", "Mutual funds"},
+        )
         self.assertEqual(chart.layout.barmode, "stack")
         self.assertEqual(chart.layout.font.size, 13)
         self.assertEqual(chart.layout.legend.font.size, 12)
@@ -339,36 +486,38 @@ class PortfolioFeatureTests(unittest.TestCase):
             light_chart.data[0].marker.color,
         )
 
-    def test_debt_validation_drops_blank_editor_rows_and_rejects_negative_values(self):
-        debt = pd.DataFrame(
-            [
-                {
-                    "Instrument": "",
-                    "Principal": None,
-                    "Current_Value": None,
-                    "Annual_Rate_%": None,
-                    "Maturity_Date": "",
-                },
-                {
-                    "Instrument": "Fixed deposit",
-                    "Principal": 1000,
-                    "Current_Value": 1020,
-                    "Annual_Rate_%": 5,
-                    "Maturity_Date": "",
-                },
-            ]
+    def test_allocation_palette_has_accessible_segment_labels_and_omits_empty_classes(self):
+        summary = calculate_allocation(
+            0,
+            pd.DataFrame(
+                [{"Ticker": "ABC", "Qty": 1, "Avg_Price": 100, "LTP": 110}]
+            ),
+            pd.DataFrame(columns=["Ticker", "Qty", "Avg_Price", "LTP"]),
+            pd.DataFrame(columns=["Units", "Latest_NAV"]),
         )
+        chart = build_allocation_chart(summary, "dark")
 
-        self.assertEqual(len(validate_debt_holdings(debt)), 1)
-        with self.assertRaises(ValueError):
-            validate_debt_holdings(
-                debt.assign(Principal=[None, -1])
-            )
-        with self.assertRaises(ValueError):
-            validate_debt_holdings(
-                debt.assign(Maturity_Date=["", "not-a-date"])
-            )
-        self.assertTrue(empty_debt_holdings().empty)
+        self.assertEqual([trace.name for trace in chart.data], ["Equity"])
+        self.assertEqual(chart.data[0].marker.color, "#2563EB")
+        self.assertEqual(chart.data[0].textfont.color, "#FFFFFF")
+        for palette in ALLOCATION_COLORS.values():
+            self.assertEqual(len(set(palette.values())), len(palette))
+            for color in palette.values():
+                channels = [
+                    int(color[index : index + 2], 16) / 255
+                    for index in (1, 3, 5)
+                ]
+                linear = [
+                    channel / 12.92
+                    if channel <= 0.04045
+                    else ((channel + 0.055) / 1.055) ** 2.4
+                    for channel in channels
+                ]
+                luminance = sum(
+                    value * weight
+                    for value, weight in zip(linear, (0.2126, 0.7152, 0.0722))
+                )
+                self.assertGreaterEqual(1.05 / (luminance + 0.05), 4.5)
 
     def test_mutual_fund_import_normalizes_optional_columns(self):
         funds = validate_mutual_funds(
@@ -386,12 +535,44 @@ class PortfolioFeatureTests(unittest.TestCase):
 
         self.assertEqual(funds.loc[0, "Latest_NAV"], 110)
         self.assertEqual(funds.loc[0, "Folio"], "")
+        self.assertEqual(funds.loc[0, "ISIN"], "")
         self.assertEqual(funds.loc[0, "NAV_Date"], "")
 
+    def test_zerodha_fetches_mutual_fund_holdings(self):
+        adapter = ZerodhaAdapter(api_key="kite-key", api_secret="kite-secret")
+        with patch.object(
+            adapter,
+            "_request",
+            return_value=[
+                {
+                    "fund": "Index fund",
+                    "folio": "folio-123",
+                    "tradingsymbol": "INF123456789",
+                    "quantity": 2.5,
+                    "average_price": 100.0,
+                    "last_price": 110.0,
+                    "last_price_date": "2026-10-01",
+                }
+            ],
+        ) as request:
+            holdings = adapter.fetch_mutual_fund_holdings("session-token")
+
+        request.assert_called_once_with("GET", "/mf/holdings", "session-token")
+        self.assertEqual(holdings.loc[0, "Fund"], "Index fund")
+        self.assertEqual(holdings.loc[0, "Folio"], "folio-123")
+        self.assertEqual(holdings.loc[0, "ISIN"], "INF123456789")
+        self.assertEqual(holdings.loc[0, "Units"], 2.5)
+        self.assertEqual(holdings.loc[0, "Latest_NAV"], 110.0)
+        self.assertEqual(holdings.loc[0, "NAV_Date"], "2026-10-01")
+
     def test_provider_model_defaults_include_multiple_gemini_models(self):
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"APP_TITLE": ""}, clear=True):
             settings = Settings.from_environment()
 
+        self.assertEqual(
+            settings.app_title,
+            "GGHP | Governed Portfolio Companion",
+        )
         self.assertEqual(
             settings.llm_provider_models["Gemini"],
             (
@@ -432,7 +613,6 @@ class PortfolioFeatureTests(unittest.TestCase):
                 "Gemini",
                 "OpenAI",
                 "Anthropic",
-                "OpenRouter",
                 "Groq",
                 "Together AI",
                 "Mistral",
@@ -477,6 +657,43 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             any(widget.label == "Model ID" for widget in app.text_input)
         )
         self.assertFalse(any(widget.label == "Model" for widget in app.selectbox))
+        self.assertGreaterEqual(len(app.get("popover")), 3)
+
+    def test_ai_provider_guide_is_inline_with_the_aligned_field_label(self):
+        app = AppTest.from_string(
+            """
+import streamlit as st
+from wealth_home_ai.features.analysis import render_analysis_panel
+
+for key, value in {
+    "llm_provider_settings": {},
+    "ai_settings_prompt": "",
+    "analysis_errors": {},
+    "analysis_price_errors": {},
+    "analysis_results": {},
+    "analysis_mode": "Portfolio and cash review",
+    "llm_provider": "Gemini",
+    "approved_trades_by_scope": {},
+    "audit_trails_by_scope": {},
+}.items():
+    st.session_state.setdefault(key, value)
+
+render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None)
+"""
+        ).run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any(widget.label == "AI provider" for widget in app.selectbox)
+        )
+        self.assertEqual(app.selectbox[1].label, "Model")
+        self.assertEqual(len(app.get("popover")), 3)
+        self.assertTrue(
+            any(
+                button.label == "🔮 Run LLM Portfolio Analysis"
+                for button in app.button
+            )
+        )
 
     def test_provider_model_options_can_be_overridden_by_environment(self):
         with patch.dict(
@@ -518,6 +735,53 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         self.assertEqual(result["analysis"], "review")
         self.assertEqual(create_client.call_args.kwargs["api_key"], "session-key")
         self.assertEqual(client.chats.create.call_args.kwargs["model"], "selected-model")
+
+    def test_analysis_rejects_validly_priced_tickers_outside_scan_candidates(self):
+        import json
+
+        targets = [
+            {
+                "Ticker": ticker,
+                "Entry_Price": 100,
+                "Target_Price": 110,
+                "Stop_Loss": 95,
+                "Confidence_Score": 70,
+                "Risk_Reward_Ratio": 2,
+                "Holding_Period": "2-6 weeks",
+                "Sector": "Example",
+                "Reasoning": "Fits the scenario",
+                "Entry_Rationale": "Wait for entry",
+                "Risk_Rationale": "Exit below stop",
+            }
+            for ticker in ("AAA", "BBB")
+        ]
+        response = MagicMock(
+            text=json.dumps(
+                {"analysis": "review", "cash_deployment_list": targets}
+            )
+        )
+        chat = MagicMock()
+        chat.send_message.return_value = response
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.chats.create.return_value = chat
+
+        with patch("wealth_home_ai.upstox_helper.genai.Client", return_value=client):
+            result = ask_llm_agent(
+                portfolio_summary="{}",
+                available_cash=1000,
+                market_context="screened candidates",
+                live_prices={"AAA": 105, "BBB": 105},
+                candidate_tickers=["AAA"],
+                api_key="session-key",
+                model="selected-model",
+            )
+
+        self.assertEqual(
+            [target["Ticker"] for target in result["cash_deployment_list"]],
+            ["AAA"],
+        )
+        self.assertIn("only tickers in that", chat.send_message.call_args.args[0])
 
     def test_analysis_does_not_use_server_gemini_key(self):
         with patch.dict("os.environ", {"GEMINI_API_KEY": "server-key"}):
@@ -710,8 +974,6 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
                 "DHAN_CLIENT_ID": "environment-dhan-client",
                 "DHAN_API_KEY": "environment-dhan-key",
                 "DHAN_API_SECRET": "environment-dhan-secret",
-                "TELEGRAM_BOT_TOKEN": "environment-telegram-token",
-                "TELEGRAM_CHAT_ID": "environment-telegram-chat",
             },
         ):
             configured = Settings.from_environment()
@@ -733,28 +995,98 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             "dhan_client_id",
             "dhan_api_key",
             "dhan_api_secret",
-            "telegram_bot_token",
-            "telegram_chat_id",
+            "whatsapp_auth_token",
+            "email_smtp_password",
         ):
             self.assertFalse(hasattr(configured, field_name))
 
-    def test_telegram_alert_uses_session_supplied_token_and_chat(self):
+    def test_upstox_sdk_requests_use_configured_timeouts(self):
+        adapter = UpstoxAdapter(api_key="app-key", api_secret="app-secret")
+        sdk = MagicMock()
+        sdk.get_user_fund_margin.return_value.data.equity.available_margin = 12500
+        timeout = (
+            settings.http_connect_timeout_seconds,
+            settings.http_read_timeout_seconds,
+        )
+        with (
+            patch.object(adapter, "_api_client", return_value=object()),
+            patch("wealth_home_ai.broker_factory.UserApi", return_value=sdk),
+        ):
+            self.assertEqual(adapter.fetch_balance("access-token"), 12500.0)
+
+        sdk.get_user_fund_margin.assert_called_once_with(
+            api_version="2.0",
+            segment="SEC",
+            _request_timeout=timeout,
+        )
+
+    def test_whatsapp_alert_uses_session_supplied_credentials(self):
         response = MagicMock()
-        response.json.return_value = {"ok": True}
         with patch(
-            "wealth_home_ai.upstox_helper.requests.post",
+            "wealth_home_ai.notifications.requests.post",
             return_value=response,
         ) as post:
-            send_telegram_alert(
+            send_whatsapp_alert(
                 "test notification",
-                chat_id="session-chat",
-                bot_token="session-bot-token",
+                account_sid="session-sid",
+                auth_token="session-token",
+                sender="whatsapp:+14155238886",
+                recipient="whatsapp:+15551234567",
             )
 
-        self.assertIn("/botsession-bot-token/sendMessage", post.call_args.args[0])
+        self.assertIn("/Accounts/session-sid/Messages.json", post.call_args.args[0])
         self.assertEqual(
-            post.call_args.kwargs["json"],
-            {"chat_id": "session-chat", "text": "test notification"},
+            post.call_args.kwargs["auth"],
+            ("session-sid", "session-token"),
+        )
+        self.assertEqual(
+            post.call_args.kwargs["data"],
+            {
+                "From": "whatsapp:+14155238886",
+                "To": "whatsapp:+15551234567",
+                "Body": "test notification",
+            },
+        )
+
+    def test_email_alert_uses_tls_and_supplied_smtp_credentials(self):
+        with patch("wealth_home_ai.notifications.SMTP") as smtp:
+            server = smtp.return_value.__enter__.return_value
+            send_email_alert(
+                "test notification",
+                smtp_host="smtp.example.com",
+                smtp_port=587,
+                username="user@example.com",
+                password="app-password",
+                sender="user@example.com",
+                recipient="alerts@example.com",
+            )
+
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user@example.com", "app-password")
+        server.send_message.assert_called_once()
+
+    def test_notification_settings_are_available_as_compact_channels(self):
+        app = AppTest.from_string(
+            """
+import wealth_home_ai.dashboard as dashboard
+dashboard._render_app_header()
+"""
+        ).run()
+
+        self.assertFalse(app.exception)
+        self.assertGreaterEqual(len(app.get("popover")), 2)
+        self.assertEqual(
+            {item.label for item in app.get("link_button")},
+            {"WhatsApp setup guide ↗", "Gmail app password guide ↗"},
+        )
+        self.assertTrue(
+            any(widget.label == "WhatsApp sender" for widget in app.text_input)
+        )
+        self.assertTrue(
+            any(widget.label == "SMTP server" for widget in app.text_input)
+        )
+        self.assertFalse(
+            any("Telegram" in widget.label for widget in app.text_input)
         )
 
     def test_zerodha_reads_cash_positions_and_live_quotes(self):
@@ -793,6 +1125,20 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         self.assertEqual(positions.loc[0, "Ticker"], "RELIANCE")
         self.assertEqual(prices, {"RELIANCE": 105.0})
         self.assertEqual(request.call_count, 3)
+
+    def test_zerodha_quotes_dynamic_nse_symbols_outside_static_ticker_map(self):
+        adapter = ZerodhaAdapter(api_key="kite-key", api_secret="kite-secret")
+        with patch.object(
+            adapter,
+            "_request",
+            return_value={"NSE:NEWLISTING": {"last_price": 125.5}},
+        ) as request:
+            prices = adapter.fetch_live_prices("session-token", ["NEWLISTING"])
+
+        self.assertEqual(prices, {"NEWLISTING": 125.5})
+        self.assertEqual(
+            request.call_args.kwargs["params"], {"i": ["NSE:NEWLISTING"]}
+        )
 
     def test_dhan_fetches_balance_and_maps_live_quote(self):
         adapter = DhanAdapter(

@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from ...broker_factory import MUTUAL_FUND_COLUMNS
+from .performance import style_returns
 
 
 def validate_mutual_funds(frame: pd.DataFrame) -> pd.DataFrame:
@@ -41,6 +42,9 @@ def validate_mutual_funds(frame: pd.DataFrame) -> pd.DataFrame:
     normalized["Folio"] = (
         normalized["Folio"].fillna("").astype(str) if "Folio" in normalized else ""
     )
+    normalized["ISIN"] = (
+        normalized["ISIN"].fillna("").astype(str) if "ISIN" in normalized else ""
+    )
     normalized["NAV_Date"] = (
         normalized["NAV_Date"].fillna("").astype(str)
         if "NAV_Date" in normalized
@@ -55,7 +59,8 @@ def render_mutual_funds(
     st.caption(
         "Broker-provided holdings use the latest reported NAV, which may be from "
         "the previous valuation day. A CSV import can be used where the broker "
-        "does not provide a funds endpoint."
+        "does not provide a funds endpoint. Live mutual-fund holdings are available "
+        "from Upstox and Zerodha; Angel One and Dhan require a statement import."
     )
     upload = st.file_uploader(
         "Import a mutual-fund statement CSV",
@@ -63,7 +68,7 @@ def render_mutual_funds(
         key="mutual_fund_csv",
         help=(
             "Required columns: Fund, Units, Avg_NAV, Latest_NAV. "
-            "Folio and NAV_Date are optional."
+            "Folio, ISIN, and NAV_Date are optional."
         ),
     )
     if upload is not None:
@@ -102,4 +107,5 @@ def render_mutual_funds(
         else 0.0,
         axis=1,
     )
-    st.dataframe(display, hide_index=True)
+    theme = getattr(st.context.theme, "type", "light")
+    st.dataframe(style_returns(display, theme=theme), hide_index=True)
