@@ -2,7 +2,7 @@ name: Sync to Hugging Face Spaces
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ master ]
 
 jobs:
   deploy:
@@ -24,5 +24,5 @@ jobs:
 
       - name: Push to Hugging Face
         run: |
-          git remote add hf https://huggingface.co/spaces/GGHP/WH_AI || true
+          git remote add hf https://huggingface.co/spaces/GGHP/GGHP_APP || true
           git push --force hf HEAD:main
