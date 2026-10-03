@@ -19,7 +19,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           # Replace 'YOUR_USERNAME' and 'YOUR_SPACE_NAME' with your actual Hugging Face details
-          git remote add hf https://GGHP:$$HF_TOKEN@huggingface.co/spaces/YOUR_USERNAME/GGHP/GGHP_APP
+          git remote add hf https://GGHP:$$HF_TOKEN@huggingface.co/spaces/GGHP/GGHP_APP
           
           # Forces the deployment update to your space
           git push --force hf HEAD:main
