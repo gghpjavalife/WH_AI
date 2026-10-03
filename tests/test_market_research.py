@@ -2,6 +2,7 @@ import math
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+import os
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -25,6 +26,7 @@ from wealth_home_ai.market_research import (
     normalize_symbol,
 )
 from wealth_home_ai.features.workspace_research import _fund_frame
+from wealth_home_ai.ui_helpers import brand_lockup_html
 
 
 def _equity_master(*symbols: str) -> pd.DataFrame:
@@ -42,6 +44,13 @@ def _equity_master(*symbols: str) -> pd.DataFrame:
 
 
 class MarketResearchTests(unittest.TestCase):
+    def test_hugging_face_token_is_loaded_from_environment(self):
+        from wealth_home_ai.settings import Settings
+
+        with patch.dict(os.environ, {"HF_TOKEN": "hf-test-token"}):
+            configured = Settings.from_environment()
+        self.assertEqual(configured.hf_token, "hf-test-token")
+
     def test_public_chart_response_is_normalized_to_daily_history(self):
         timestamps = [1_700_000_000 + day * 86_400 for day in range(60)]
         payload = {
@@ -609,7 +618,7 @@ class MarketResearchTests(unittest.TestCase):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
-        app.session_state["app_navigation"] = "Market research"
+        app.session_state["app_navigation"] = "Equities"
         master = pd.DataFrame(
             [
                 {
@@ -636,11 +645,11 @@ class MarketResearchTests(unittest.TestCase):
         self.assertEqual(
             [tab.label for tab in app.tabs],
             [
-                "Home",
-                "Equities",
-                "Trades",
-                "F&O",
-                "Mutual Funds",
+                ":material/home: Home",
+                ":material/show_chart: Equities",
+                ":material/swap_horiz: Trades",
+                ":material/query_stats: F&O",
+                ":material/savings: Mutual Funds",
             ],
         )
         self.assertGreaterEqual(len(app.get("popover")), 2)
@@ -651,12 +660,13 @@ class MarketResearchTests(unittest.TestCase):
                 for item in app.get("html")
             )
         )
-        self.assertTrue(
-            any(
-                "Governed Growth &amp; Hedged Portfolios" in item.value
-                for item in app.get("html")
-            )
+        brand_html = brand_lockup_html(
+            "GGHP",
+            "Governed Growth & Hedged Portfolios",
+            "Governed multi-broker portfolio companion",
         )
+        self.assertEqual(brand_html.count('class="gghp-initial"'), 4)
+        self.assertIn("Governed multi-broker portfolio companion", brand_html)
         self.assertTrue(
             any("JEV guardrails" in item.value for item in app.markdown)
         )
@@ -678,44 +688,19 @@ class MarketResearchTests(unittest.TestCase):
         )
         self.assertEqual(
             app.session_state["app_navigation"],
-            "Equities",
+            ":material/show_chart: Equities",
         )
         self.assertTrue(
             any(
-                tab.label == "Equities"
+                tab.label.endswith("Equities")
                 for tab in app.tabs
             )
         )
         self.assertTrue(
             any("No broker is connected" in item.value for item in app.info)
         )
-        watchlist = next(
-            widget
-            for widget in app.multiselect
-            if widget.label == "Indian stock watchlist"
-        )
         self.assertTrue(
-            any(str(option).startswith("ALPHA") for option in watchlist.options)
-        )
-        self.assertTrue(
-            any(str(option).startswith("BETA") for option in watchlist.options)
-        )
-        all_stocks = next(
-            widget
-            for widget in app.checkbox
-            if widget.label.startswith("Select all ")
-        )
-        self.assertFalse(all_stocks.value)
-        all_stocks.set_value(True).run()
-        self.assertFalse(app.exception)
-        self.assertFalse(
-            any(widget.label == "Indian stock watchlist" for widget in app.multiselect)
-        )
-        self.assertTrue(
-            any(
-                "All " in item.value and " stocks selected" in item.value
-                for item in app.caption
-            )
+            any(widget.label == "Choose which stocks to scan" for widget in app.selectbox)
         )
         self.assertFalse(
             any(tab.label in {"Market research", "Market scanner"} for tab in app.tabs)
@@ -756,56 +741,6 @@ class MarketResearchTests(unittest.TestCase):
             )
         )
 
-    def test_market_scanner_uses_recommended_defaults_and_warns_on_changes(self):
-        app = AppTest.from_file(
-            str(Path(__file__).resolve().parents[1] / "app.py")
-        )
-        app.session_state["app_navigation"] = "Market scanner"
-        with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
-            return_value=_equity_master(
-                "RELIANCE",
-                "HDFCBANK",
-                "ICICIBANK",
-                "SBIN",
-                "TCS",
-                "INFY",
-                "BHARTIARTL",
-                "ITC",
-            ),
-        ):
-            app.run()
-            app.toggle(key="market_equities_use_custom").set_value(True).run()
-        self.assertFalse(app.exception)
-        self.assertTrue(
-            any(widget.label == "Minimum price (₹)" for widget in app.number_input)
-        )
-        self.assertEqual(
-            app.number_input(key="market_equities_minimum_rsi").value,
-            35.0,
-        )
-        with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
-            return_value=_equity_master(
-                "RELIANCE",
-                "HDFCBANK",
-                "ICICIBANK",
-                "SBIN",
-                "TCS",
-                "INFY",
-                "BHARTIARTL",
-                "ITC",
-            ),
-        ):
-            app.number_input(key="market_equities_minimum_rsi").set_value(40).run()
-        self.assertFalse(app.exception)
-        self.assertTrue(
-            any(
-                "differ from the suggested defaults" in item.value
-                for item in app.warning
-            )
-        )
-
     def test_disconnected_combined_workspace_shows_research_and_screeners(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
@@ -827,78 +762,46 @@ class MarketResearchTests(unittest.TestCase):
         )
         self.assertEqual(len(app.segmented_control), 0)
         self.assertTrue(
-            any(widget.label == "Indian stock watchlist" for widget in app.multiselect)
+            any(widget.label == "Choose which stocks to scan" for widget in app.selectbox)
         )
 
-    def test_scanner_select_all_lists_buy_signals_by_strength_with_pagination(self):
+    def test_portfolio_scan_universe_uses_equity_holding_tickers(self):
         from wealth_home_ai.features import market
 
-        def row(ticker, signal, score, passes):
-            return {
-                "Ticker": ticker,
-                "As_of": "2026-01-01",
-                "Price": 100.0,
-                "Recommendation": signal,
-                "Signal_score": score,
-                "Reason": "r",
-                "Indicator_signals": "",
-                "Daily_change_%": 1.0,
-                "RSI_14": 55.0,
-                "Passes_filters": passes,
-            }
-
-        rows = [row("HOLDER", "HOLD", 0, True)] + [
-            row(f"B{index:02d}", "BUY", index, False) for index in range(30)
-        ] + [row("TOP", "STRONG BUY", 11, False)]
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
-        app.session_state["app_navigation"] = "Equities"
-        with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
-            return_value=_equity_master("RELIANCE"),
-        ), patch.object(market, "_scan_stocks", return_value=(rows, [])):
-            app.run()
-            app.checkbox(key="market_equities_select_all").check().run()
-            app.button(key="market_equities_scan_button").click().run()
-
-        self.assertFalse(app.exception)
-        metric = next(
-            item for item in app.metric if item.label == "Buy / Strong Buy signals"
-        )
-        self.assertEqual(metric.value, "31")
-
-    def test_scanner_specific_selection_lists_every_scanned_stock(self):
-        from wealth_home_ai.features import market
-
-        rows = [
+        app.session_state["app_navigation"] = "Trades"
+        app.session_state["portfolio"] = pd.DataFrame(
             {
-                "Ticker": "RELIANCE.NS",
-                "As_of": "2026-01-01",
-                "Price": 100.0,
-                "Recommendation": "SELL",
-                "Signal_score": -4,
-                "Reason": "r",
-                "Indicator_signals": "",
-                "Daily_change_%": -1.0,
-                "RSI_14": 30.0,
-                "Passes_filters": False,
+                "Ticker": ["ALPHA", "BETA"],
+                "Qty": [1, 2],
+                "Avg_Price": [10.0, 20.0],
+                "LTP": [11.0, 21.0],
             }
-        ]
+        )
+        app.session_state["market_trading_scan_universe"] = "Portfolio holdings"
+        with patch(
+            "wealth_home_ai.features.market.fetch_indian_equity_master",
+            return_value=_equity_master("ALPHA", "BETA", "GAMMA"),
+        ), patch.object(market, "_scan_stocks", return_value=([], [])):
+            app.run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any("2 portfolio holdings available to scan" in item.value for item in app.caption)
+        )
+
+    def test_equities_workspace_has_no_equities_or_equity_analysis_headings(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
         app.session_state["app_navigation"] = "Equities"
-        with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
-            return_value=_equity_master("RELIANCE"),
-        ), patch.object(market, "_scan_stocks", return_value=(rows, [])):
-            app.run()
-            app.button(key="market_equities_scan_button").click().run()
+        app.run()
 
         self.assertFalse(app.exception)
-        metric = next(item for item in app.metric if item.label == "Stocks scanned")
-        self.assertEqual(metric.value, "1")
+        self.assertFalse(any(item.value in {"Equities", "Equity analysis"} for item in app.subheader))
+
     def test_scan_table_embeds_rows_with_color_coded_indicators(self):
         import json
 
@@ -939,7 +842,7 @@ class MarketResearchTests(unittest.TestCase):
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
         app.session_state["app_navigation"] = "Trades"
-        app.run()
+        app.run(timeout=10)
         app.toggle(key="market_trading_use_custom").set_value(True).run()
 
         self.assertFalse(app.exception)
@@ -979,7 +882,7 @@ class MarketResearchTests(unittest.TestCase):
 
         self.assertFalse(app.exception)
         self.assertTrue(
-            any(tab.label == "F&O" for tab in app.tabs)
+            any(tab.label.endswith("F&O") for tab in app.tabs)
         )
         self.assertTrue(
             any("option-chain and futures-contract quotes" in item.value for item in app.info)

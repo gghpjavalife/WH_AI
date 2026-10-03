@@ -10,3 +10,4 @@ google-genai>=1.0.0
 smartapi-python>=1.5.5
 pyotp>=2.9.0
 python-dotenv>=1.0.0
+huggingface_hub

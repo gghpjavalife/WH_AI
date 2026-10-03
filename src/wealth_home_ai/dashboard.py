@@ -207,7 +207,7 @@ def _render_header_feature_badges() -> None:
     ):
         st.badge(
             "AI insights",
-            icon=":material/auto_awesome:",
+            icon=":material/lightbulb:",
             color="violet",
         )
         with st.popover(
@@ -232,7 +232,7 @@ def _render_header_feature_badges() -> None:
                 "charges may apply.\n"
                 "- Recommendations are advisory. They are checked by JEV rules "
                 "and are never submitted automatically.\n"
-                "- **Ask about this Agent** is a separate local app guide and "
+                "- **Ask the AI guide** is a separate local app guide and "
                 "does not use an AI key."
             )
             st.markdown(
@@ -242,7 +242,7 @@ def _render_header_feature_badges() -> None:
 
         st.badge(
             "JEV guardrails",
-            icon=":material/shield:",
+            icon=":material/verified_user:",
             color="blue",
         )
         with st.popover(
@@ -388,15 +388,15 @@ def _render_same_tab_link(label: str, url: str) -> None:
 
 
 def _render_app_header(connected_broker: str | None = None) -> None:
-    with st.container(border=True, gap="small"):
-        title_column, action_column = st.columns(
-            [1.15, 1.85],
+    with st.container(border=True, gap="medium"):
+        with st.container(
+            horizontal=True,
+            horizontal_alignment="distribute",
             vertical_alignment="center",
-        )
-        with title_column:
+            gap="medium",
+            wrap=True,
+        ):
             _render_brand_lockup()
-            _render_header_feature_badges()
-        with action_column:
             with st.container(
                 horizontal=True,
                 horizontal_alignment="right",
@@ -407,14 +407,21 @@ def _render_app_header(connected_broker: str | None = None) -> None:
                 _render_portfolio_share()
                 _render_notification_settings()
                 _render_agent()
-            with st.container(
-                horizontal=True,
-                horizontal_alignment="right",
-                vertical_alignment="center",
-                gap="small",
-                wrap=True,
-            ):
-                if connected_broker:
+        with st.container(
+            horizontal=True,
+            horizontal_alignment="distribute",
+            vertical_alignment="center",
+            gap="small",
+            wrap=True,
+        ):
+            _render_header_feature_badges()
+            if connected_broker:
+                with st.container(
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="small",
+                    wrap=True,
+                ):
                     st.badge(
                         f"{connected_broker} connected",
                         icon=":material/check_circle:",
@@ -427,12 +434,12 @@ def _render_app_header(connected_broker: str | None = None) -> None:
                         icon=":material/swap_horiz:",
                         help="Disconnect this broker and connect another account.",
                     )
-                else:
-                    st.badge(
-                        "No broker connected",
-                        icon=":material/link_off:",
-                        color="gray",
-                    )
+            else:
+                st.badge(
+                    "No broker connected",
+                    icon=":material/link_off:",
+                    color="gray",
+                )
 
 
 def _tenant_identifier() -> str:
@@ -505,26 +512,33 @@ APP_TAB_LABELS = (
 )
 
 APP_TABS = (
-    "Home",
-    "Equities",
-    "Trades",
-    "F&O",
-    "Mutual Funds",
+    ":material/home: Home",
+    ":material/show_chart: Equities",
+    ":material/swap_horiz: Trades",
+    ":material/query_stats: F&O",
+    ":material/savings: Mutual Funds",
 )
 
 
 def _render_header_tabs():
     legacy_navigation = {
+        "Home": APP_TAB_LABELS[0],
+        "Equities": APP_TAB_LABELS[1],
         "Equity / Debt": APP_TAB_LABELS[1],
         "Debt": APP_TAB_LABELS[1],
         "Trading": APP_TAB_LABELS[2],
+        "Trades": APP_TAB_LABELS[2],
         "Options": APP_TAB_LABELS[3],
         "Futures": APP_TAB_LABELS[3],
+        "F&O": APP_TAB_LABELS[3],
+        "Mutual Funds": APP_TAB_LABELS[4],
         "Mutual funds": APP_TAB_LABELS[4],
         "Market research": APP_TAB_LABELS[1],
         "Market scanner": APP_TAB_LABELS[1],
         ":material/home: Home": APP_TAB_LABELS[0],
         ":material/account_balance: Equity / Debt": APP_TAB_LABELS[1],
+        ":material/show_chart: Equities": APP_TAB_LABELS[1],
+        ":material/swap_horiz: Trades": APP_TAB_LABELS[2],
         ":material/swap_vert: Trades": APP_TAB_LABELS[2],
         ":material/query_stats: F&O": APP_TAB_LABELS[3],
         ":material/savings: Mutual Funds": APP_TAB_LABELS[4],
@@ -695,7 +709,7 @@ def _render_notification_settings() -> None:
 
     with st.popover(
         "Email",
-        icon=":material/mail:",
+        icon=":material/alternate_email:",
         help="Configure secure email alerts for this browser session.",
     ):
         st.selectbox(
@@ -1864,8 +1878,8 @@ def _show_login() -> None:
     _render_app_header()
     with st.container(border=True, gap="medium"):
         tabs = _render_header_tabs()
-        if tabs["Home"].open:
-            with tabs["Home"]:
+        if tabs[APP_TAB_LABELS[0]].open:
+            with tabs[APP_TAB_LABELS[0]]:
                 _render_broker_connection()
         for asset in APP_TAB_LABELS[1:]:
             if tabs[asset].open:
@@ -2759,8 +2773,8 @@ def _show_workspace() -> None:
             st.session_state.planning_budget_inr = max(
                 float(st.session_state.balance), 1.0
             )
-        if tabs["Home"].open:
-            with tabs["Home"]:
+        if tabs[APP_TAB_LABELS[0]].open:
+            with tabs[APP_TAB_LABELS[0]]:
                 render_home_dashboard(
                     float(st.session_state.balance),
                     st.session_state.equity_holdings,
@@ -3005,8 +3019,8 @@ def _render_portfolio_share() -> None:
 def _render_agent() -> None:
     st.session_state.setdefault("chat_history", [])
     with st.popover(
-        "Ask about this Agent",
-        icon=":material/chat:",
+        "Ask the AI guide",
+        icon=":material/smart_toy:",
         help="Local app guide for GGHP No AI API key or external request required.",
     ):
         st.caption(
@@ -3069,10 +3083,8 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
     if asset == "Equities":
         if st.session_state.broker_data_errors.get("equity"):
             st.warning(st.session_state.broker_data_errors["equity"])
-        st.subheader("Equities")
         render_equity(st.session_state.equity_holdings)
         if broker_connected:
-            st.subheader("Equity analysis")
             render_analysis_panel(
                 "equity", "equity", _run_analysis, _show_approved_trades
             )
@@ -3197,8 +3209,8 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
 
 def _render_portfolio_ai_review() -> None:
     with st.expander(
-        "Portfolio review & risk settings",
-        icon=":material/tune:",
+        "Portfolio planning & safeguards",
+        icon=":material/shield_with_heart:",
     ):
         st.caption(
             "Review equity, trading, and mutual-fund records together. "

@@ -219,7 +219,7 @@ class JevRuleEngine:
                 buy_lock_until = now + timedelta(hours=24)
             self.facts["buy_lock_until"] = buy_lock_until
             self.audit_trail.append(
-                "Rule A (Portfolio Circuit Breaker): realized daily loss is "
+                "Rule 1 — Rule A (Portfolio circuit breaker): realized daily loss is "
                 f"{loss_pct:.2f}% (at or below -3%); BUY execution is locked "
                 f"until {buy_lock_until.isoformat()}."
             )
@@ -230,13 +230,13 @@ class JevRuleEngine:
         if buy_lock_until is not None and buy_lock_until > now:
             self.facts["buy_lock_until"] = buy_lock_until
             self.audit_trail.append(
-                "Rule A (Portfolio Circuit Breaker): existing BUY lock remains "
+                "Rule 1 — Rule A (Portfolio circuit breaker): existing BUY lock remains "
                 f"active until {buy_lock_until.isoformat()}."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         self.facts["buy_lock_until"] = None
         self.audit_trail.append(
-            "Rule A (Portfolio Circuit Breaker): no active daily-loss lock."
+            "Rule 1 — Rule A (Portfolio circuit breaker): no active daily-loss lock."
         )
 
         trading_open = (
@@ -245,7 +245,7 @@ class JevRuleEngine:
         )
         if not trading_open:
             self.audit_trail.append(
-                "Rule B (Trading Window Guard): closed; new trades are allowed "
+                "Rule 2 — Rule B (Trading window): closed; new trades are allowed "
                 "only Monday–Friday, 09:45–15:00 Asia/Kolkata."
             )
             self.audit_trail.append(
@@ -253,7 +253,7 @@ class JevRuleEngine:
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         self.audit_trail.append(
-            "Rule B (Trading Window Guard): current IST time is inside the "
+            "Rule 2 — Rule B (Trading window): current IST time is inside the "
             "Monday–Friday 09:45–15:00 window."
         )
 
@@ -269,7 +269,7 @@ class JevRuleEngine:
         position_count = max(int(position_count or 0), 0)
         if position_count >= 8:
             self.audit_trail.append(
-                "Rule C (Focus Cap): "
+                "Rule 3 — Rule C (Position limit): "
                 f"{position_count} active positions meet/exceed the limit of 8; "
                 "new trades are blocked."
             )
@@ -278,7 +278,7 @@ class JevRuleEngine:
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         self.audit_trail.append(
-            f"Rule C (Focus Cap): {position_count} of 8 active positions."
+            f"Rule 3 — Rule C (Position limit): {position_count} of 8 active positions."
         )
 
         confidence_passed = [
@@ -287,7 +287,7 @@ class JevRuleEngine:
             if candidate["Confidence_Score"] >= 70
         ]
         self.audit_trail.append(
-            "Rule D (Confidence Boundary): "
+            "Rule 4 — Rule D (Confidence threshold): "
             f"{len(confidence_passed)} of {len(candidates)} valid target(s) "
             "passed the 70% minimum."
         )
@@ -310,14 +310,14 @@ class JevRuleEngine:
         )
         if allocation_cap_pct is None or not 0 <= allocation_cap_pct <= 100:
             self.audit_trail.append(
-                "Rule E/F (Allocation Limit): invalid allocation cap; no trades "
+                "Rule 5 — Rule E/F (Allocation limit): invalid allocation cap; no trades "
                 "were approved."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         allocatable_cash = cash * allocation_cap_pct / 100
         if cash > 20_000:
             self.audit_trail.append(
-                "Rule E (Capital Adequacy Check): abundant cash; equal-weight "
+                "Rule 5 — Rule E (Capital allocation): sufficient cash; equal-weight "
                 f"allocation uses {allocation_cap_pct:.1f}% cap "
                 f"(INR {allocatable_cash:,.2f} total)."
             )
@@ -329,13 +329,13 @@ class JevRuleEngine:
                 ):
                     self.approved_trades.append({**candidate, "Qty": quantity})
             self.audit_trail.append(
-                f"Rule E approved {len(self.approved_trades)} affordable "
+                f"Rule 5 approved {len(self.approved_trades)} affordable "
                 "equal-weight allocation(s) within the cap."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
 
         self.audit_trail.append(
-            "Rule F (Ordinal Triage Filter): scarce cash; prioritizing "
+            "Rule 6 — Rule F (Limited-cash prioritization): scarce cash; prioritizing "
             "unheld sectors, then confidence, within the capped wallet budget."
         )
         held_sectors = self._existing_sectors()
@@ -360,7 +360,7 @@ class JevRuleEngine:
         )
         if selected is None:
             self.audit_trail.append(
-                "Rule F selected no target: none of the ranked candidates fit the "
+                "Rule 6 selected no target: none of the ranked candidates fit the "
                 "allocation cap and wallet budget."
             )
         else:
@@ -368,7 +368,7 @@ class JevRuleEngine:
             if quantity > 0:
                 self.approved_trades = [{**selected, "Qty": quantity}]
                 self.audit_trail.append(
-                    f"Rule F approved {selected['Ticker']} ({selected.get('Sector') or 'unknown sector'}), "
+                    f"Rule 6 approved {selected['Ticker']} ({selected.get('Sector') or 'unknown sector'}), "
                     f"confidence {selected['Confidence_Score']:.1f}%, quantity {quantity}."
                 )
         return self.approved_trades.copy(), self.audit_trail.copy()

@@ -300,16 +300,16 @@ class PortfolioFeatureTests(unittest.TestCase):
         self.assertFalse(app.sidebar.get("caption"))
         self.assertEqual(
             app.session_state["app_navigation"],
-            "Home",
+            ":material/home: Home",
         )
         self.assertEqual(
             [tab.label for tab in app.tabs],
             [
-                "Home",
-                "Equities",
-                "Trades",
-                "F&O",
-                "Mutual Funds",
+                ":material/home: Home",
+                ":material/show_chart: Equities",
+                ":material/swap_horiz: Trades",
+                ":material/query_stats: F&O",
+                ":material/savings: Mutual Funds",
             ],
         )
         self.assertFalse(

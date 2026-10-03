@@ -222,7 +222,8 @@ def render_analysis_panel(
         if candidate_count:
             st.caption(
                 f"AI candidate pool: {candidate_count} NSE Strong Buy/Buy stocks "
-                "from the latest equity scan; broker quotes are refreshed when analysis runs."
+                "from the latest Equities scan. BSE listings and stocks without a "
+                "usable broker quote are not eligible for an LLM recommendation."
             )
         else:
             st.caption(
@@ -255,10 +256,25 @@ def render_analysis_panel(
     candidates = analysis["cash_deployment_list"]
     if candidates:
         st.dataframe(pd.DataFrame(candidates), hide_index=True)
-    with st.expander(f"{title} analysis audit trail"):
-        st.code(
-            "\n".join(st.session_state.audit_trails_by_scope.get(scope, []))
+    with st.expander("JEV rules engine · evaluation log", icon=":material/rule:"):
+        st.caption(
+            "Numbered checks show the order in which portfolio safeguards and "
+            "allocation rules were evaluated. The letter in parentheses maps to "
+            "the corresponding rule definition."
         )
+        audit_lines = st.session_state.audit_trails_by_scope.get(scope, [])
+        if audit_lines:
+            numbered_lines = []
+            rule_number = 0
+            for line in audit_lines:
+                if line.startswith("Rule "):
+                    rule_number += 1
+                    numbered_lines.append(f"{rule_number}. {line}")
+                else:
+                    numbered_lines.append(f"   {line}")
+            st.code("\n".join(numbered_lines), language=None)
+        else:
+            st.info("No rule evaluation log is available for this analysis yet.")
     trades = st.session_state.approved_trades_by_scope.get(scope, [])
     if trades:
         st.warning(

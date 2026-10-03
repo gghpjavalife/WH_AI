@@ -790,7 +790,6 @@ def _save_scanner_state(prefix: str) -> None:
 def _render_scanner(
     *, scope: str, suggested_symbols: list[str] | None = None
 ) -> None:
-    st.subheader(f"{scope} market scanner")
     if scope == "Trading":
         st.caption(
             "Screen active trade candidates using price, RSI, average liquidity, "
@@ -830,6 +829,22 @@ def _render_scanner(
             f"{len(master):,} active Indian equities available across NSE "
             "and BSE · lists refresh automatically every 24 hours."
         )
+        with st.expander("What do the stock counts mean?", icon=":material/help:"):
+            st.markdown(
+                "- **Listed stocks**: securities in the combined active NSE/BSE "
+                "exchange list. The scan universe may also include broker-mapped "
+                "or portfolio tickers.\n"
+                "- **Fetched**: selected symbols for which enough daily price history "
+                "was retrieved to calculate indicators. Unavailable symbols are "
+                "reported separately as scan failures.\n"
+                "- **Buy / Strong Buy signals**: fetched stocks whose technical "
+                "indicator score is classified as Buy or Strong Buy. With custom "
+                "filters enabled, this count includes only stocks that pass them.\n"
+                "- **NSE candidates for portfolio analysis**: the latest Equities "
+                "scan's Buy/Strong Buy stocks that pass custom filters (when enabled) "
+                "and are NSE tickers. BSE `.BO` listings are excluded. The LLM can "
+                "recommend only candidates with usable broker quotes."
+            )
         st.markdown(
             "[BSE listed-equity feed ↗](https://www.bseindia.com/) · "
             "[NSE equity security master ↗]"
@@ -863,24 +878,65 @@ def _render_scanner(
         for symbol in st.session_state[watchlist_key]
         if symbol in available_symbols
     ]
-    select_all = st.checkbox(
-        f"Select all {len(available_symbols):,} listed stocks",
-        key=f"market_{prefix}_select_all",
+    exchange_symbols = {
+        exchange: sorted(
+            set(master.loc[master["Exchange"].eq(exchange), "Symbol"].astype(str))
+            if "Exchange" in master and "Symbol" in master
+            else set()
+        )
+        for exchange in ("NSE", "BSE")
+    }
+    universe_options = [
+        "Choose stock universe",
+        "All listed stocks (NSE + BSE)",
+        "NSE-listed stocks",
+        "BSE-listed stocks",
+        "Portfolio holdings",
+    ]
+    universe_key = f"market_{prefix}_scan_universe"
+    if universe_key not in st.session_state:
+        st.session_state[universe_key] = universe_options[0]
+    st.selectbox(
+        "Choose which stocks to scan",
+        options=universe_options,
+        key=universe_key,
         help=(
-            "Use the entire NSE and BSE universe without rendering thousands of "
-            "selected chips. Scanning all stocks makes one history request per "
-            "stock and may take a long time."
+            "Choose a listing universe or your portfolio. Use the stock picker "
+            "below to scan a hand-picked watchlist."
         ),
     )
+    selected_universe = st.session_state[universe_key]
+    select_all = selected_universe == "All listed stocks (NSE + BSE)"
     if select_all:
         symbols = sorted(available_symbols)
         st.caption(
-            f"All {len(symbols):,} stocks selected. Historical prices are fetched "
-            "individually; exchange and public-data-provider rate limits may apply."
+            f"All {len(symbols):,} listed stocks selected. Historical prices are "
+            "fetched individually; provider rate limits may apply."
         )
+    elif selected_universe == "NSE-listed stocks":
+        symbols = exchange_symbols["NSE"]
+        st.caption(f"{len(symbols):,} NSE-listed stocks selected.")
+    elif selected_universe == "BSE-listed stocks":
+        symbols = exchange_symbols["BSE"]
+        st.caption(f"{len(symbols):,} BSE-listed stocks selected.")
+    elif selected_universe == "Portfolio holdings":
+        symbols = []
+        for state_key in ("equity_holdings", "portfolio"):
+            portfolio_frame = st.session_state.get(state_key)
+            if not isinstance(portfolio_frame, pd.DataFrame) or "Ticker" not in portfolio_frame.columns:
+                continue
+            for ticker in portfolio_frame["Ticker"].dropna():
+                normalized = str(ticker).strip().upper()
+                if normalized:
+                    try:
+                        symbols.append(normalize_symbol(normalized))
+                    except ValueError:
+                        continue
+        symbols = sorted(set(symbols) & available_symbols)
+        st.caption(f"{len(symbols):,} portfolio holdings available to scan.")
     else:
         symbols = st.multiselect(
-            "Indian stock watchlist",
+            "Pick individual stocks",
             options=sorted(available_symbols),
             format_func=lambda ticker: labels.get(ticker, ticker),
             key=watchlist_key,
@@ -1007,27 +1063,6 @@ def _render_scanner(
     if minimum_rsi > maximum_rsi:
         st.error("Minimum RSI must not exceed maximum RSI.")
 
-    # Allow the user to restrict the scanned universe to portfolio symbols.
-    only_portfolio = st.checkbox(
-        "Only portfolio stocks",
-        key=f"market_{prefix}_only_portfolio",
-        help="When checked, scan only the stocks currently held in your workspace portfolio.",
-    )
-    if only_portfolio:
-        portfolio_symbols = []
-        try:
-            portfolio_frame = st.session_state.get("equity_holdings") or st.session_state.get("portfolio")
-            if portfolio_frame is not None:
-                portfolio_symbols = [
-                    str(t).strip().upper()
-                    for t in portfolio_frame.get("Ticker", [])
-                    if str(t).strip()
-                ]
-        except Exception:
-            portfolio_symbols = []
-        # intersect with available symbols
-        symbols = [s for s in (symbols or []) if s in set(portfolio_symbols)]
-
     if custom_filters:
         st.html(
             f"<style>.st-key-market_{prefix}_scan_button button"
@@ -1038,11 +1073,6 @@ def _render_scanner(
         bool(symbols)
         and minimum_price <= maximum_price
         and minimum_rsi <= maximum_rsi
-    )
-    nse_symbols = sorted(
-        set(master.loc[master["Exchange"].eq("NSE"), "Symbol"].astype(str))
-        if "Exchange" in master and "Symbol" in master
-        else set()
     )
     with st.container(horizontal=True, vertical_alignment="center"):
         scan_clicked = st.button(
@@ -1057,19 +1087,8 @@ def _render_scanner(
                 else "Fetch delayed public daily candles and evaluate the selected stocks."
             ),
         )
-        scan_nse_clicked = st.button(
-            "Scan all NSE listings",
-            key=f"market_{prefix}_scan_nse_button",
-            icon=":material/query_stats:",
-            disabled=not nse_symbols or minimum_price > maximum_price or minimum_rsi > maximum_rsi,
-            help=(
-                "Score every active NSE EQ security from the current NSE master; "
-                "daily history is cached for repeat scans."
-            ),
-        )
-    if scan_nse_clicked:
-        symbols = nse_symbols
-    scan_requested = scan_clicked or scan_nse_clicked
+        
+    scan_requested = scan_clicked
     results: list[dict[str, object]] = []
     failures: dict[str, str] = {}
     if scan_requested:
@@ -1136,9 +1155,17 @@ def _render_scanner(
             border=True,
         )
         if scope == "Equities":
+            candidate_count = len(st.session_state.get("market_ai_candidates", []))
+            updated_at = st.session_state.get("market_ai_candidates_updated_at")
+            update_note = (
+                f" Last updated {updated_at.strftime('%d %b %Y, %H:%M:%S')}."
+                if isinstance(updated_at, datetime)
+                else " Run an Equities scan to create this candidate list."
+            )
             st.caption(
-                f"{len(st.session_state.get('market_ai_candidates', [])):,} NSE "
-                "Strong Buy/Buy candidates saved for the next LLM portfolio analysis."
+                f"{candidate_count:,} NSE Buy/Strong Buy candidates from the latest "
+                "Equities scan are saved for portfolio analysis."
+                + update_note
             )
         if matches:
             payload, config = _scan_table_payload(matches, labels)
