@@ -1,4 +1,4 @@
-# --- Core Framework & UI ---
+# --- Core UI & Framework ---
 streamlit>=1.57.0
 plotly>=5.0.0
 
@@ -15,5 +15,5 @@ python-dotenv>=1.0.0
 
 # --- Broker Integrations ---
 upstox-python-sdk>=2.30.0
-# Pulls the active, clean development distribution to bypass PyPI pip loops:
-git+https://github.com
+# Native wheel parsing flag for Streamlit's pip environment
+smartapi-python @ git+https://github.com
