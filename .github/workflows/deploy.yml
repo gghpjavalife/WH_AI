@@ -1,0 +1,25 @@
+name: Sync to Hugging Face Spaces
+
+on:
+  push:
+    branches: [ master ] # Triggers whenever you push code to master or main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Replace 'YOUR_USERNAME' and 'YOUR_SPACE_NAME' with your actual Hugging Face details
+          git remote add hf https://GGHP:$$HF_TOKEN@huggingface.co/spaces/YOUR_USERNAME/GGHP/GGHP_APP
+          
+          # Forces the deployment update to your space
+          git push --force hf HEAD:main
