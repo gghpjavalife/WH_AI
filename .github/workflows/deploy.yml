@@ -14,9 +14,15 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      - name: Push to Space
-        uses: huggingface/hfaction@v3
-        with:
-          hf_token: ${{ secrets.HF_TOKEN }}
-          hf_repo: GGHP/GGHP_APP
-          repo_type: space
+      - name: Configure Git Credentials
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Use basic auth formatting to bypass string evaluation failures
+          git config --global credential.helper store
+          echo "https://GGHP:${HF_TOKEN}@huggingface.co" > ~/.git-credentials
+
+      - name: Push to Hugging Face
+        run: |
+          git remote add hf https://huggingface.co || true
+          git push --force hf HEAD:main
