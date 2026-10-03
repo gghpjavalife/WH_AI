@@ -1,12 +1,19 @@
-# The official PyPI distribution imports as upstox_client.
-upstox-python-sdk>=2.30.0
+# --- Core Framework & UI ---
 streamlit>=1.57.0
+plotly>=5.0.0
+
+# --- Data Engine ---
 pandas>=2.2.0
 pandas-ta>=0.4.71b0; python_version < "3.14"
-plotly>=5.0.0
+
+# --- AI & Utilities ---
+google-genai>=1.0.0
 logzero>=1.7.0
 requests>=2.31.0
-google-genai>=1.0.0
-smartapi-python
 pyotp>=2.9.0
 python-dotenv>=1.0.0
+
+# --- Broker Integrations ---
+upstox-python-sdk>=2.30.0
+# Pulls the active, clean development distribution to bypass PyPI pip loops:
+git+https://github.com
