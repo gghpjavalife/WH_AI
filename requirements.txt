@@ -16,4 +16,4 @@ python-dotenv>=1.0.0
 # --- Broker Integrations ---
 upstox-python-sdk>=2.30.0
 # Native wheel parsing flag for Streamlit's pip environment
-smartapi-python @ git+https://github.com
+smartapi-python>=1.5.5
