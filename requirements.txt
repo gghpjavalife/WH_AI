@@ -1,17 +1,10 @@
-# --- Core UI & Framework ---
-streamlit>=1.57.0
-plotly>=5.0.0
-
-# --- Data Engine ---
+streamlit>=1.40.0
+plotly>=5.24.0
 pandas>=2.2.0
 pandas-ta>=0.4.71b0; python_version < "3.14"
-
-# --- AI & Utilities ---
 google-genai>=1.0.0
-logzero>=1.7.0
-requests>=2.31.0
 pyotp>=2.9.0
 python-dotenv>=1.0.0
-
-# --- Broker Integrations ---
+logzero>=1.7.0
+requests>=2.31.0
 upstox-python-sdk>=2.30.0
