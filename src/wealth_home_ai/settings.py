@@ -134,7 +134,6 @@ class Settings:
     llm_retry_jitter: float = 0.2
     resend_api_key: str = ""
     resend_sender: str = ""
-    hf_token: str = ""
     turso_primary_db_url: str = ""
     turso_auth_token: str = ""
     dynamic_broker_allowed_hosts: tuple[str, ...] = ()
@@ -299,7 +298,6 @@ class Settings:
             ),
             resend_api_key=str(configured_value("RESEND_API_KEY", "")).strip(),
             resend_sender=str(configured_value("RESEND_SENDER", "")).strip(),
-            hf_token=str(configured_value("HF_TOKEN", "")).strip(),
             turso_primary_db_url=str(
                 configured_value("TURSO_PRIMARY_DB_URL", "")
             ).strip(),

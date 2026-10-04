@@ -47,7 +47,7 @@ class JevRuleEngineTests(TestCase):
         self.assertEqual(
             engine.facts["buy_lock_until"], self.now + timedelta(hours=24)
         )
-        self.assertTrue(any("Rule A" in line for line in audit))
+        self.assertTrue(any("Rule 1 (Portfolio circuit breaker)" in line for line in audit))
 
     def test_circuit_breaker_keeps_existing_lock_until_its_expiry(self):
         expiry = self.now + timedelta(hours=5)
@@ -156,3 +156,20 @@ class JevRuleEngineTests(TestCase):
         self.assertEqual(len(trades), 1)
         self.assertEqual(trades[0]["Ticker"], "TCS")
         self.assertTrue(any("Rule F" in line for line in audit))
+
+    def test_selected_rules_can_be_skipped_for_analysis_filtering(self):
+        engine = self._engine(
+            now=self.now.replace(hour=16),
+            realized_daily_loss_pct=-4,
+            active_positions_count=8,
+            cash_balance=10_000,
+            enabled_rules=[],
+        )
+
+        trades, audit = engine.run()
+
+        self.assertTrue(trades)
+        self.assertTrue(any("Rule 1 (Portfolio circuit breaker): skipped" in line for line in audit))
+        self.assertTrue(any("Rule 2 (Trading window): skipped" in line for line in audit))
+        self.assertTrue(any("Rule 3 (Position limit): skipped" in line for line in audit))
+

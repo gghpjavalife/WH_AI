@@ -189,6 +189,14 @@ class JevRuleEngine:
         self.steps = self.audit_trail
         self.approved_trades = []
         candidates = self._validated_candidates()
+        enabled_rules = self.facts.get("enabled_rules", [1, 2, 3, 4, 5, 6])
+        if not isinstance(enabled_rules, (list, tuple, set, frozenset)):
+            enabled_rules = [1, 2, 3, 4, 5, 6]
+        enabled_rules = {
+            rule_number
+            for rule_number in enabled_rules
+            if isinstance(rule_number, int) and not isinstance(rule_number, bool)
+        }
 
         now = self.facts.get("now")
         if not isinstance(now, datetime):
@@ -214,12 +222,12 @@ class JevRuleEngine:
                 )
         else:
             buy_lock_until = None
-        if loss_pct <= -3:
+        if 1 in enabled_rules and loss_pct <= -3:
             if buy_lock_until is None or buy_lock_until <= now:
                 buy_lock_until = now + timedelta(hours=24)
             self.facts["buy_lock_until"] = buy_lock_until
             self.audit_trail.append(
-                "Rule 1 — Rule A (Portfolio circuit breaker): realized daily loss is "
+                "Rule 1 (Portfolio circuit breaker): realized daily loss is "
                 f"{loss_pct:.2f}% (at or below -3%); BUY execution is locked "
                 f"until {buy_lock_until.isoformat()}."
             )
@@ -227,35 +235,41 @@ class JevRuleEngine:
                 "Evaluation stopped: the portfolio circuit breaker blocks new buys."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
-        if buy_lock_until is not None and buy_lock_until > now:
+        if 1 in enabled_rules and buy_lock_until is not None and buy_lock_until > now:
             self.facts["buy_lock_until"] = buy_lock_until
             self.audit_trail.append(
-                "Rule 1 — Rule A (Portfolio circuit breaker): existing BUY lock remains "
+                "Rule 1 (Portfolio circuit breaker): existing BUY lock remains "
                 f"active until {buy_lock_until.isoformat()}."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         self.facts["buy_lock_until"] = None
-        self.audit_trail.append(
-            "Rule 1 — Rule A (Portfolio circuit breaker): no active daily-loss lock."
-        )
+        if 1 in enabled_rules:
+            self.audit_trail.append(
+                "Rule 1 (Portfolio circuit breaker): no active daily-loss lock."
+            )
+        else:
+            self.audit_trail.append("Rule 1 (Portfolio circuit breaker): skipped by user.")
 
         trading_open = (
             now.weekday() < 5
             and time(9, 45) <= now.time() <= time(15, 0)
         )
-        if not trading_open:
+        if 2 in enabled_rules and not trading_open:
             self.audit_trail.append(
-                "Rule 2 — Rule B (Trading window): closed; new trades are allowed "
+                "Rule 2 (Trading window): closed; new trades are allowed "
                 "only Monday–Friday, 09:45–15:00 Asia/Kolkata."
             )
             self.audit_trail.append(
                 "Evaluation stopped: outside the configured trading window."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
-        self.audit_trail.append(
-            "Rule 2 — Rule B (Trading window): current IST time is inside the "
-            "Monday–Friday 09:45–15:00 window."
-        )
+        if 2 in enabled_rules:
+            self.audit_trail.append(
+                "Rule 2 (Trading window): current IST time is inside the "
+                "Monday–Friday 09:45–15:00 window."
+            )
+        else:
+            self.audit_trail.append("Rule 2 (Trading window): skipped by user.")
 
         portfolio = self.facts.get("portfolio")
         supplied_count = self.facts.get("active_positions_count")
@@ -267,9 +281,9 @@ class JevRuleEngine:
                 supplied_count = 0
         position_count = _finite_number(supplied_count)
         position_count = max(int(position_count or 0), 0)
-        if position_count >= 8:
+        if 3 in enabled_rules and position_count >= 8:
             self.audit_trail.append(
-                "Rule 3 — Rule C (Position limit): "
+                "Rule 3 (Position limit): "
                 f"{position_count} active positions meet/exceed the limit of 8; "
                 "new trades are blocked."
             )
@@ -277,19 +291,22 @@ class JevRuleEngine:
                 "Evaluation stopped: the active-position focus cap is reached."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
-        self.audit_trail.append(
-            f"Rule 3 — Rule C (Position limit): {position_count} of 8 active positions."
-        )
+        if 3 in enabled_rules:
+            self.audit_trail.append(
+                f"Rule 3 (Position limit): {position_count} of 8 active positions."
+            )
+        else:
+            self.audit_trail.append("Rule 3 (Position limit): skipped by user.")
 
         confidence_passed = [
             candidate
             for candidate in candidates
-            if candidate["Confidence_Score"] >= 70
+            if 4 not in enabled_rules or candidate["Confidence_Score"] >= 70
         ]
         self.audit_trail.append(
-            "Rule 4 — Rule D (Confidence threshold): "
+            "Rule 4 (Confidence threshold): "
             f"{len(confidence_passed)} of {len(candidates)} valid target(s) "
-            "passed the 70% minimum."
+            + ("passed the 70% minimum." if 4 in enabled_rules else "included; rule skipped by user.")
         )
         if not confidence_passed:
             self.audit_trail.append("Evaluation stopped: no high-confidence candidates.")
@@ -307,17 +324,24 @@ class JevRuleEngine:
         )
         allocation_cap_pct = _finite_number(
             self.facts.get("max_allocation_pct", cap_value)
+            if 5 in enabled_rules
+            else 100.0
         )
         if allocation_cap_pct is None or not 0 <= allocation_cap_pct <= 100:
             self.audit_trail.append(
-                "Rule 5 — Rule E/F (Allocation limit): invalid allocation cap; no trades "
+                "Rule 5 (Allocation limit): invalid allocation cap; no trades "
                 "were approved."
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
         allocatable_cash = cash * allocation_cap_pct / 100
-        if cash > 20_000:
+        if cash > 20_000 or 6 not in enabled_rules:
+            if 6 not in enabled_rules and cash <= 20_000:
+                self.audit_trail.append(
+                    "Rule 6 (Limited-cash prioritization): skipped by user; "
+                    "eligible recommendations are evaluated without sector prioritization."
+                )
             self.audit_trail.append(
-                "Rule 5 — Rule E (Capital allocation): sufficient cash; equal-weight "
+                "Rule 5 (Capital allocation): sufficient cash; equal-weight "
                 f"allocation uses {allocation_cap_pct:.1f}% cap "
                 f"(INR {allocatable_cash:,.2f} total)."
             )
@@ -334,11 +358,16 @@ class JevRuleEngine:
             )
             return self.approved_trades.copy(), self.audit_trail.copy()
 
-        self.audit_trail.append(
-            "Rule 6 — Rule F (Limited-cash prioritization): scarce cash; prioritizing "
-            "unheld sectors, then confidence, within the capped wallet budget."
-        )
-        held_sectors = self._existing_sectors()
+        if 6 in enabled_rules:
+            self.audit_trail.append(
+                "Rule 6 (Limited-cash prioritization): scarce cash; prioritizing "
+                "unheld sectors, then confidence, within the capped wallet budget."
+            )
+        else:
+            self.audit_trail.append(
+                "Rule 6 (Limited-cash prioritization): skipped by user."
+            )
+        held_sectors = self._existing_sectors() if 6 in enabled_rules else set()
         ranked = sorted(
             confidence_passed,
             key=lambda candidate: (

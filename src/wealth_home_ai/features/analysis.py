@@ -248,6 +248,48 @@ def render_analysis_panel(
             )
         return
 
+    if scope == "all":
+        rule_labels = {
+            1: "Rule 1 — Portfolio circuit breaker",
+            2: "Rule 2 — Trading window",
+            3: "Rule 3 — Active position limit",
+            4: "Rule 4 — Confidence threshold",
+            5: "Rule 5 — Capital allocation",
+            6: "Rule 6 — Limited-cash prioritization",
+        }
+        selected_rules = st.multiselect(
+            "JEv rules for analysis",
+            options=list(rule_labels),
+            default=st.session_state.get("enabled_jev_rules", list(rule_labels)),
+            format_func=lambda rule_number: rule_labels[rule_number],
+            key="enabled_jev_rules",
+        )
+        selected_rules = sorted(int(rule_number) for rule_number in selected_rules)
+        previous_rules = st.session_state.get("jev_rule_selection_after_analysis")
+        if previous_rules is not None and selected_rules != previous_rules:
+            st.session_state.jev_rule_selection_after_analysis = list(selected_rules)
+            st.session_state.jev_rule_selection_before_analysis = list(selected_rules)
+            for existing_scope, existing_analysis in st.session_state.analysis_results.items():
+                reevaluate = st.session_state.get("reevaluate_analysis_rules")
+                if reevaluate:
+                    reevaluate(existing_scope, existing_analysis, selected_rules)
+    else:
+        rule_labels = {
+            1: "Rule 1 — Portfolio circuit breaker",
+            2: "Rule 2 — Trading window",
+            3: "Rule 3 — Active position limit",
+            4: "Rule 4 — Confidence threshold",
+            5: "Rule 5 — Capital allocation",
+            6: "Rule 6 — Limited-cash prioritization",
+        }
+        selected_rules = st.multiselect(
+            "JEv rules for analysis",
+            options=list(rule_labels),
+            default=st.session_state.get("enabled_jev_rules", list(rule_labels)),
+            format_func=lambda rule_number: rule_labels[rule_number],
+            key="enabled_jev_rules",
+        )
+
     st.caption(
         f"Scenario budget: ₹{float(st.session_state.planning_budget_inr):,.2f} · "
         f"actual broker cash: ₹{float(st.session_state.balance):,.2f}"

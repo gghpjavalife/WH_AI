@@ -1,8 +1,7 @@
 import math
 import unittest
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
-import os
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -44,12 +43,6 @@ def _equity_master(*symbols: str) -> pd.DataFrame:
 
 
 class MarketResearchTests(unittest.TestCase):
-    def test_hugging_face_token_is_loaded_from_environment(self):
-        from wealth_home_ai.settings import Settings
-
-        with patch.dict(os.environ, {"HF_TOKEN": "hf-test-token"}):
-            configured = Settings.from_environment()
-        self.assertEqual(configured.hf_token, "hf-test-token")
 
     def test_public_chart_response_is_normalized_to_daily_history(self):
         timestamps = [1_700_000_000 + day * 86_400 for day in range(60)]

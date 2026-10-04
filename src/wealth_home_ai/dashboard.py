@@ -9,6 +9,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from math import isfinite
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -351,7 +352,7 @@ if isinstance(st.session_state.llm_provider_settings, dict):
     st.session_state.llm_provider_settings.pop("OpenRouter", None)
 if st.session_state.get("llm_provider") not in LLM_PROVIDER_BASE_URLS:
     st.session_state.llm_provider = "Gemini"
-st.session_state.setdefault("planning_budget_inr", None)
+st.session_state.setdefault("planning_budget_inr", 100_000.0)
 st.session_state.setdefault("analysis_live_prices", {})
 st.session_state.setdefault("analysis_live_prices_updated_at", None)
 st.session_state.setdefault("market_ai_candidates", [])
@@ -363,6 +364,12 @@ st.session_state.setdefault("approved_trades", [])
 st.session_state.setdefault("approved_trades_by_scope", {})
 st.session_state.setdefault("audit_trail", [])
 st.session_state.setdefault("audit_trails_by_scope", {})
+st.session_state.setdefault("enabled_jev_rules", [1, 2, 3, 4, 5, 6])
+st.session_state.setdefault("jev_rule_selection_before_analysis", [1, 2, 3, 4, 5, 6])
+st.session_state.setdefault("jev_rule_selection_after_analysis", [1, 2, 3, 4, 5, 6])
+st.session_state.setdefault("max_allocation_pct", 30.0)
+st.session_state.setdefault("realized_daily_loss_pct", 0.0)
+st.session_state.setdefault("buy_lock_until", None)
 st.session_state.setdefault("login_error", None)
 st.session_state.setdefault("pending_broker_name", None)
 st.session_state.setdefault("pending_broker_adapter", None)
@@ -1913,6 +1920,7 @@ def _show_login() -> None:
         if tabs[APP_TAB_LABELS[0]].open:
             with tabs[APP_TAB_LABELS[0]]:
                 _render_broker_connection()
+                _render_portfolio_ai_review()
         for asset in APP_TAB_LABELS[1:]:
             if tabs[asset].open:
                 with tabs[asset]:
@@ -2406,32 +2414,39 @@ def _run_analysis(scope: str = "all") -> None:
             .tolist()
         )
         quote_tickers = sorted(set(portfolio_tickers + candidate_tickers))
-        try:
-            live_prices = st.session_state.broker_state.fetch_live_prices(
-                st.session_state.token, quote_tickers
-            )
-        except (
-            BrokerAPIError,
-            requests.RequestException,
-            RuntimeError,
-            ValueError,
-        ) as error:
-            log_failure(
-                "Analysis live-price refresh",
-                error,
-                broker=st.session_state.broker_name,
-            )
+        if st.session_state.get("broker_state") and st.session_state.get("token"):
+            try:
+                live_prices = st.session_state.broker_state.fetch_live_prices(
+                    st.session_state.token, quote_tickers
+                )
+            except (
+                BrokerAPIError,
+                requests.RequestException,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                log_failure(
+                    "Analysis live-price refresh",
+                    error,
+                    broker=st.session_state.broker_name,
+                )
+                live_prices = {}
+                price_error = (
+                    "Could not retrieve a fresh broker quote. Analysis will still run, "
+                    "but the app will not submit unpriced recommendations."
+                )
+            else:
+                price_error = (
+                    None
+                    if live_prices
+                    else "The broker returned no current prices; price-based deployments "
+                    "remain disabled."
+                )
+        else:
             live_prices = {}
             price_error = (
-                "Could not retrieve a fresh broker quote. Analysis will still run, "
-                "but the app will not submit unpriced recommendations."
-            )
-        else:
-            price_error = (
-                None
-                if live_prices
-                else "The broker returned no current prices; price-based deployments "
-                "remain disabled."
+                "No broker is connected, so live quotes and price-based deployments "
+                "are unavailable. Portfolio analysis can still run on the supplied data."
             )
         st.session_state.analysis_price_errors[scope] = price_error
         if scope == "all":
@@ -2565,6 +2580,11 @@ def _run_analysis(scope: str = "all") -> None:
         for ticker in scoped_portfolio["Ticker"].astype(str).str.upper()
         if ticker in SECTOR_BY_TICKER
     } if not scoped_portfolio.empty else set()
+    selected_rule_numbers = sorted(
+        int(rule_number)
+        for rule_number in st.session_state.get("enabled_jev_rules", [1, 2, 3, 4, 5, 6])
+        if int(rule_number) in range(1, 7)
+    )
     engine = JevRuleEngine(
         {
             "cash_balance": min(
@@ -2585,6 +2605,7 @@ def _run_analysis(scope: str = "all") -> None:
             "sector_holdings": sorted(sectors_held),
             "portfolio": scoped_portfolio,
             "llm_targets": analysis["cash_deployment_list"],
+            "enabled_rules": selected_rule_numbers,
         }
     )
     trades, audit_trail = engine.run()
@@ -2592,6 +2613,7 @@ def _run_analysis(scope: str = "all") -> None:
     st.session_state.analysis_results[scope] = analysis
     st.session_state.approved_trades_by_scope[scope] = trades
     st.session_state.audit_trails_by_scope[scope] = audit_trail
+    st.session_state.jev_rule_selection_after_analysis = selected_rule_numbers
     st.session_state.analysis_errors.pop(scope, None)
     if scope == "all":
         st.session_state.analysis_result = analysis
@@ -2618,6 +2640,18 @@ def _active_equity_position_count(*frames: pd.DataFrame) -> int:
     )
     active = combined.loc[combined["Qty"].ne(0), "Ticker"]
     return int(active.astype(str).str.upper().nunique())
+
+
+def _portfolio_for_scope(
+    scope: str, portfolio: pd.DataFrame, equity_holdings: pd.DataFrame
+) -> pd.DataFrame:
+    if scope == "equity":
+        return equity_holdings
+    if scope == "trading":
+        return portfolio
+    if scope == "all":
+        return pd.concat([equity_holdings, portfolio], ignore_index=True)
+    return pd.DataFrame(columns=PORTFOLIO_COLUMNS)
 
 
 def _buy_execution_block_reason(
@@ -3116,10 +3150,9 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
         if st.session_state.broker_data_errors.get("equity"):
             st.warning(st.session_state.broker_data_errors["equity"])
         render_equity(st.session_state.equity_holdings)
-        if broker_connected:
-            render_analysis_panel(
-                "equity", "equity", _run_analysis, _show_approved_trades
-            )
+        render_analysis_panel(
+            "equity", "equity", _run_analysis, _show_approved_trades
+        )
         equity_symbols = _workspace_symbols(st.session_state.equity_holdings)
         with st.expander("Market scanner", icon=":material/filter_list:"):
             render_market_scanner(
@@ -3133,11 +3166,10 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
         if st.session_state.broker_data_errors.get("trading"):
             st.warning(st.session_state.broker_data_errors["trading"])
         render_trading(st.session_state.portfolio)
-        if broker_connected:
-            st.subheader("Trades analysis")
-            render_analysis_panel(
-                "trading", "trading", _run_analysis, _show_approved_trades
-            )
+        st.subheader("Trades analysis")
+        render_analysis_panel(
+            "trading", "trading", _run_analysis, _show_approved_trades
+        )
         symbols = _workspace_symbols(st.session_state.portfolio)
         with st.expander("Market scanner", icon=":material/filter_list:"):
             render_market_scanner(
@@ -3149,15 +3181,14 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
 
     if asset == "F&O":
         render_derivatives("Options and futures")
-        if broker_connected:
-            st.subheader("Options analysis")
-            render_analysis_panel(
-                "options", "options", _run_analysis, _show_approved_trades
-            )
-            st.subheader("Futures analysis")
-            render_analysis_panel(
-                "futures", "futures", _run_analysis, _show_approved_trades
-            )
+        st.subheader("Options analysis")
+        render_analysis_panel(
+            "options", "options", _run_analysis, _show_approved_trades
+        )
+        st.subheader("Futures analysis")
+        render_analysis_panel(
+            "futures", "futures", _run_analysis, _show_approved_trades
+        )
         with st.expander("Market research", icon=":material/query_stats:"):
             st.info(
                 "F&O research needs verified option-chain and futures-contract "
@@ -3221,14 +3252,13 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
             st.session_state.broker_data_errors.get("mutual_funds")
             or st.session_state.mutual_fund_error,
         )
-        if broker_connected:
-            st.subheader("Mutual-fund analysis")
-            render_analysis_panel(
-                "mutual_funds",
-                "mutual funds",
-                _run_analysis,
-                _show_approved_trades,
-            )
+        st.subheader("Mutual-fund analysis")
+        render_analysis_panel(
+            "mutual_funds",
+            "mutual funds",
+            _run_analysis,
+            _show_approved_trades,
+        )
         with st.expander("Market research", icon=":material/query_stats:"):
             render_local_asset_research_view(
                 "Mutual Funds", st.session_state.mutual_funds, mode="research"
@@ -3239,6 +3269,48 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
             )
         return
 
+def _reevaluate_analysis_rules(
+    scope: str, analysis: dict[str, Any], enabled_rules: list[int]
+) -> None:
+    portfolio = st.session_state.portfolio
+    equity_holdings = st.session_state.equity_holdings
+    scoped_portfolio = _portfolio_for_scope(scope, portfolio, equity_holdings)
+    active_positions_count = _active_equity_position_count(portfolio, equity_holdings)
+    sectors_held = {
+        SECTOR_BY_TICKER[ticker]
+        for ticker in scoped_portfolio.get("Ticker", pd.Series(dtype=str))
+        .astype(str)
+        .str.upper()
+        if ticker in SECTOR_BY_TICKER
+    }
+    budget = float(st.session_state.get("planning_budget_inr") or 0.0)
+    live_prices = st.session_state.get("analysis_live_prices", {})
+    engine = JevRuleEngine(
+        {
+            "cash_balance": min(budget, max(float(st.session_state.get("balance", 0.0)), 0.0)),
+            "actual_broker_balance": float(st.session_state.get("balance", 0.0)),
+            "active_positions_count": active_positions_count,
+            "realized_daily_loss_pct": float(st.session_state.realized_daily_loss_pct),
+            "max_allocation_pct": float(st.session_state.max_allocation_pct),
+            "buy_lock_until": st.session_state.buy_lock_until,
+            "live_prices": live_prices,
+            "sector_holdings": sorted(sectors_held),
+            "portfolio": scoped_portfolio,
+            "llm_targets": analysis.get("cash_deployment_list", []),
+            "enabled_rules": enabled_rules,
+        }
+    )
+    approved, audit = engine.run()
+    st.session_state.approved_trades_by_scope[scope] = approved
+    st.session_state.audit_trails_by_scope[scope] = audit
+    if scope == "all":
+        st.session_state.approved_trades = approved
+        st.session_state.audit_trail = audit
+
+
+st.session_state.reevaluate_analysis_rules = _reevaluate_analysis_rules
+
+
 def _render_portfolio_ai_review() -> None:
     with st.expander(
         "Portfolio planning & safeguards",
@@ -3248,6 +3320,12 @@ def _render_portfolio_ai_review() -> None:
             "Review equity, trading, and mutual-fund records together. "
             "Recommendations are advisory and orders are never submitted automatically."
         )
+        if not st.session_state.get("token"):
+            st.info(
+                "This planning panel works without a connected broker. Add portfolio "
+                "holdings in the relevant workspace for personalized analysis; live "
+                "prices, broker cash, and order execution require a broker connection."
+            )
         _render_risk_controls()
         analysis_mode_descriptions = {
             "Portfolio and cash review": (
