@@ -76,7 +76,7 @@ class PortfolioFeatureTests(unittest.TestCase):
 
     def test_broker_sign_in_links_navigate_in_the_same_tab(self):
         markup = same_tab_link_html(
-            "Connect with Upstox",
+            "Connect with Zerodha",
             "https://broker.example/authorize?client_id=app&state=one",
         )
         self.assertIn('target="_self"', markup)

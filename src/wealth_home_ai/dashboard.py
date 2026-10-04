@@ -387,6 +387,24 @@ def _render_same_tab_link(label: str, url: str) -> None:
     st.html(same_tab_link_html(label, url))
 
 
+def _render_oauth_tab_link(label: str, url: str) -> None:
+    """Render broker OAuth as a new top-level browsing context."""
+    safe_url = html.escape(url, quote=True)
+    safe_label = html.escape(label)
+    st.html(
+        '<a href="'
+        + safe_url
+        + '" target="_blank" rel="noopener noreferrer" '
+        'style="display:inline-flex;align-items:center;justify-content:center;'
+        'gap:.55rem;padding:.72rem 1.25rem;border:1px solid #16a34a;'
+        'border-radius:.75rem;background:linear-gradient(135deg,#22c55e 0%,'
+        '#15803d 100%);box-shadow:0 5px 14px rgba(22,163,74,.28);color:#fff;'
+        'font-weight:600;text-decoration:none">'
+        f"<span>{safe_label}</span>"
+        '<span aria-hidden="true" style="font-size:1.1rem">&#8599;</span></a>'
+    )
+
+
 def _render_app_header(connected_broker: str | None = None) -> None:
     with st.container(border=True, gap="medium"):
         with st.container(
@@ -1618,7 +1636,14 @@ def _render_broker_connection() -> None:
             if login_error:
                 st.error(login_error)
             if api_key and api_secret and login_url:
-                _render_same_tab_link(button_label, login_url)
+                if broker_choice == "Upstox":
+                    _render_oauth_tab_link(button_label, login_url)
+                    st.caption(
+                        "Upstox opens in a new tab. Complete authorization there; "
+                        "it will return to this app’s registered callback URL."
+                    )
+                else:
+                    _render_same_tab_link(button_label, login_url)
             else:
                 st.button(
                     button_label,
