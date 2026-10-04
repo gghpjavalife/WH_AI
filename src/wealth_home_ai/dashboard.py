@@ -388,8 +388,21 @@ def _render_same_tab_link(label: str, url: str) -> None:
 
 
 def _render_oauth_tab_link(label: str, url: str) -> None:
-    """Render an explicit broker link for top-level same-tab navigation."""
-    st.html(same_tab_link_html(label, url))
+    """Render an explicit broker authorization link in a separate tab."""
+    safe_url = html.escape(url, quote=True)
+    safe_label = html.escape(label)
+    st.html(
+        '<a href="'
+        + safe_url
+        + '" target="_blank" rel="noopener noreferrer" '
+        'style="display:inline-flex;align-items:center;justify-content:center;'
+        'gap:.55rem;padding:.72rem 1.25rem;border:1px solid #16a34a;'
+        'border-radius:.75rem;background:linear-gradient(135deg,#22c55e 0%,'
+        '#15803d 100%);box-shadow:0 5px 14px rgba(22,163,74,.28);color:#fff;'
+        'font-weight:600;text-decoration:none">'
+        f"<span>{safe_label}</span>"
+        '<span aria-hidden="true" style="font-size:1.1rem">&#8599;</span></a>'
+    )
 
 
 def _render_app_header(connected_broker: str | None = None) -> None:
@@ -1628,9 +1641,9 @@ def _render_broker_connection() -> None:
                     with st.container(border=True):
                         st.markdown("**Upstox sign-in is ready**")
                         st.write(
-                            "Click the green button to continue to Upstox in this tab. "
-                            "After approval, Upstox returns to this same tab and the "
-                            "app completes the connection."
+                            "Click the green button to open Upstox in a new tab. "
+                            "Complete approval there; the original app tab stays open "
+                            "and finishes the connection when Upstox redirects back."
                         )
                         st.caption(
                             "If no tab appears, allow pop-ups for this site and click "
