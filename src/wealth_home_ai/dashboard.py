@@ -388,8 +388,8 @@ def _render_same_tab_link(label: str, url: str) -> None:
 
 
 def _render_oauth_tab_link(label: str, url: str) -> None:
-    """Navigate the current top-level tab to broker OAuth."""
-    _render_same_tab_link(label, url)
+    """Render an explicit broker link for top-level same-tab navigation."""
+    st.html(same_tab_link_html(label, url))
 
 
 def _render_app_header(connected_broker: str | None = None) -> None:
