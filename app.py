@@ -15,3 +15,4 @@ if APPLICATION_MODULE in sys.modules:
     importlib.reload(sys.modules[APPLICATION_MODULE])
 else:
     importlib.import_module(APPLICATION_MODULE)
+
