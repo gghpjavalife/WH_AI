@@ -8,3 +8,4 @@ python-dotenv>=1.0.0
 logzero>=1.7.0
 requests>=2.31.0
 upstox-python-sdk>=2.30.0
+
