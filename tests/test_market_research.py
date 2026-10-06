@@ -8,12 +8,12 @@ import pandas as pd
 import requests
 from streamlit.testing.v1 import AppTest
 
-from wealth_home_ai.features.market import (
+from features.equities.scanner import (
     RECOMMENDED_FILTERS,
     _ai_recommendation_candidates,
     _scan_stocks,
 )
-from wealth_home_ai.market_research import (
+from features.equities.market_data import (
     MarketDataError,
     assess_stock,
     calculate_indicators,
@@ -24,8 +24,8 @@ from wealth_home_ai.market_research import (
     matches_scanner_filters,
     normalize_symbol,
 )
-from wealth_home_ai.features.workspace_research import _fund_frame
-from wealth_home_ai.ui_helpers import brand_lockup_html
+from features.mutual_funds.research import _fund_frame
+from ui.helpers import brand_lockup_html
 
 
 def _equity_master(*symbols: str) -> pd.DataFrame:
@@ -104,7 +104,7 @@ class MarketResearchTests(unittest.TestCase):
         response.status_code = 200
         response.raise_for_status.return_value = None
         with patch(
-            "wealth_home_ai.market_research.requests.get",
+            "features.equities.market_data.requests.get",
             return_value=response,
         ) as get:
             fetch_nse_equity_master.clear()
@@ -119,7 +119,7 @@ class MarketResearchTests(unittest.TestCase):
 
     def test_nse_equity_master_surfaces_feed_failures(self):
         with patch(
-            "wealth_home_ai.market_research.requests.get",
+            "features.equities.market_data.requests.get",
             side_effect=requests.RequestException("unavailable"),
         ):
             fetch_nse_equity_master.clear()
@@ -166,7 +166,7 @@ class MarketResearchTests(unittest.TestCase):
         response.status_code = 200
         response.raise_for_status.return_value = None
         with patch(
-            "wealth_home_ai.market_research.requests.get",
+            "features.equities.market_data.requests.get",
             return_value=response,
         ) as get:
             fetch_bse_equity_master.clear()
@@ -216,11 +216,11 @@ class MarketResearchTests(unittest.TestCase):
         )
         with (
             patch(
-                "wealth_home_ai.market_research.fetch_bse_equity_master",
+                "features.equities.market_data.fetch_bse_equity_master",
                 return_value=bse,
             ),
             patch(
-                "wealth_home_ai.market_research.fetch_nse_equity_master",
+                "features.equities.market_data.fetch_nse_equity_master",
                 return_value=nse,
             ),
         ):
@@ -551,7 +551,7 @@ class MarketResearchTests(unittest.TestCase):
             }
         )
         with patch(
-            "wealth_home_ai.features.market.fetch_daily_history",
+            "features.equities.scanner.fetch_daily_history",
             return_value=history,
         ):
             rows, failures = _scan_stocks(
@@ -629,7 +629,7 @@ class MarketResearchTests(unittest.TestCase):
             ]
         )
         with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
+            "features.equities.scanner.fetch_indian_equity_master",
             return_value=master,
         ):
             app.run()
@@ -740,7 +740,7 @@ class MarketResearchTests(unittest.TestCase):
         )
         app.session_state["app_navigation"] = "Equities"
         with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
+            "features.equities.scanner.fetch_indian_equity_master",
             return_value=_equity_master("RELIANCE"),
         ):
             app.run()
@@ -759,7 +759,7 @@ class MarketResearchTests(unittest.TestCase):
         )
 
     def test_portfolio_scan_universe_uses_equity_holding_tickers(self):
-        from wealth_home_ai.features import market
+        from features.equities import scanner as market
 
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
@@ -775,7 +775,7 @@ class MarketResearchTests(unittest.TestCase):
         )
         app.session_state["market_trading_scan_universe"] = "Portfolio holdings"
         with patch(
-            "wealth_home_ai.features.market.fetch_indian_equity_master",
+            "features.equities.scanner.fetch_indian_equity_master",
             return_value=_equity_master("ALPHA", "BETA", "GAMMA"),
         ), patch.object(market, "_scan_stocks", return_value=([], [])):
             app.run(timeout=10)
@@ -798,8 +798,8 @@ class MarketResearchTests(unittest.TestCase):
     def test_scan_table_embeds_rows_with_color_coded_indicators(self):
         import json
 
-        from wealth_home_ai.features.market import _scan_table_payload
-        from wealth_home_ai.features.scan_table import render_scan_table
+        from features.equities.scanner import _scan_table_payload
+        from features.equities.scan_table import render_scan_table
 
         row = {
             "Ticker": "ABC.BO",

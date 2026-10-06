@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from unittest import TestCase
 from zoneinfo import ZoneInfo
 
-from wealth_home_ai.jev_rules import JevRuleEngine, buy_execution_block_reason
+from features.trades.rules import JevRuleEngine, buy_execution_block_reason
 
 
 class JevRuleEngineTests(TestCase):
@@ -172,4 +172,3 @@ class JevRuleEngineTests(TestCase):
         self.assertTrue(any("Rule 1 (Portfolio circuit breaker): skipped" in line for line in audit))
         self.assertTrue(any("Rule 2 (Trading window): skipped" in line for line in audit))
         self.assertTrue(any("Rule 3 (Position limit): skipped" in line for line in audit))
-

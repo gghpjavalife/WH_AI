@@ -3,14 +3,15 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
-from wealth_home_ai import broker_factory, cloud_services
-from wealth_home_ai.app_help import answer_app_help_question
-from wealth_home_ai.broker_factory import (
+import brokers.factory as broker_factory
+import services.cloud as cloud_services
+from application.help import answer_app_help_question
+from brokers.factory import (
     BrokerCapabilityError,
     GenericDynamicAdapter,
 )
-from wealth_home_ai.settings import settings
-from wealth_home_ai.upstox_helper import (
+from core.config import settings
+from services.ai import (
     ask_llm_agent,
     send_whatsapp_update,
     whatsapp_update_is_configured,
@@ -49,7 +50,7 @@ class CloudServiceTests(unittest.TestCase):
                 },
                 clear=True,
             ),
-            patch("wealth_home_ai.cloud_services.requests.post", return_value=response) as post,
+            patch("services.cloud.requests.post", return_value=response) as post,
         ):
             rows = cloud_services.execute_turso_query(
                 "SELECT name, balance FROM users WHERE id = ?",
@@ -81,7 +82,7 @@ class CloudServiceTests(unittest.TestCase):
                 },
                 clear=True,
             ),
-            patch("wealth_home_ai.cloud_services.requests.post") as post,
+            patch("services.cloud.requests.post") as post,
         ):
             with self.assertRaisesRegex(ValueError, "HTTPS"):
                 cloud_services.execute_turso_query("SELECT 1")
@@ -92,7 +93,7 @@ class CloudServiceTests(unittest.TestCase):
         response = Mock()
         response.json.return_value = {"id": "email-123"}
         with patch(
-            "wealth_home_ai.cloud_services.requests.post", return_value=response
+            "services.cloud.requests.post", return_value=response
         ) as post:
             message_id = cloud_services.send_resend_email(
                 "Portfolio",
@@ -119,7 +120,7 @@ class CloudServiceTests(unittest.TestCase):
         }
         with (
             patch.dict(os.environ, configuration, clear=True),
-            patch("wealth_home_ai.notifications.requests.post") as post,
+            patch("services.notifications.requests.post") as post,
         ):
             self.assertTrue(whatsapp_update_is_configured())
             send_whatsapp_update("Portfolio update")
@@ -131,6 +132,28 @@ class CloudServiceTests(unittest.TestCase):
         self.assertEqual(
             post.call_args.kwargs["auth"],
             ("AC-test", "twilio-test-token"),
+        )
+
+    def test_explicit_profile_phone_overrides_server_default_recipient(self):
+        configuration = {
+            "TWILIO_ACCOUNT_SID": "AC-test",
+            "TWILIO_AUTH_TOKEN": "twilio-test-token",
+            "TWILIO_WHATSAPP_SENDER": "whatsapp:+14155238886",
+            "TWILIO_WHATSAPP_RECIPIENT": "whatsapp:+15550000000",
+        }
+        with (
+            patch.dict(os.environ, configuration, clear=True),
+            patch("services.notifications.requests.post") as post,
+        ):
+            self.assertFalse(whatsapp_update_is_configured({"recipient": ""}))
+            send_whatsapp_update(
+                "Profile destination test",
+                {"recipient": "whatsapp:+15551234567"},
+            )
+
+        self.assertEqual(
+            post.call_args.kwargs["data"]["To"],
+            "whatsapp:+15551234567",
         )
 
     def test_dynamic_adapter_requires_allowlisted_host_and_is_read_only(self):
@@ -190,7 +213,7 @@ class CloudServiceTests(unittest.TestCase):
                     dynamic_broker_allowed_hosts=("api.broker.example",),
                 ),
             ),
-            patch("wealth_home_ai.cloud_services.execute_turso_query", mock_query),
+            patch("services.cloud.execute_turso_query", mock_query),
         ):
             cloud_services.register_dynamic_broker(
                 "person@example.com", "Example broker", configuration
@@ -231,7 +254,7 @@ class CloudServiceTests(unittest.TestCase):
             ]
         }
         with patch(
-            "wealth_home_ai.upstox_helper.requests.post", return_value=response
+            "services.ai.requests.post", return_value=response
         ) as post:
             result = ask_llm_agent(
                 "provider-key",

@@ -1,7 +1,9 @@
 import unittest
 import hashlib
 import secrets
+from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Barrier
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -9,26 +11,32 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from wealth_home_ai.features.operations.mutual_funds import validate_mutual_funds
-from wealth_home_ai.features.operations.performance import style_returns
-from wealth_home_ai.features.home import ALLOCATION_COLORS, build_allocation_chart
-from wealth_home_ai.diagnostics import diagnostic_summary, log_failure
-from wealth_home_ai.features.portfolio import (
+from features.mutual_funds.workspace import validate_mutual_funds
+from features.shared.performance import style_returns
+from features.home.workspace import ALLOCATION_COLORS, build_allocation_chart
+from core.logging import diagnostic_summary, log_failure
+from features.portfolio.metrics import (
     calculate_allocation,
 )
-from wealth_home_ai.settings import Settings, settings
-from wealth_home_ai.oauth_state_store import (
+from core.config import Settings, settings
+import security.oauth as oauth_service
+from security.oauth import (
     consume_oauth_state,
     consume_oauth_state_context,
     create_oauth_state,
 )
-from wealth_home_ai.notifications import send_email_alert, send_whatsapp_alert
-from wealth_home_ai.upstox_helper import ask_llm_agent
-from wealth_home_ai.ui_helpers import (
+from services.notifications import send_email_alert, send_whatsapp_alert
+import services.database as secure_database
+import services.user_settings as user_settings_service
+from services.ai import (
+    ask_llm_agent,
+    test_ai_provider_configuration as verify_ai_provider_configuration,
+)
+from ui.helpers import (
     broker_connect_button_css,
     same_tab_link_html,
 )
-from wealth_home_ai.broker_factory import (
+from brokers.factory import (
     BrokerFactory,
     DhanAdapter,
     UpstoxAdapter,
@@ -36,7 +44,63 @@ from wealth_home_ai.broker_factory import (
 )
 
 
+_database_settings_patcher = None
+_database_settings_directory = None
+_database_module_patchers = []
+
+
+def setUpModule():
+    global _database_settings_patcher, _database_settings_directory
+    _database_settings_directory = TemporaryDirectory()
+    test_settings = replace(
+        settings,
+        oauth_database_path=str(
+            Path(_database_settings_directory.name) / "app-settings.sqlite3"
+        ),
+        database_encryption_key=secrets.token_hex(32),
+    )
+    _database_settings_patcher = patch.object(
+        secure_database,
+        "settings",
+        test_settings,
+    )
+    _database_settings_patcher.start()
+    for module in (user_settings_service, oauth_service):
+        module_patcher = patch.object(module, "settings", test_settings)
+        module_patcher.start()
+        _database_module_patchers.append(module_patcher)
+
+
+def tearDownModule():
+    if _database_settings_patcher is not None:
+        _database_settings_patcher.stop()
+    for module_patcher in _database_module_patchers:
+        module_patcher.stop()
+    if _database_settings_directory is not None:
+        _database_settings_directory.cleanup()
+
+
 class PortfolioFeatureTests(unittest.TestCase):
+    def _register_broker(
+        self,
+        app,
+        broker: str,
+        *,
+        credentials: dict[str, str] | None = None,
+        consent: bool = False,
+    ) -> str:
+        app.selectbox(key="selected_broker").select(broker).run(timeout=20)
+        app.button(key="open_user_settings").click().run(timeout=20)
+        for field, value in (credentials or {}).items():
+            app.text_input(key=f"user_settings_{broker}_{field}").set_value(
+                value
+            ).run(timeout=20)
+        app.checkbox(key="settings_sensitive_consent").set_value(consent).run(
+            timeout=20
+        )
+        app.button(key="save_user_settings").click().run(timeout=20)
+        return broker
+
     def test_diagnostics_report_safe_http_status_and_request_id(self):
         api_error = RuntimeError("upstream response includes private content")
         api_error.status = 403
@@ -98,7 +162,7 @@ class PortfolioFeatureTests(unittest.TestCase):
             "linear-gradient(135deg,#22c55e 0%,#15803d 100%)", button_css
         )
 
-    def test_broker_login_forms_reject_missing_required_credentials(self):
+    def test_broker_login_forms_show_missing_credentials_for_all_builtins(self):
         cases = (
             (
                 "Upstox",
@@ -123,87 +187,341 @@ class PortfolioFeatureTests(unittest.TestCase):
         )
         for broker, button_label, element_type in cases:
             with self.subTest(broker=broker):
-                app = AppTest.from_file(
-                    str(Path(__file__).resolve().parents[1] / "app.py")
-                ).run()
-                next(
-                    widget
-                    for widget in app.selectbox
-                    if widget.label == "Select broker"
-                ).select(broker).run()
-                callback_field = next(
-                    widget
-                    for widget in app.text_input
-                    if widget.label == "Callback URL"
-                )
-                self.assertEqual(callback_field.label, "Callback URL")
-                self.assertTrue(callback_field.disabled)
-                if element_type == "button":
-                    button = next(
-                        button
-                        for button in app.button
-                        if button.label == button_label
-                    )
-                    self.assertTrue(button.disabled)
-                self.assertFalse(app.exception)
-                self.assertIsNone(app.session_state.get("pending_broker_name"))
-                self.assertFalse(
-                    any(widget.label == "OpenRouter API key" for widget in app.text_input)
-                )
-                self.assertGreaterEqual(len(app.get("popover")), 4)
+                with TemporaryDirectory() as directory:
+                    database_path = Path(directory) / "settings.sqlite3"
+                    with patch(
+                        "services.user_settings.settings",
+                        replace(settings, oauth_database_path=str(database_path)),
+                    ):
+                        app = AppTest.from_file(
+                            str(Path(__file__).resolve().parents[1] / "app.py")
+                        ).run(timeout=20)
+                        app.selectbox(key="selected_broker").select("Upstox").run(
+                            timeout=20
+                        )
+                        self.assertTrue(
+                            any(
+                                widget.label == "Select a broker"
+                                for widget in app.selectbox
+                            )
+                        )
+                        self.assertTrue(
+                            any("credentials are not configured" in item.value for item in app.warning)
+                        )
+                        self._register_broker(app, broker)
+                        if broker == "Angel One":
+                            self.assertFalse(
+                                any(
+                                    widget.label == "Callback URL"
+                                    for widget in app.text_input
+                                )
+                            )
+                        self.assertTrue(
+                            any(
+                                widget.label == "Select a broker"
+                                for widget in app.selectbox
+                            )
+                        )
+                        if element_type == "button":
+                            button = next(
+                                button
+                                for button in app.button
+                                if button.label == button_label
+                            )
+                            self.assertTrue(button.disabled)
+                        self.assertFalse(app.exception)
+                        self.assertIsNone(
+                            app.session_state.get("pending_broker_name")
+                        )
+                        self.assertFalse(
+                            any(
+                                widget.label == "OpenRouter API key"
+                                for widget in app.text_input
+                            )
+                        )
+                        self.assertGreaterEqual(len(app.get("popover")), 4)
+                        self.assertTrue(
+                            any(
+                                widget.label == "Select a broker"
+                                for widget in app.selectbox
+                            )
+                        )
 
     def test_connect_controls_update_when_credentials_are_entered(self):
-        angel_app = AppTest.from_file(
-            str(Path(__file__).resolve().parents[1] / "app.py")
-        ).run()
-        next(
-            widget
-            for widget in angel_app.selectbox
-            if widget.label == "Select broker"
-        ).select("Angel One").run()
-        for key, value in (
-            ("angel_api_key", "api-key"),
-            ("angel_client_id", "client-id"),
-            ("angel_password", "password"),
-            ("angel_totp_secret", "totp-secret"),
-        ):
-            angel_app.text_input(key=key).set_value(value).run()
-        angel_button = next(
-            button
-            for button in angel_app.button
-            if button.label == "Connect with Angel One →"
-        )
-        self.assertFalse(angel_button.disabled)
-        self.assertFalse(angel_app.exception)
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "user-settings.sqlite3"
+            with patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
+            ):
+                for broker, credentials, button_label in (
+                    (
+                        "Angel One",
+                        {
+                            "user_settings_Angel One_api_key": "api-key",
+                            "user_settings_Angel One_client_id": "client-id",
+                            "user_settings_Angel One_password": "password",
+                            "user_settings_Angel One_totp_secret": "totp-secret",
+                        },
+                        "Connect with Angel One →",
+                    ),
+                    (
+                        "Dhan",
+                        {
+                            "user_settings_Dhan_client_id": "client-id",
+                            "user_settings_Dhan_api_key": "api-key",
+                            "user_settings_Dhan_api_secret": "api-secret",
+                        },
+                        "Connect with Dhan →",
+                    ),
+                ):
+                    with self.subTest(broker=broker):
+                        app = AppTest.from_file(
+                            str(Path(__file__).resolve().parents[1] / "app.py")
+                        ).run(timeout=20)
+                        self._register_broker(
+                            app,
+                            broker,
+                            credentials={
+                                key.removeprefix(f"user_settings_{broker}_"): value
+                                for key, value in credentials.items()
+                            },
+                            consent=True,
+                        )
+                        broker_input_prefix = {
+                            "Angel One": "angel_",
+                            "Dhan": "dhan_",
+                        }[broker]
+                        self.assertFalse(
+                            any(
+                                widget.key
+                                and widget.key.startswith(broker_input_prefix)
+                                for widget in app.text_input
+                            )
+                        )
+                        self.assertTrue(
+                            any(
+                                "saved securely and encrypted" in item.value.lower()
+                                for item in app.success
+                            )
+                        )
+                        self.assertFalse(
+                            any(
+                                "credentials saved" in item.value.lower()
+                                for item in app.markdown
+                            )
+                        )
+                        button = next(
+                            button
+                            for button in app.button
+                            if button.label == button_label
+                        )
+                        self.assertFalse(button.disabled)
+                        self.assertFalse(app.exception)
 
-        dhan_app = AppTest.from_file(
-            str(Path(__file__).resolve().parents[1] / "app.py")
-        ).run()
-        next(
-            widget
-            for widget in dhan_app.selectbox
-            if widget.label == "Select broker"
-        ).select("Dhan").run()
-        for key, value in (
-            ("dhan_client_id", "client-id"),
-            ("dhan_api_key", "api-key"),
-            ("dhan_api_secret", "api-secret"),
-        ):
-            dhan_app.text_input(key=key).set_value(value).run()
-        dhan_button = next(
-            button
-            for button in dhan_app.button
-            if button.label == "Connect with Dhan →"
-        )
-        self.assertFalse(dhan_button.disabled)
-        self.assertFalse(dhan_app.exception)
+    def test_missing_broker_credentials_can_be_reviewed_and_saved_from_connection_screen(self):
+        from services.user_settings import load_user_settings
+
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "user-settings.sqlite3"
+            with patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
+            ):
+                app = AppTest.from_file(
+                    str(Path(__file__).resolve().parents[1] / "app.py")
+                ).run(timeout=20)
+                app.selectbox(key="selected_broker").select("Upstox").run(
+                    timeout=20
+                )
+                self.assertTrue(
+                    any("credentials are not configured" in item.value for item in app.warning)
+                )
+                self.assertTrue(
+                    any(widget.key == "upstox_api_key" for widget in app.text_input)
+                )
+                self.assertTrue(
+                    any(widget.key == "upstox_api_secret" for widget in app.text_input)
+                )
+                review_button = next(
+                    button
+                    for button in app.button
+                    if button.key == "save_upstox_credentials"
+                )
+                self.assertTrue(review_button.disabled)
+                app.text_input(key="upstox_api_key").set_value("app-key").run(
+                    timeout=20
+                )
+                self.assertFalse(
+                    next(
+                        button
+                        for button in app.button
+                        if button.key == "save_upstox_credentials"
+                    ).disabled
+                )
+                app.text_input(key="upstox_api_secret").set_value(
+                    "app-secret"
+                ).run(timeout=20)
+                app.button(key="save_upstox_credentials").click().run(timeout=20)
+                self.assertEqual(
+                    app.session_state.user_settings_Upstox_api_key,
+                    "app-key",
+                )
+                self.assertEqual(
+                    app.session_state.user_settings_Upstox_api_secret,
+                    "app-secret",
+                )
+                app.checkbox(key="settings_sensitive_consent").set_value(
+                    True
+                ).run(timeout=20)
+                app.button(key="save_user_settings").click().run(timeout=20)
+                saved = load_user_settings("local-user")
+                self.assertEqual(
+                    saved["sensitive"]["broker_profiles"]["builtin-upstox"],
+                    {"api_key": "app-key", "api_secret": "app-secret"},
+                )
+                self.assertTrue(saved["sensitive_consent"])
+
+    def test_broker_settings_offer_all_builtin_brokers_without_enable_toggles(self):
+        from services.user_settings import load_user_settings
+
+        app_source = """
+import streamlit as st
+from ui.user_settings import apply_settings_to_session, render_user_settings
+if "registry_initialized" not in st.session_state:
+    apply_settings_to_session({
+        "preferences": {},
+        "sensitive": {},
+        "sensitive_consent": False,
+    })
+    st.session_state.registry_initialized = True
+render_user_settings("registry-test-user")
+"""
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "settings.sqlite3"
+            with patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
+            ):
+                app = AppTest.from_string(app_source).run(timeout=20)
+                app.button(key="open_user_settings").click().run(timeout=20)
+                self.assertEqual(
+                    [profile["type"] for profile in app.session_state.registered_broker_profiles],
+                    ["Upstox", "Zerodha", "Angel One", "Dhan"],
+                )
+                self.assertTrue(
+                    all(
+                        profile["active"]
+                        for profile in app.session_state.registered_broker_profiles
+                    )
+                )
+                self.assertFalse(
+                    any(widget.label == "Broker name" for widget in app.text_input)
+                )
+                self.assertFalse(
+                    any(widget.key == "start_broker_registration" for widget in app.button)
+                )
+                self.assertFalse(
+                    any("Custom read-only" in option for widget in app.selectbox for option in widget.options)
+                )
+                self.assertFalse(
+                    any("Enable " in widget.label for widget in app.checkbox)
+                )
+                self.assertFalse(
+                    any(
+                        widget.key == "settings_default_broker_widget"
+                        for widget in app.selectbox
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        not expander.proto.expanded
+                        for expander in app.get("expander")
+                    )
+                )
+                app.text_input(key="settings_profile_name").set_value(
+                    "Updated profile"
+                ).run(timeout=20)
+                app.text_input(key="settings_profile_email").set_value(
+                    "updated@example.com"
+                ).run(timeout=20)
+                app.number_input(key="settings_max_allocation_pct").set_value(
+                    65.0
+                ).run(timeout=20)
+                app.text_input(key="user_settings_Upstox_api_key").set_value(
+                    "updated-api-key"
+                ).run(timeout=20)
+                app.checkbox(key="settings_sensitive_consent").set_value(
+                    True
+                ).run(timeout=20)
+                app.button(key="save_user_settings").click().run(timeout=20)
+                self.assertEqual(
+                    app.session_state.selected_broker,
+                    "Upstox",
+                )
+                self.assertTrue(
+                    any("Settings saved successfully" in item.value for item in app.success)
+                )
+                self.assertTrue(
+                    any(button.key == "dismiss_settings_saved" for button in app.button)
+                )
+                app.button(key="dismiss_settings_saved").click().run(timeout=20)
+                self.assertNotIn("user_settings_feedback", app.session_state)
+                self.assertFalse(app.session_state.user_settings_dialog_open)
+                self.assertFalse(
+                    any(
+                        widget.key == "settings_profile_name"
+                        for widget in app.text_input
+                    )
+                )
+
+                app.button(key="open_user_settings").click().run(timeout=20)
+                self.assertNotIn("settings_default_broker", app.session_state)
+                self.assertEqual(
+                    app.session_state.settings_profile_name,
+                    "Updated profile",
+                )
+                self.assertEqual(
+                    app.session_state.settings_profile_email,
+                    "updated@example.com",
+                )
+                self.assertEqual(
+                    app.session_state.settings_max_allocation_pct,
+                    65.0,
+                )
+                self.assertEqual(
+                    app.session_state.user_settings_Upstox_api_key,
+                    "updated-api-key",
+                )
+                app.text_input(key="settings_profile_email").set_value(
+                    "invalid-email"
+                ).run(timeout=20)
+                app.button(key="save_user_settings").click().run(timeout=20)
+                self.assertTrue(
+                    any("valid email address" in item.value for item in app.error)
+                )
+                app.text_input(key="settings_profile_email").set_value(
+                    "updated@example.com"
+                ).run(timeout=20)
+                app.button(key="save_user_settings").click().run(timeout=20)
+                self.assertEqual(
+                    load_user_settings("registry-test-user")["preferences"][
+                        "broker_profiles"
+                    ][0]["name"],
+                    "Upstox",
+                )
+                self.assertNotIn(
+                    "default_broker",
+                    load_user_settings("registry-test-user")["preferences"],
+                )
+                self.assertFalse(app.exception)
 
     def test_upstox_callback_can_resume_without_original_streamlit_session(self):
         oauth_state = secrets.token_urlsafe(32)
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "oauth.sqlite3"
             with patch(
-                "wealth_home_ai.oauth_state_store._database_path",
+                "security.oauth._database_path",
                 return_value=database_path,
             ):
                 create_oauth_state(
@@ -232,19 +550,19 @@ class PortfolioFeatureTests(unittest.TestCase):
 
                 with (
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.authenticate",
+                        "brokers.factory.UpstoxAdapter.authenticate",
                         return_value="access-token",
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_profile",
+                        "brokers.factory.UpstoxAdapter.fetch_profile",
                         return_value={"name": "Test user", "user_id": "test-user"},
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_balance",
+                        "brokers.factory.UpstoxAdapter.fetch_balance",
                         side_effect=concurrent_result(0),
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_positions",
+                        "brokers.factory.UpstoxAdapter.fetch_positions",
                         side_effect=concurrent_result(
                             pd.DataFrame(
                                 columns=["Ticker", "Qty", "Avg_Price", "LTP"]
@@ -252,7 +570,7 @@ class PortfolioFeatureTests(unittest.TestCase):
                         ),
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_holdings",
+                        "brokers.factory.UpstoxAdapter.fetch_holdings",
                         side_effect=concurrent_result(
                             pd.DataFrame(
                                 columns=["Ticker", "Qty", "Avg_Price", "LTP"]
@@ -260,7 +578,7 @@ class PortfolioFeatureTests(unittest.TestCase):
                         ),
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.UpstoxAdapter.fetch_mutual_fund_holdings",
+                        "brokers.factory.UpstoxAdapter.fetch_mutual_fund_holdings",
                         side_effect=concurrent_result(
                             pd.DataFrame(
                                 columns=[
@@ -339,13 +657,7 @@ class PortfolioFeatureTests(unittest.TestCase):
         )
         self.assertTrue(connected_workspace_loaded)
         self.assertTrue(fno_analysis_actions_present)
-        self.assertTrue(
-            {
-                widget.label for widget in app.number_input
-            }.issuperset(
-                {"Maximum scenario allocation (%)", "Realized daily loss (%)"}
-            )
-        )
+        self.assertTrue(any(button.key == "open_user_settings" for button in app.button))
         self.assertFalse(
             any(button.label == "Finish Upstox sign-in" for button in app.button)
         )
@@ -360,21 +672,27 @@ class PortfolioFeatureTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "oauth.sqlite3"
             with patch(
-                "wealth_home_ai.oauth_state_store._database_path",
+                "security.oauth._database_path",
                 return_value=database_path,
+            ), patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
             ):
                 app = AppTest.from_file(
                     str(Path(__file__).resolve().parents[1] / "app.py")
-                ).run()
-                next(
-                    widget
-                    for widget in app.selectbox
-                    if widget.label == "Select broker"
-                ).select("Upstox").run()
-                app.text_input(key="upstox_api_key").set_value("app-key").run()
+                ).run(timeout=20)
+                self._register_broker(
+                    app,
+                    "Upstox",
+                    credentials={"api_key": "app-key"},
+                    consent=True,
+                )
                 self.assertIsNone(app.session_state["pending_broker_name"])
-
-                app.text_input(key="upstox_api_secret").set_value("app-secret").run()
+                app.button(key="open_user_settings").click().run(timeout=20)
+                app.text_input(
+                    key="user_settings_Upstox_api_secret"
+                ).set_value("app-secret").run(timeout=20)
+                app.button(key="save_user_settings").click().run(timeout=20)
                 self.assertEqual(app.session_state["pending_broker_name"], "Upstox")
                 self.assertTrue(app.session_state["pending_login_url"])
 
@@ -383,7 +701,7 @@ class PortfolioFeatureTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "oauth.sqlite3"
             with patch(
-                "wealth_home_ai.oauth_state_store._database_path",
+                "security.oauth._database_path",
                 return_value=database_path,
             ):
                 create_oauth_state(
@@ -403,31 +721,31 @@ class PortfolioFeatureTests(unittest.TestCase):
                 )
                 with (
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.authenticate",
+                        "brokers.factory.ZerodhaAdapter.authenticate",
                         return_value="kite-access-token",
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_profile",
+                        "brokers.factory.ZerodhaAdapter.fetch_profile",
                         return_value={"name": "Test user", "user_id": "test-user"},
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_balance",
+                        "brokers.factory.ZerodhaAdapter.fetch_balance",
                         return_value=0,
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_positions",
+                        "brokers.factory.ZerodhaAdapter.fetch_positions",
                         return_value=pd.DataFrame(
                             columns=["Ticker", "Qty", "Avg_Price", "LTP"]
                         ),
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_holdings",
+                        "brokers.factory.ZerodhaAdapter.fetch_holdings",
                         return_value=pd.DataFrame(
                             columns=["Ticker", "Qty", "Avg_Price", "LTP"]
                         ),
                     ),
                     patch(
-                        "wealth_home_ai.broker_factory.ZerodhaAdapter.fetch_mutual_fund_holdings",
+                        "brokers.factory.ZerodhaAdapter.fetch_mutual_fund_holdings",
                         return_value=pd.DataFrame(
                             columns=["Fund", "Folio", "Units", "Avg_NAV", "Latest_NAV"]
                         ),
@@ -617,6 +935,9 @@ class PortfolioFeatureTests(unittest.TestCase):
                 "Together AI",
                 "Mistral",
                 "DeepSeek",
+                "OpenRouter",
+                "xAI",
+                "Cerebras",
                 "Custom OpenAI-compatible",
             },
         )
@@ -639,60 +960,342 @@ class PortfolioFeatureTests(unittest.TestCase):
         app = AppTest.from_string(
             """
 import streamlit as st
-from wealth_home_ai.features.analysis import render_analysis_panel
+from ui.user_settings import apply_settings_to_session, render_user_settings
 
-st.session_state.setdefault("llm_provider_settings", {})
-st.session_state.setdefault("ai_settings_prompt", "")
-st.session_state.setdefault("analysis_errors", {})
-st.session_state.setdefault("analysis_price_errors", {})
-st.session_state.setdefault("analysis_results", {})
-st.session_state.setdefault("analysis_mode", "Portfolio and cash review")
-st.session_state.setdefault("llm_provider", "Custom OpenAI-compatible")
-render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None)
+apply_settings_to_session({
+    "preferences": {"ai_provider": "Custom OpenAI-compatible"},
+    "sensitive": {},
+    "sensitive_consent": False,
+})
+render_user_settings("settings-test-user")
 """
-        ).run()
+        ).run(timeout=20)
+        app.button(key="open_user_settings").click().run(timeout=20)
 
         self.assertFalse(app.exception)
+        app.button(key="add_ai_provider_config").click().run(timeout=20)
         self.assertTrue(
-            any(widget.label == "Model ID" for widget in app.text_input)
+            any(widget.label == "Suggested model" for widget in app.selectbox)
         )
-        self.assertFalse(any(widget.label == "Model" for widget in app.selectbox))
-        self.assertGreaterEqual(len(app.get("popover")), 3)
+        app.selectbox(key="settings_ai_editor_suggested_model").select(
+            "gemini-2.5-flash"
+        ).run(timeout=20)
+        self.assertEqual(
+            app.text_input(key="settings_ai_editor_model").value,
+            "gemini-2.5-flash",
+        )
+        app.selectbox(key="settings_ai_editor_provider").select(
+            "Custom OpenAI-compatible"
+        ).run(timeout=20)
+        self.assertTrue(
+            any(widget.label == "Provider name" for widget in app.text_input)
+        )
+        self.assertTrue(
+            any(widget.label == "Model" for widget in app.text_input)
+        )
 
-    def test_ai_provider_guide_is_inline_with_the_aligned_field_label(self):
+    def test_ai_provider_and_credentials_are_managed_in_user_settings(self):
         app = AppTest.from_string(
             """
 import streamlit as st
-from wealth_home_ai.features.analysis import render_analysis_panel
+from ui.user_settings import apply_settings_to_session, render_user_settings
 
-for key, value in {
-    "llm_provider_settings": {},
-    "ai_settings_prompt": "",
-    "analysis_errors": {},
-    "analysis_price_errors": {},
-    "analysis_results": {},
-    "analysis_mode": "Portfolio and cash review",
-    "llm_provider": "Gemini",
-    "approved_trades_by_scope": {},
-    "audit_trails_by_scope": {},
-}.items():
-    st.session_state.setdefault(key, value)
-
-render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None)
+apply_settings_to_session({
+    "preferences": {"ai_provider": "Gemini"},
+    "sensitive": {},
+    "sensitive_consent": False,
+})
+render_user_settings("settings-test-user")
 """
-        ).run()
+        ).run(timeout=20)
+        app.button(key="open_user_settings").click().run(timeout=20)
 
         self.assertFalse(app.exception)
         self.assertTrue(
+            any(
+                widget.label == "+ AI provider config"
+                for widget in app.button
+            )
+        )
+        app.button(key="add_ai_provider_config").click().run(timeout=20)
+        self.assertTrue(
             any(widget.label == "AI provider" for widget in app.selectbox)
         )
-        self.assertEqual(app.selectbox[1].label, "Model")
-        self.assertEqual(len(app.get("popover")), 3)
         self.assertTrue(
-            any(
-                button.label == "🔮 Run LLM Portfolio Analysis"
-                for button in app.button
+            any(widget.label == "API key" for widget in app.text_input)
+        )
+        self.assertTrue(
+            any(widget.label == "Test provider setup" for widget in app.button)
+        )
+
+    def test_custom_model_and_provider_setup_must_pass_test_before_save(self):
+        from services.user_settings import load_user_settings
+
+        app_source = """
+import streamlit as st
+from ui.user_settings import apply_settings_to_session, render_user_settings
+if "ai_test_initialized" not in st.session_state:
+    apply_settings_to_session({
+        "preferences": {},
+        "sensitive": {},
+        "sensitive_consent": False,
+    })
+    st.session_state.ai_test_initialized = True
+render_user_settings("ai-provider-test-user")
+"""
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "settings.sqlite3"
+            with patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
+            ):
+                app = AppTest.from_string(app_source).run(timeout=20)
+                app.button(key="open_user_settings").click().run(timeout=20)
+                app.button(key="add_ai_provider_config").click().run(timeout=20)
+                app.selectbox(key="settings_ai_editor_provider").select(
+                    "Custom OpenAI-compatible"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_provider_name").set_value(
+                    "OpenRouter"
+                ).run(timeout=20)
+                app.text_input(
+                    key="settings_ai_editor_api_key"
+                ).set_value("test-api-key").run(timeout=20)
+                app.text_input(key="settings_ai_editor_model").set_value(
+                    "openai/gpt-test"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_base_url").set_value(
+                    "https://openrouter.example/api/v1"
+                ).run(timeout=20)
+                app.checkbox(key="settings_sensitive_consent").set_value(
+                    True
+                ).run(timeout=20)
+
+                with patch(
+                    "ui.user_settings.test_ai_provider_configuration"
+                ) as test_provider:
+                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
+                test_provider.assert_called_once_with(
+                    provider="Custom OpenAI-compatible",
+                    api_key="test-api-key",
+                    model="openai/gpt-test",
+                    base_url="https://openrouter.example/api/v1",
+                )
+                app.button(key="save_ai_provider_config").click().run(timeout=20)
+                saved = load_user_settings("ai-provider-test-user")
+                self.assertEqual(
+                    saved["preferences"]["ai_provider_configs"][0]["provider"],
+                    "Custom OpenAI-compatible",
+                )
+                self.assertEqual(
+                    saved["preferences"]["ai_provider_configs"][0]["name"],
+                    "OpenRouter",
+                )
+                self.assertEqual(
+                    saved["preferences"]["ai_provider_configs"][0]["model"],
+                    "openai/gpt-test",
+                )
+                config_id = saved["preferences"]["ai_provider_configs"][0]["id"]
+                self.assertEqual(
+                    saved["sensitive"]["ai_provider_config_keys"][config_id],
+                    "test-api-key",
+                )
+                self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 1)
+                config_id = saved["preferences"]["ai_provider_configs"][0]["id"]
+                safe_id = hashlib.sha256(config_id.encode("utf-8")).hexdigest()[:12]
+                app.button(key=f"edit_ai_config_{safe_id}").click().run(timeout=20)
+                self.assertEqual(
+                    app.text_input(key="settings_ai_editor_api_key").value,
+                    "test-api-key",
+                )
+                app.text_input(key="settings_ai_editor_model").set_value(
+                    "openai/gpt-updated"
+                ).run(timeout=20)
+                with patch("ui.user_settings.test_ai_provider_configuration"):
+                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
+                app.button(key="save_ai_provider_config").click().run(timeout=20)
+                saved = load_user_settings("ai-provider-test-user")
+                self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 1)
+                self.assertEqual(
+                    saved["preferences"]["ai_provider_configs"][0]["model"],
+                    "openai/gpt-updated",
+                )
+                app.button(key="add_ai_provider_config").click().run(timeout=20)
+                app.selectbox(key="settings_ai_editor_provider").select(
+                    "Groq"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_api_key").set_value(
+                    "groq-test-key"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_model").set_value(
+                    "groq-custom-model"
+                ).run(timeout=20)
+                with patch(
+                    "ui.user_settings.test_ai_provider_configuration"
+                ):
+                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
+                app.button(key="save_ai_provider_config").click().run(timeout=20)
+                saved = load_user_settings("ai-provider-test-user")
+                self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 2)
+                groq_config = next(
+                    item
+                    for item in saved["preferences"]["ai_provider_configs"]
+                    if item["provider"] == "Groq"
+                )
+                self.assertEqual(
+                    saved["sensitive"]["ai_provider_config_keys"][
+                        groq_config["id"]
+                    ],
+                    "groq-test-key",
+                )
+                safe_id = hashlib.sha256(
+                    groq_config["id"].encode("utf-8")
+                ).hexdigest()[:12]
+                app.button(key=f"use_ai_config_{safe_id}").click().run(timeout=20)
+                self.assertEqual(app.session_state.llm_provider, "Groq")
+                self.assertEqual(
+                    app.session_state.user_llm_api_key_groq,
+                    "groq-test-key",
+                )
+                app.button(key="save_user_settings").click().run(timeout=20)
+                saved = load_user_settings("ai-provider-test-user")
+                self.assertEqual(
+                    saved["preferences"]["ai_active_config_id"],
+                    groq_config["id"],
+                )
+                app.button(key="dismiss_settings_saved").click().run(timeout=20)
+                app.button(key="open_user_settings").click().run(timeout=20)
+                app.button(key=f"delete_ai_config_{safe_id}").click().run(
+                    timeout=20
+                )
+                app.button(key=f"confirm_delete_ai_config_{safe_id}").click().run(
+                    timeout=20
+                )
+                saved = load_user_settings("ai-provider-test-user")
+                self.assertEqual(
+                    len(saved["preferences"]["ai_provider_configs"]),
+                    1,
+                )
+                self.assertNotIn(
+                    groq_config["id"],
+                    saved["sensitive"]["ai_provider_config_keys"],
+                )
+                self.assertFalse(app.exception)
+
+    def test_ai_provider_key_stays_session_only_without_explicit_consent(self):
+        from services.user_settings import load_user_settings
+
+        app_source = """
+import streamlit as st
+from ui.user_settings import apply_settings_to_session, render_user_settings
+if "ai_session_only_initialized" not in st.session_state:
+    apply_settings_to_session({
+        "preferences": {},
+        "sensitive": {},
+        "sensitive_consent": False,
+    })
+    st.session_state.ai_session_only_initialized = True
+render_user_settings("ai-session-only-user")
+"""
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "settings.sqlite3"
+            with patch(
+                "services.user_settings.settings",
+                replace(settings, oauth_database_path=str(database_path)),
+            ):
+                app = AppTest.from_string(app_source).run(timeout=20)
+                app.button(key="open_user_settings").click().run(timeout=20)
+                app.button(key="add_ai_provider_config").click().run(timeout=20)
+                app.selectbox(key="settings_ai_editor_provider").select(
+                    "OpenAI"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_api_key").set_value(
+                    "private-session-key"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_model").set_value(
+                    "custom-openai-model"
+                ).run(timeout=20)
+                with patch("ui.user_settings.test_ai_provider_configuration"):
+                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
+                app.button(key="save_ai_provider_config").click().run(timeout=20)
+                saved = load_user_settings("ai-session-only-user")
+                self.assertFalse(saved["sensitive_consent"])
+                self.assertEqual(saved["sensitive"], {})
+                self.assertEqual(app.session_state.user_llm_api_key_openai, "private-session-key")
+                self.assertEqual(
+                    app.session_state.settings_ai_provider_config_keys[
+                        saved["preferences"]["ai_provider_configs"][0]["id"]
+                    ],
+                    "private-session-key",
+                )
+                self.assertFalse(app.exception)
+
+    def test_ai_provider_connection_test_checks_model_and_credentials(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "choices": [{"message": {"content": "READY"}}]
+        }
+        with patch("services.ai.requests.post", return_value=response) as post:
+            verify_ai_provider_configuration(
+                provider="Custom OpenAI-compatible",
+                api_key="test-key",
+                model="test-model",
+                base_url="https://api.example.com/v1",
             )
+        post.assert_called_once()
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://api.example.com/v1/chat/completions",
+        )
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "test-model")
+
+        gemini_client = MagicMock()
+        gemini_client.__enter__.return_value = gemini_client
+        gemini_client.models.generate_content.return_value.text = "READY"
+        with patch(
+            "services.ai.genai.Client",
+            return_value=gemini_client,
+        ) as create_client:
+            verify_ai_provider_configuration(
+                provider="Gemini",
+                api_key="gemini-test-key",
+                model="gemini-test-model",
+            )
+        create_client.assert_called_once_with(api_key="gemini-test-key")
+        self.assertEqual(
+            gemini_client.models.generate_content.call_args.kwargs["model"],
+            "gemini-test-model",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Enter an API key"):
+            verify_ai_provider_configuration(
+                provider="OpenAI",
+                api_key="",
+                model="gpt-4o-mini",
+            )
+
+    def test_typed_provider_name_uses_custom_compatible_endpoint(self):
+        from ui import user_settings
+
+        session_values = {
+            "settings_ai_provider": "Proxy Provider",
+            "user_settings_ai_key_custom_openai_compatible": "test-key",
+            "user_settings_model_custom_openai_compatible": "openai/gpt-test",
+            "settings_ai_custom_base_url": "https://openrouter.example/api/v1",
+        }
+        with patch.object(user_settings.st, "session_state", session_values):
+            configuration = user_settings._selected_ai_configuration()
+
+        self.assertEqual(
+            configuration,
+            {
+                "provider": "Custom OpenAI-compatible",
+                "provider_selection": "Proxy Provider",
+                "custom_provider_name": "Proxy Provider",
+                "api_key": "test-key",
+                "model": "openai/gpt-test",
+                "base_url": "https://openrouter.example/api/v1",
+            },
         )
 
     def test_provider_model_options_can_be_overridden_by_environment(self):
@@ -722,7 +1325,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         client.__enter__.return_value = client
         client.chats.create.return_value = chat
 
-        with patch("wealth_home_ai.upstox_helper.genai.Client", return_value=client) as create_client:
+        with patch("services.ai.genai.Client", return_value=client) as create_client:
             result = ask_llm_agent(
                 portfolio_summary="{}",
                 available_cash=1000,
@@ -766,7 +1369,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         client.__enter__.return_value = client
         client.chats.create.return_value = chat
 
-        with patch("wealth_home_ai.upstox_helper.genai.Client", return_value=client):
+        with patch("services.ai.genai.Client", return_value=client):
             result = ask_llm_agent(
                 portfolio_summary="{}",
                 available_cash=1000,
@@ -805,7 +1408,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             ]
         }
         with patch(
-            "wealth_home_ai.upstox_helper.requests.post",
+            "services.ai.requests.post",
             return_value=response,
         ) as post:
             result = ask_llm_agent(
@@ -837,7 +1440,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             ]
         }
         with patch(
-            "wealth_home_ai.upstox_helper.requests.post",
+            "services.ai.requests.post",
             return_value=response,
         ) as post:
             result = ask_llm_agent(
@@ -858,7 +1461,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         self.assertEqual(post.call_args.kwargs["headers"]["x-api-key"], "user-key")
 
     def test_custom_provider_rejects_non_local_insecure_endpoints(self):
-        with patch("wealth_home_ai.upstox_helper.requests.post") as post:
+        with patch("services.ai.requests.post") as post:
             with self.assertRaisesRegex(ValueError, "secure HTTPS"):
                 ask_llm_agent(
                     portfolio_summary="{}",
@@ -914,7 +1517,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             "data": {"access_token": "zerodha-token"},
         }
         with patch(
-            "wealth_home_ai.broker_factory.requests.post",
+            "brokers.factory.requests.post",
             return_value=response,
         ) as post:
             token = adapter.authenticate("request-token", "https://wealth.example.com/")
@@ -938,7 +1541,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             "status": "success",
         }
         with patch(
-            "wealth_home_ai.broker_factory.requests.post",
+            "brokers.factory.requests.post",
             return_value=consent_response,
         ):
             login_url = adapter.get_login_url("https://wealth.example.com/")
@@ -950,7 +1553,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
             "accessToken": "dhan-access-token",
         }
         with patch(
-            "wealth_home_ai.broker_factory.requests.get",
+            "brokers.factory.requests.get",
             return_value=token_response,
         ) as get:
             token = adapter.authenticate("token-id", "https://wealth.example.com/")
@@ -1010,7 +1613,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         )
         with (
             patch.object(adapter, "_api_client", return_value=object()),
-            patch("wealth_home_ai.broker_factory.UserApi", return_value=sdk),
+            patch("brokers.factory.UserApi", return_value=sdk),
         ):
             self.assertEqual(adapter.fetch_balance("access-token"), 12500.0)
 
@@ -1023,7 +1626,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
     def test_whatsapp_alert_uses_session_supplied_credentials(self):
         response = MagicMock()
         with patch(
-            "wealth_home_ai.notifications.requests.post",
+            "services.notifications.requests.post",
             return_value=response,
         ) as post:
             send_whatsapp_alert(
@@ -1049,7 +1652,7 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         )
 
     def test_email_alert_uses_tls_and_supplied_smtp_credentials(self):
-        with patch("wealth_home_ai.notifications.SMTP") as smtp:
+        with patch("services.notifications.SMTP") as smtp:
             server = smtp.return_value.__enter__.return_value
             send_email_alert(
                 "test notification",
@@ -1065,29 +1668,126 @@ render_analysis_panel("all", "portfolio", lambda scope: None, lambda scope: None
         server.login.assert_called_once_with("user@example.com", "app-password")
         server.send_message.assert_called_once()
 
-    def test_notification_settings_are_available_as_compact_channels(self):
+    def test_profile_contacts_replace_the_alerts_settings_tab(self):
         app = AppTest.from_string(
             """
-import wealth_home_ai.dashboard as dashboard
-dashboard._render_app_header()
+from ui.user_settings import render_user_settings
+render_user_settings("settings-test-user")
 """
         ).run()
+        app.button(key="open_user_settings").click().run()
 
         self.assertFalse(app.exception)
-        self.assertGreaterEqual(len(app.get("popover")), 2)
-        self.assertEqual(
-            {item.label for item in app.get("link_button")},
-            {"WhatsApp setup guide ↗", "Gmail app password guide ↗"},
+        self.assertNotIn("Alerts", {tab.label for tab in app.tabs})
+        self.assertTrue(
+            any(widget.label == "Email address" for widget in app.text_input)
         )
         self.assertTrue(
-            any(widget.label == "WhatsApp sender" for widget in app.text_input)
+            any(
+                widget.label == "10-digit phone number"
+                for widget in app.text_input
+            )
         )
         self.assertTrue(
-            any(widget.label == "SMTP server" for widget in app.text_input)
+            any(widget.label == "Country code" for widget in app.selectbox)
+        )
+        self.assertFalse(
+            any(
+                widget.label in {"SMTP server", "Twilio Account SID", "Email recipient"}
+                for widget in app.text_input
+            )
+        )
+        self.assertTrue(
+            {
+                widget.label for widget in app.number_input
+            }.issuperset(
+                {"Maximum scenario allocation (%)", "Realized daily loss (%)"}
+            )
         )
         self.assertFalse(
             any("Telegram" in widget.label for widget in app.text_input)
         )
+
+    def test_saved_profile_contacts_are_prepopulated(self):
+        app = AppTest.from_string(
+            """
+from ui.user_settings import apply_settings_to_session, render_user_settings
+apply_settings_to_session({
+    "preferences": {},
+    "sensitive": {
+        "profile": {
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+            "phone": "+14165551234",
+            "phone_country": "Canada",
+        },
+    },
+    "sensitive_consent": True,
+})
+render_user_settings("settings-test-user")
+"""
+        ).run()
+        app.button(key="open_user_settings").click().run()
+
+        self.assertFalse(app.exception)
+        values_by_label = {widget.label: widget.value for widget in app.text_input}
+        self.assertEqual(values_by_label["Your name"], "Ada Lovelace")
+        self.assertEqual(values_by_label["Email address"], "ada@example.com")
+        self.assertEqual(
+            values_by_label["10-digit phone number"],
+            "4165551234",
+        )
+        self.assertEqual(
+            next(
+                widget.value
+                for widget in app.selectbox
+                if widget.label == "Country code"
+            ),
+            "🇨🇦 Canada (+1)",
+        )
+        country_options = next(
+            widget.options
+            for widget in app.selectbox
+            if widget.label == "Country code"
+        )
+        self.assertIn("🇮🇳 India (+91)", country_options)
+        self.assertIn("🇨🇦 Canada (+1)", country_options)
+
+    def test_profile_shows_email_and_phone_validation_errors_as_typed(self):
+        app = AppTest.from_string(
+            """
+from ui.user_settings import render_user_settings
+render_user_settings("settings-test-user")
+"""
+        ).run()
+        app.button(key="open_user_settings").click().run()
+        app.text_input(key="settings_profile_email").set_value("invalid-email").run()
+        app.text_input(key="settings_profile_phone_national").set_value(
+            "12345abcde"
+        ).run()
+
+        self.assertFalse(app.exception)
+        errors = [element.value for element in app.error]
+        self.assertTrue(any("valid email address" in error for error in errors))
+        self.assertTrue(
+            any("exactly 10 digits" in error for error in errors)
+        )
+
+    def test_selected_flag_country_code_is_combined_for_saved_phone(self):
+        app = AppTest.from_string(
+            """
+import streamlit as st
+from ui.user_settings import _collect_sensitive_settings
+st.session_state["settings_profile_phone_country"] = "🇨🇦 Canada (+1)"
+st.session_state["settings_profile_phone_national"] = "4165551234"
+st.session_state["collected_settings"] = _collect_sensitive_settings()
+"""
+        ).run()
+
+        self.assertFalse(app.exception)
+        saved_profile = app.session_state["collected_settings"]["profile"]
+        self.assertEqual(saved_profile["phone"], "+14165551234")
+        self.assertEqual(saved_profile["phone_country"], "Canada")
 
     def test_zerodha_reads_cash_positions_and_live_quotes(self):
         adapter = ZerodhaAdapter(api_key="kite-key", api_secret="kite-secret")
@@ -1173,7 +1873,7 @@ dashboard._render_app_header()
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "oauth.sqlite3"
             with patch(
-                "wealth_home_ai.oauth_state_store._database_path",
+                "security.oauth._database_path",
                 return_value=database_path,
             ):
                 create_oauth_state("user-one-state")
@@ -1188,7 +1888,7 @@ dashboard._render_app_header()
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "oauth.sqlite3"
             with patch(
-                "wealth_home_ai.oauth_state_store._database_path",
+                "security.oauth._database_path",
                 return_value=database_path,
             ):
                 create_oauth_state(

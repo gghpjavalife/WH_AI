@@ -6,19 +6,40 @@ AI-assisted insights and deterministic JEV risk guardrails.
 ## Run locally
 
 Install the project dependencies, configure credentials and optional runtime
-settings in the single project-root `.env` file, then start Streamlit:
+settings in the project-root `.env` file, then start Streamlit. Do not put the
+database encryption key in `.env`; see the secure setup below.
 
 ```powershell
 uv sync
 streamlit run app.py
 ```
 
+**First-time encrypted database setup is required.** The app uses SQLCipher and
+will not open or create a database until its 256-bit key is available from the
+OS credential manager or a deployment secret manager. On a local Windows,
+macOS, or Linux desktop with a supported native keyring:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m security.database_key provision
+```
+
+Run this once as the same OS user that will run Streamlit. To deploy without a
+native desktop vault, set `WEALTH_HOME_DB_ENCRYPTION_KEY` to exactly 64 hex
+characters in the hosting platform's secret manager. Use one stable value for
+all instances that share the same database; never put it in source control or
+a checked-in `.env` file. Losing the key makes the encrypted database
+unrecoverable.
+
 ## Create the credentials you need
 
 Create credentials only on the official provider sites below. Beside each
-credential field, the app explains why it is needed, how to obtain the right
-value, and links to the provider's setup guide. Interactive credentials stay
-in the current browser session.
+credential section in **User settings**, the app links to the provider's setup
+guide. Settings and preferences are stored in the app's local SQLCipher-encrypted
+SQLite database.
+Email, phone, broker credentials, and AI keys remain session-only unless the
+user explicitly consents to encrypted storage in the settings dialog.
+Notification delivery credentials are configured separately by the app operator.
 
 | Purpose | Official setup page |
 | --- | --- |
@@ -33,22 +54,24 @@ in the current browser session.
 | Together AI API key | [Together AI settings](https://api.together.xyz/settings/api-keys) |
 | Mistral API key | [Mistral console](https://console.mistral.ai/api-keys/) |
 | DeepSeek API key | [DeepSeek platform](https://platform.deepseek.com/api_keys) |
-| Twilio WhatsApp sender and credentials | [Twilio WhatsApp Sandbox setup](https://www.twilio.com/docs/whatsapp/sandbox) |
-| Gmail SMTP app password | [Google app passwords](https://support.google.com/accounts/answer/185833) |
+| OpenRouter API key | [OpenRouter keys](https://openrouter.ai/settings/keys) |
+| xAI API key | [xAI console](https://console.x.ai/) |
+| Cerebras API key | [Cerebras Cloud](https://cloud.cerebras.ai/) |
+| Operator WhatsApp delivery (Twilio) | [Twilio WhatsApp Sandbox setup](https://www.twilio.com/docs/whatsapp/sandbox) |
+| Operator email delivery (Resend) | [Resend API keys](https://resend.com/api-keys) |
 
 For Upstox, Zerodha, and Dhan, register the exact callback URL displayed by
 the app in the broker's API-app settings. A custom OpenAI-compatible provider
 does not have a shared key-generation page; use the endpoint provider's own
-console and enter its API base URL and model ID in the analysis controls.
-WhatsApp and email alerts can be configured from the app header. WhatsApp uses
-Twilio's WhatsApp API; join the Twilio sandbox with the recipient before sending
-test messages. Email requires an SMTP server supporting TLS on port 465 (SSL) or
-587 (STARTTLS). Notification settings are held only in the active browser
-session.
+console and enter its API base URL and model ID in **User settings**.
+Users enter only their email address and phone number in **User settings →
+Profile**. Email and WhatsApp delivery credentials are configured by the app
+operator as server secrets; phone notifications use WhatsApp, not SMS. Twilio
+sandbox recipients must first join the sandbox.
 
-Runtime settings are centralized in `wealth_home_ai.settings`. The `.env` file
-contains both credentials and setting overrides; safe defaults are used for
-omitted options. Deployment secrets should be supplied by the platform secret
+Runtime settings are centralized in `core.config`. The `.env` file contains
+operator-managed integration credentials and setting overrides; safe defaults
+are used for omitted options. Deployment secrets should be supplied by the platform secret
 manager or Streamlit's ignored `.streamlit/secrets.toml`, rather than committed
 files. Environment variables take precedence over Streamlit secrets.
 
@@ -70,45 +93,46 @@ server_metadata_url = "https://accounts.google.com/.well-known/openid-configurat
 
 Register the exact redirect URI with the selected OIDC provider. For local use,
 replace it with `http://localhost:8501/oauth2callback`. The app uses the
-authenticated email or subject to scope custom broker definitions. Without the
-OIDC gate, custom definitions are scoped only to a browser session and are not
-suitable for shared-user isolation.
+authenticated email or subject to scope saved user settings. Without the OIDC
+gate, settings are scoped only to a browser session and are not suitable for
+shared-user isolation.
 
 Optional server-side integration settings are:
 
 | Setting | Purpose |
 | --- | --- |
-| `TURSO_PRIMARY_DB_URL`, `TURSO_AUTH_TOKEN` | Enable the tenant-scoped custom broker registry in Turso. |
-| `DYNAMIC_BROKER_ALLOWED_HOSTS` | Comma-separated, operator-controlled HTTPS host allow-list for custom broker APIs. |
 | `RESEND_API_KEY`, `RESEND_SENDER` | Default Resend sender for email delivery; sender/domain must be verified with Resend. |
-| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_SENDER`, `TWILIO_WHATSAPP_RECIPIENT` | Optional server defaults for WhatsApp notifications. |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_SENDER` | Optional server-side WhatsApp delivery configuration; each recipient comes from the signed-in user's profile. |
 | `WEALTH_HOME_REQUIRE_LOGIN` | Set to `true` to require OIDC sign-in. |
 
 These settings can be environment variables on Render or Hugging Face Spaces,
-or top-level values in Streamlit secrets. The app creates its
-`dynamic_broker_registry` table in Turso on first use. Each definition requires
-an allow-listed HTTPS API host and `balance`, `positions`, and `holdings`
-endpoint paths. Responses must use the documented balance and equity-row
-fields in `GenericDynamicAdapter`; optional `profile` and `live_prices` paths
-may also be configured. Custom adapters reject redirects and are read-only:
-they cannot place orders, access mutual-fund or ATR feeds, or bypass the
-operator's server-side hostname allow-list. Broker bearer tokens are not stored
-in the registry.
+or top-level values in Streamlit secrets. Broker credentials are configured
+only for the four supported built-in integrations: Upstox, Zerodha, Angel One,
+and Dhan.
 
-OAuth recovery state is stored in SQLite, not Turso. Keep
-`WEALTH_HOME_OAUTH_DB` on persistent storage and configure the same
-`OAUTH_CREDENTIAL_ENCRYPTION_KEY` across instances that share that database.
+OAuth recovery state is stored in the SQLCipher SQLite database, not Turso.
+Keep `WEALTH_HOME_OAUTH_DB` on persistent storage and configure the same
+`WEALTH_HOME_DB_ENCRYPTION_KEY` and `OAUTH_CREDENTIAL_ENCRYPTION_KEY` across
+instances that share that database.
 SQLite needs a storage topology that supports its locking and journal semantics;
 do not point multiple independent instances at unrelated local disks and expect
 OAuth callbacks to resume across them. If the host cannot provide compatible
 shared storage, use a single app instance or adopt a shared OAuth-state store
 before scaling horizontally.
 
-Broker tokens, portfolio data, notification preferences, and AI chat remain in
-the active Streamlit session; they are not durable user records. OIDC identifies
-users and scopes the optional broker registry, but does not persist broker
-credentials or portfolios. Use a single-instance deployment or a deliberately
-designed encrypted persistence layer if durable sessions are required.
+Broker tokens, portfolio data, and AI chat remain in the active Streamlit
+session. User preferences are saved in the local SQLCipher-encrypted
+`.wealth_home_oauth.sqlite3` database. Contact details and credentials are
+saved only after the user opts in; the opt-in data also uses a Fernet layer
+with a local `.key` file or configured `OAUTH_CREDENTIAL_ENCRYPTION_KEY`.
+SQLCipher's database key is separately obtained from the OS credential vault
+or `WEALTH_HOME_DB_ENCRYPTION_KEY`. Encryption at rest does not protect data
+from someone who can access the running app and the necessary keys; protect
+the app host, database, OS vault, and deployment secrets accordingly.
+Without OIDC, user settings belong to the
+single local app user and are not suitable for a shared deployment. Enable the
+OIDC gate before exposing the app to multiple users; OIDC identity scopes saved
+settings, but does not persist broker tokens or portfolios.
 
 The interface's deterministic rules constrain recommendations and app-issued
 BUY orders, but they are not broker-side controls and cannot stop orders placed
@@ -121,18 +145,23 @@ broker API access, market data, AI model availability/rate limits, Turso,
 Twilio, and Resend are subject to each provider's changing eligibility,
 quotas, terms, and possible charges.
 
-Connected users choose an AI provider, enter its API key, and select a model
-beside the main portfolio analysis button. Keys are kept only in the current
-browser session and are never loaded from server environment variables or
-written to `.env`. Supported providers include Gemini, OpenAI, Anthropic,
-Groq, Together AI, Mistral, DeepSeek, and custom OpenAI-compatible endpoints.
+Users choose an AI provider and model in **User settings** using searchable
+selectors; they can also type a provider name (for an OpenAI-compatible API) or
+a provider-specific model ID. Users can keep multiple configurations and edit
+each one. Each configuration must pass a small connection test before it can
+be saved individually. The test sends no portfolio data, but may incur the
+provider's normal API charge. Keys remain in the
+current session by default; users may explicitly approve encrypted local
+persistence. Supported providers include Gemini, OpenAI, Anthropic, Groq,
+Together AI, Mistral, DeepSeek, OpenRouter, xAI, Cerebras, and custom
+OpenAI-compatible endpoints.
 The **Ask about this Agent** header button is a local guide for application
 features and workflows, including broker connections, workspaces, research,
 analysis, risk controls, and notifications. It uses a deterministic in-app
 help guide and makes no external AI request, so it does not require a provider
 key. The model selector for portfolio analysis is populated from
 provider-specific defaults in
-`wealth_home_ai.settings`. Override model lists with the `LLM_PROVIDER_MODELS`
+`core.config`. Override model lists with the `LLM_PROVIDER_MODELS`
 environment setting as a JSON object, for example:
 
 ```text
@@ -141,50 +170,74 @@ LLM_PROVIDER_MODELS={"OpenAI":["gpt-4o-mini","gpt-4.1-mini"],"Groq":["llama-3.3-
 
 Custom OpenAI-compatible endpoints accept a freeform model ID and
 require an API base URL, which can be supplied as `LLM_CUSTOM_BASE_URL` or in
-the analysis controls. They do not have a predefined or shared model list;
+User settings. They do not have a predefined or shared model list;
 enter the model ID provided by your endpoint. Provider
 model availability, access, quotas, and pricing are controlled by each provider
 and can change.
 
 The root `app.py` remains the supported Streamlit entry point. Application
-implementation modules live only in the `wealth_home_ai` package.
+code uses a `src/` layout with separate application, broker, core, feature,
+security, service, and UI packages.
 
 ## Source layout
 
 ```text
-src/wealth_home_ai/
-  dashboard.py            Streamlit UI and session orchestration
-  broker_factory.py       Broker interface and Upstox, Angel One, Zerodha, and Dhan adapters
-  market_research.py      Public daily NSE history and transparent technical signals
-  jev_rules.py            Deterministic recommendation rule engine
-  oauth_state_store.py    Expiring, one-time OAuth state persistence
-  upstox_helper.py        Multi-provider AI analysis, ATR calculations, and alerts
-  features/
-    analysis.py           Full-portfolio and scoped AI analysis views
-    home.py               Investment summary and interactive allocation chart
-    market.py             Broker-independent stock search and watchlist scanner
-    portfolio.py          Portfolio aggregates
-    operations/           Equity, trading, derivatives, and MF views
+src/
+  application/            Dashboard composition and local help guide
+  brokers/                Broker interfaces and provider adapters
+  core/                   Runtime settings, constants, and logging
+  features/                Analysis and portfolio workspaces by domain
+  security/                OAuth state and credential encryption
+  services/                AI, cloud, notifications, and user-settings persistence
+  ui/                     Shared header, helpers, and user-settings dialog
 ```
 
-OAuth state is stored in the project-root `.wealth_home_oauth.sqlite3` file by
-default to preserve existing local sign-ins. Set `WEALTH_HOME_OAUTH_DB` to use a
-different writable database path in deployments.
+OAuth state and user preferences share the project-root
+`.wealth_home_oauth.sqlite3` SQLCipher database by default. All app database
+connections apply the key before reading or writing and fail closed if the
+driver is not SQLCipher, the key is missing/wrong, or a plaintext database is
+detected. Set `WEALTH_HOME_OAUTH_DB` to use a different writable database path
+in deployments.
 
-Each broker's login form requests credentials after that broker is selected.
-Inputs are held in the active Streamlit browser session while needed for that
-sign-in and are not written to `.env` or read from server environment
-configuration. Upstox and Zerodha API key/secret pairs identify the developer
-app, while each user separately authorizes their own broker account. OAuth state
+### Existing plaintext database migration
+
+The former app version used plain SQLite. Stop **all** running app processes,
+provision or configure the SQLCipher key above, and make any required protected
+backup before converting an existing database:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m security.database_migration --confirm-plaintext-removal
+```
+
+The command builds and validates an encrypted replacement, then atomically
+replaces the plaintext file. It deliberately retains no plaintext backup.
+Plaintext backups and remnants from storage media may remain recoverable, so
+protect any backup and retire it securely. Migration refuses to run when
+SQLite WAL/journal sidecars exist; close the app cleanly and retry.
+
+On supported desktop platforms the app uses Windows Credential Manager, macOS
+Keychain, or Linux Secret Service/KWallet. A headless server should use
+`WEALTH_HOME_DB_ENCRYPTION_KEY` from its secret manager instead; OS keyrings
+often require an interactive login/session. The Python SQLCipher driver is
+`sqlcipher3`; it is not interchangeable with the standard-library `sqlite3`.
+
+Configure one of the four supported brokers in **User settings → Brokers**
+or select it directly in Home's broker selector. Upstox, Zerodha, Angel One,
+and Dhan are always available; no separate enable step is required. Credentials are
+entered in the corresponding broker settings and are not written to `.env` or
+read from server environment configuration. Upstox and Zerodha API key/secret pairs identify
+the developer app, while each user separately authorizes their own broker account. OAuth state
 is random, short-lived, one-time, and stored only as a digest. To complete
 Upstox or Zerodha sign-in automatically after the broker redirects to a fresh
 Streamlit session, the state store also holds the matching app credentials in
 encrypted form until the state expires or is consumed. Locally, the encryption
-key is created beside the OAuth database in a `.key` file with restricted
-permissions where supported; deployments with multiple app instances should
-configure the same stable `OAUTH_CREDENTIAL_ENCRYPTION_KEY` secret on every
-instance and use shared OAuth storage. Protect and back up that key as a
-deployment secret.
+for OAuth callback contexts remains an additional Fernet layer; its key can be
+configured with `OAUTH_CREDENTIAL_ENCRYPTION_KEY`. SQLCipher's database key is
+separate and must be sourced from the OS vault or
+`WEALTH_HOME_DB_ENCRYPTION_KEY`. Deployments with multiple app instances must
+provide the same stable keys to every instance that shares storage. Protect
+and back up keys as deployment secrets.
 
 Generate a Fernet-compatible deployment key with the installed dependency:
 
@@ -219,13 +272,17 @@ endpoints used by this app to fetch mutual-fund holdings. Angel One SmartAPI and
 Dhan do not expose a mutual-fund holdings feed here, so import those holdings
 from a current statement CSV when using either broker.
 
-WhatsApp and email notifications are configured from the header and use
-session-only credentials. WhatsApp sandbox recipients must first join the
-Twilio sandbox; email credentials must be accepted by the selected SMTP server.
-
-Broker API credentials, AI provider keys, and notification credentials are kept
-in the active app session only; the app does not save them in browser storage or
-server configuration. Re-enter them after the session ends.
+Profile contact details, broker settings, AI providers, and risk preferences
+are managed in **User settings**; there is no user-facing Alerts settings tab.
+Email and phone are the per-user notification destinations. Delivery credentials
+remain operator-managed server secrets. Public preferences are saved by default.
+A clear, optional, explicit encrypted-storage consent applies to contact details
+and user-provided broker/AI credentials. With consent unchecked, confidential
+values are removed from saved records and need to be entered again in a later
+session. The consent notice explains the risks of storing encrypted values on
+the app host.
+AI settings support multiple tested provider configurations, suggested or
+custom model IDs, and OpenAI-compatible custom endpoints.
 
 Each active browser session has its own Streamlit session state; this is not a
 durable user directory or account vault. Shared developer-app credentials let
@@ -235,9 +292,9 @@ shared deployment, enable the OIDC gate described above and use the deployment
 limitations documented in that section.
 
 Home is the default page. Before connecting, it provides the broker sign-in
-form; after connecting, it shows the selected account's cash, portfolio
-summary, allocation, and portfolio review. WhatsApp and email configuration
-remain available from the header whether or not a broker is connected.
+action; configure broker credentials in **User settings** first. After
+connecting, Home shows the selected account's cash, portfolio summary,
+allocation, and portfolio review.
 
 The compact header navigation has Home, Equities, Trades, F&O, and Mutual
 Funds workspaces. Market research and scanning live inside each relevant
