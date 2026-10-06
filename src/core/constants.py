@@ -14,8 +14,8 @@ class AppIdentity(StrEnum):
     BRAND_DESCRIPTION = "Governed multi-broker portfolio companion"
     TITLE = "GGHP | Governed Portfolio Companion"
     TIMEZONE = "Asia/Kolkata"
-    DEFAULT_REDIRECT_URI = "http://localhost:8501"
-
+    # DEFAULT_REDIRECT_URI = "http://localhost:8501"
+    DEFAULT_REDIRECT_URI = "https://gghp-ai-agent-dev.streamlit.app"
 
 class AppTab(StrEnum):
     HOME = "Home"
