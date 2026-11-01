@@ -25,4 +25,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["application*", "brokers*", "core*", "features*", "security*", "services*", "ui*"]
+include = ["application*", "brokers*", "core*", "features*", "security*", "services*", "storage*", "ui*"]
+
+[tool.setuptools.package-data]
+ui = ["components/indexeddb_storage/index.html"]

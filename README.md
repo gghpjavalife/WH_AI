@@ -6,39 +6,55 @@ AI-assisted insights and deterministic JEV risk guardrails.
 ## Run locally
 
 Install the project dependencies, configure credentials and optional runtime
-settings in the project-root `.env` file, then start Streamlit. Do not put the
-database encryption key in `.env`; see the secure setup below.
+settings in the project-root `.env` file, then start Streamlit. Streamlit runs
+use browser IndexedDB for durable application data; no database key or server
+database setup is needed for this runtime.
 
 ```powershell
 uv sync
 streamlit run app.py
 ```
 
-**First-time encrypted database setup is required.** The app uses SQLCipher and
-will not open or create a database until its 256-bit key is available from the
-OS credential manager or a deployment secret manager. On a local Windows,
-macOS, or Linux desktop with a supported native keyring:
+## Keep a free deployment responsive
+
+Streamlit already exposes a lightweight health endpoint at
+`https://<your-app-host>/_stcore/health`; it returns HTTP 200 when the app
+server is responsive. No extra endpoint code or dependency is required.
+
+The production config disables Streamlit's development file watcher to avoid
+unneeded file scanning. Market-data requests are already cached by the app.
+
+To monitor the app with UptimeRobot:
+
+1. Create a free account and choose **Add New Monitor** → **HTTP(s)**.
+2. Enter a monitor name and the health URL above.
+3. Set the monitoring interval to **5 minutes**, then save.
+4. Optionally add an email alert contact to receive downtime notifications.
+
+An uptime monitor can wake a sleeping app and may see a timeout while it starts.
+It cannot override a hosting provider's sleep, restart, or usage policies, so
+continuous availability is not guaranteed on a free plan.
+
+The SQLite provider remains available for non-Streamlit native runtimes. Before
+using that provider on Windows, macOS, or Linux, provision its SQLCipher key
+through the supported OS credential manager:
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m security.database_key provision
 ```
 
-Run this once as the same OS user that will run Streamlit. To deploy without a
-native desktop vault, set `WEALTH_HOME_DB_ENCRYPTION_KEY` to exactly 64 hex
-characters in the hosting platform's secret manager. Use one stable value for
-all instances that share the same database; never put it in source control or
-a checked-in `.env` file. Losing the key makes the encrypted database
-unrecoverable.
+This setup is not used by Streamlit browser storage. Never configure a shared
+server database for user data.
 
 ## Create the credentials you need
 
 Create credentials only on the official provider sites below. Beside each
 credential section in **User settings**, the app links to the provider's setup
-guide. Settings and preferences are stored in the app's local SQLCipher-encrypted
-SQLite database.
+guide. Settings and preferences are stored in the current device's browser
+IndexedDB when running in Streamlit.
 Email, phone, broker credentials, and AI keys remain session-only unless the
-user explicitly consents to encrypted storage in the settings dialog.
+user explicitly consents to encrypted local storage in the settings dialog.
 Notification delivery credentials are configured separately by the app operator.
 
 | Purpose | Official setup page |
@@ -110,29 +126,22 @@ or top-level values in Streamlit secrets. Broker credentials are configured
 only for the four supported built-in integrations: Upstox, Zerodha, Angel One,
 and Dhan.
 
-OAuth recovery state is stored in the SQLCipher SQLite database, not Turso.
-Keep `WEALTH_HOME_OAUTH_DB` on persistent storage and configure the same
-`WEALTH_HOME_DB_ENCRYPTION_KEY` and `OAUTH_CREDENTIAL_ENCRYPTION_KEY` across
-instances that share that database.
-SQLite needs a storage topology that supports its locking and journal semantics;
-do not point multiple independent instances at unrelated local disks and expect
-OAuth callbacks to resume across them. If the host cannot provide compatible
-shared storage, use a single app instance or adopt a shared OAuth-state store
-before scaling horizontally.
+Streamlit browser sessions store user settings and short-lived broker OAuth
+callback state in IndexedDB. Confidential settings and OAuth callback context
+are encrypted locally with browser Web Crypto. The browser bridge executes
+IndexedDB operations in the browser; it does not persist those records to the
+Streamlit server filesystem or to a cloud database.
 
-Broker tokens, portfolio data, and AI chat remain in the active Streamlit
-session. User preferences are saved in the local SQLCipher-encrypted
-`.wealth_home_oauth.sqlite3` database. Contact details and credentials are
-saved only after the user opts in; the opt-in data also uses a Fernet layer
-with a local `.key` file or configured `OAUTH_CREDENTIAL_ENCRYPTION_KEY`.
-SQLCipher's database key is separately obtained from the OS credential vault
-or `WEALTH_HOME_DB_ENCRYPTION_KEY`. Encryption at rest does not protect data
-from someone who can access the running app and the necessary keys; protect
-the app host, database, OS vault, and deployment secrets accordingly.
+Settings use a device-local repository abstraction. Streamlit selects the
+IndexedDB provider; non-Streamlit runtimes select the SQLCipher provider, which
+retains the existing `user_settings` and `oauth_states` table structures.
+Confidential browser records use AES-GCM through Web Crypto, and native
+confidential records retain the existing Fernet layer over SQLCipher.
+Encryption does not protect data from someone who can access the browser
+profile or native device.
 Without OIDC, user settings belong to the
-single local app user and are not suitable for a shared deployment. Enable the
-OIDC gate before exposing the app to multiple users; OIDC identity scopes saved
-settings, but does not persist broker tokens or portfolios.
+single local app user. OIDC is optional and is not required to use local storage;
+when enabled, the authenticated identity scopes settings in the browser store.
 
 The interface's deterministic rules constrain recommendations and app-issued
 BUY orders, but they are not broker-side controls and cannot stop orders placed
@@ -141,8 +150,8 @@ brokers do not provide a verified common realized-P&L feed. Verify all trades
 independently before submitting them.
 
 “Free tier” availability is not a zero-cost or uptime guarantee. Hosting,
-broker API access, market data, AI model availability/rate limits, Turso,
-Twilio, and Resend are subject to each provider's changing eligibility,
+broker API access, market data, AI model availability/rate limits, Twilio,
+and Resend are subject to each provider's changing eligibility,
 quotas, terms, and possible charges.
 
 Users choose an AI provider and model in **User settings** using searchable
@@ -188,22 +197,23 @@ src/
   core/                   Runtime settings, constants, and logging
   features/                Analysis and portfolio workspaces by domain
   security/                OAuth state and credential encryption
-  services/                AI, cloud, notifications, and user-settings persistence
+  services/                AI, cloud, notifications, and application services
+  storage/                 StorageProvider implementations and repositories
   ui/                     Shared header, helpers, and user-settings dialog
 ```
 
-OAuth state and user preferences share the project-root
-`.wealth_home_oauth.sqlite3` SQLCipher database by default. All app database
-connections apply the key before reading or writing and fail closed if the
-driver is not SQLCipher, the key is missing/wrong, or a plaintext database is
-detected. Set `WEALTH_HOME_OAUTH_DB` to use a different writable database path
-in deployments.
+The browser store uses versioned IndexedDB object stores and preserves the
+current SQLite record fields for settings and OAuth state. A persistent
+anonymous device ID is generated and stored on first launch. Repositories
+depend only on the provider contract so synchronization can be introduced
+without changing application services.
 
-### Existing plaintext database migration
+### Existing native SQLite database migration
 
-The former app version used plain SQLite. Stop **all** running app processes,
-provision or configure the SQLCipher key above, and make any required protected
-backup before converting an existing database:
+This migration applies only to existing databases used by the native SQLite
+provider; Streamlit browser storage does not read or write this file. Stop all
+native app processes, provision the SQLCipher key above, and make any required
+protected backup before converting:
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -216,11 +226,10 @@ Plaintext backups and remnants from storage media may remain recoverable, so
 protect any backup and retire it securely. Migration refuses to run when
 SQLite WAL/journal sidecars exist; close the app cleanly and retry.
 
-On supported desktop platforms the app uses Windows Credential Manager, macOS
-Keychain, or Linux Secret Service/KWallet. A headless server should use
-`WEALTH_HOME_DB_ENCRYPTION_KEY` from its secret manager instead; OS keyrings
-often require an interactive login/session. The Python SQLCipher driver is
-`sqlcipher3`; it is not interchangeable with the standard-library `sqlite3`.
+On supported desktop platforms the native provider uses Windows Credential
+Manager, macOS Keychain, or Linux Secret Service/KWallet. The Python SQLCipher
+driver is `sqlcipher3`; it is not interchangeable with standard-library
+`sqlite3`.
 
 Configure one of the four supported brokers in **User settings → Brokers**
 or select it directly in Home's broker selector. Upstox, Zerodha, Angel One,
@@ -232,24 +241,8 @@ is random, short-lived, one-time, and stored only as a digest. To complete
 Upstox or Zerodha sign-in automatically after the broker redirects to a fresh
 Streamlit session, the state store also holds the matching app credentials in
 encrypted form until the state expires or is consumed. Locally, the encryption
-for OAuth callback contexts remains an additional Fernet layer; its key can be
-configured with `OAUTH_CREDENTIAL_ENCRYPTION_KEY`. SQLCipher's database key is
-separate and must be sourced from the OS vault or
-`WEALTH_HOME_DB_ENCRYPTION_KEY`. Deployments with multiple app instances must
-provide the same stable keys to every instance that shares storage. Protect
-and back up keys as deployment secrets.
-
-Generate a Fernet-compatible deployment key with the installed dependency:
-
-```powershell
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-
-Store the generated value as `OAUTH_CREDENTIAL_ENCRYPTION_KEY` in the deployment
-secret manager, not in source control. Local development creates and reuses a
-protected `.key` file automatically. See
-[Streamlit secrets management](https://docs.streamlit.io/develop/concepts/connections/secrets-management)
-for deployment secret configuration guidance.
+for OAuth callback contexts uses browser Web Crypto in Streamlit and the
+existing Fernet-plus-SQLCipher protection in native SQLite runtimes.
 
 Each OAuth connect control stays disabled until its required credentials are
 present. Upstox and Zerodha open the broker authorization directly and finish
@@ -279,8 +272,8 @@ remain operator-managed server secrets. Public preferences are saved by default.
 A clear, optional, explicit encrypted-storage consent applies to contact details
 and user-provided broker/AI credentials. With consent unchecked, confidential
 values are removed from saved records and need to be entered again in a later
-session. The consent notice explains the risks of storing encrypted values on
-the app host.
+session. The consent notice explains the risks of storing encrypted values on the
+current device.
 AI settings support multiple tested provider configurations, suggested or
 custom model IDs, and OpenAI-compatible custom endpoints.
 

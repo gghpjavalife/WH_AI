@@ -1604,10 +1604,10 @@ def _settings_dialog(owner_identifier: str) -> None:
         return
 
     st.caption(
-        "Your non-confidential preferences are stored in this app's local "
-        "SQLCipher-encrypted SQLite database. Contact details and credentials "
-        "are session-only unless you explicitly approve their additional "
-        "encrypted storage below."
+        "Your non-confidential preferences are stored on this device "
+        "(IndexedDB in Streamlit; SQLite in native runtimes). Contact details "
+        "and credentials are session-only unless you explicitly approve their "
+        "additional encrypted local storage below."
     )
     load_error = st.session_state.get("user_settings_error")
     feedback = _mapping(st.session_state.get("user_settings_feedback"))
@@ -1693,12 +1693,10 @@ def _settings_dialog(owner_identifier: str) -> None:
 
     st.warning(
         "Serious privacy notice: enabling consent stores your contact details "
-        "and entered credentials on the app host for future sessions. They are "
-        "encrypted at rest: SQLCipher protects the database, with an additional "
-        "encrypted layer for confidential fields. Encryption does not protect "
-        "data from someone who can access the running app and its required keys "
-        "(the SQLCipher key in the OS vault/deployment secret and the credential "
-        "encryption key). Only consent if you trust the device and its operator."
+        "and entered credentials on this device for future sessions. Streamlit "
+        "uses browser IndexedDB with local AES-GCM encryption; native SQLite "
+        "storage uses SQLCipher. Encryption does not protect data from someone "
+        "who can access your browser profile or device."
     )
     st.checkbox(
         "I explicitly consent to save my private/confidential fields encrypted "

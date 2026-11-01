@@ -61,6 +61,11 @@ from services.cloud import (
 )
 from services.user_settings import load_user_settings
 from services.database import DatabaseError, DatabaseSecurityError
+from storage import StorageRequestPending, get_storage_provider
+from storage.indexeddb_provider import (
+    has_pending_browser_write,
+    process_browser_storage_bridge,
+)
 from security.oauth import consume_oauth_state_context, create_oauth_state
 from core.config import settings
 from application.help import answer_app_help_question
@@ -356,7 +361,17 @@ def _load_user_settings_for_user() -> None:
     if st.session_state.get("user_settings_loaded_for") == owner_identifier:
         return
     try:
+        get_storage_provider(settings).get_or_create_device_id()
+    except StorageRequestPending:
+        pass
+    except (OSError, RuntimeError, ValueError) as error:
+        log_failure("Local device ID initialization", error)
+        st.session_state["user_settings_error"] = str(error)
+        return
+    try:
         saved_settings = load_user_settings(owner_identifier)
+    except StorageRequestPending:
+        return
     except (OSError, RuntimeError, DatabaseError, ValueError) as error:
         log_failure("User settings load", error)
         st.session_state["user_settings_error"] = str(error)
@@ -1028,6 +1043,9 @@ def _render_broker_connection() -> None:
                     str(st.query_params["code"]),
                     st.query_params.get("state"),
                 )
+            except StorageRequestPending:
+                st.info("Checking the broker callback state in browser storage…")
+                return
             except (
                 BrokerAPIError,
                 requests.RequestException,
@@ -1055,6 +1073,9 @@ def _render_broker_connection() -> None:
                     str(st.query_params["request_token"]),
                     st.query_params.get("state"),
                 )
+            except StorageRequestPending:
+                st.info("Checking the broker callback state in browser storage…")
+                return
             except (
                 BrokerAPIError,
                 requests.RequestException,
@@ -1096,7 +1117,9 @@ def _render_broker_connection() -> None:
             if login_error:
                 st.error(login_error)
             if api_key and api_secret and login_url:
-                if broker_choice == "Upstox":
+                if has_pending_browser_write("oauth_states"):
+                    st.info("Saving the one-time callback state in browser storage…")
+                elif broker_choice == "Upstox":
                     _render_oauth_tab_link(button_label, login_url)
                     with st.container(border=True):
                         st.markdown("**Upstox sign-in is ready**")
@@ -2611,3 +2634,5 @@ if st.session_state.token is None:
     _show_login()
 else:
     _show_workspace()
+
+process_browser_storage_bridge()
