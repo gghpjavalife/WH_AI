@@ -14,6 +14,7 @@ from streamlit.testing.v1 import AppTest
 from features.mutual_funds.workspace import validate_mutual_funds
 from features.shared.performance import style_returns
 from features.home.workspace import ALLOCATION_COLORS, build_allocation_chart
+from features.equities.workspace import build_equity_holdings_display
 from core.logging import diagnostic_summary, log_failure
 from features.portfolio.metrics import (
     calculate_allocation,
@@ -104,6 +105,7 @@ class PortfolioFeatureTests(unittest.TestCase):
     def test_diagnostics_report_safe_http_status_and_request_id(self):
         api_error = RuntimeError("upstream response includes private content")
         api_error.status = 403
+        api_error.code = 403
         api_error.reason = "Forbidden"
         api_error.headers = {"X-Request-Id": "request-123"}
         wrapped_error = RuntimeError("Broker API request failed")
@@ -122,6 +124,14 @@ class PortfolioFeatureTests(unittest.TestCase):
                 broker="Upstox",
             )
         self.assertIn("request_id=request-123", logs.output[0])
+
+        gemini_error = RuntimeError("Do not expose provider response content.")
+        gemini_error.code = 400
+        gemini_error.status = "INVALID_ARGUMENT"
+        summary = diagnostic_summary("Gemini portfolio analysis", gemini_error)
+        self.assertIn("HTTP 400", summary)
+        self.assertIn("INVALID_ARGUMENT", summary)
+        self.assertNotIn("provider response content", summary)
 
     def test_return_table_backgrounds_distinguish_gains_losses_and_neutral(self):
         frame = pd.DataFrame(
@@ -593,8 +603,9 @@ render_user_settings("registry-test-user")
                     ),
                 ):
                     app.run()
-                    connected_workspace_loaded = any(
-                        status.label == "Upstox data loaded" for status in app.status
+                    successful_sync_timestamp = app.session_state.last_sync
+                    persistent_sync_status_present = any(
+                        "data loaded" in status.label for status in app.status
                     )
                     app.run()
                     app.session_state["app_navigation"] = "F&O"
@@ -624,6 +635,10 @@ render_user_settings("registry-test-user")
             [tab.label for tab in app.tabs],
             [
                 ":material/home: Home",
+                "Equities · 0.0%",
+                "Trading · 0.0%",
+                "Mutual Funds · 0.0%",
+                "F&O · 0.0%",
                 ":material/show_chart: Equities",
                 ":material/swap_horiz: Trades",
                 ":material/query_stats: F&O",
@@ -655,7 +670,8 @@ render_user_settings("registry-test-user")
                 for header in app.subheader
             )
         )
-        self.assertTrue(connected_workspace_loaded)
+        self.assertIsNotNone(successful_sync_timestamp)
+        self.assertFalse(persistent_sync_status_present)
         self.assertTrue(fno_analysis_actions_present)
         self.assertTrue(any(button.key == "open_user_settings" for button in app.button))
         self.assertFalse(
@@ -783,6 +799,8 @@ render_user_settings("registry-test-user")
         self.assertEqual(summary["allocation"]["Trading"], 40)
         self.assertEqual(summary["pnl_by_asset"]["Trading"], 10)
         self.assertEqual(summary["cash"], 200)
+        equity_display = build_equity_holdings_display(equity, 316)
+        self.assertEqual(equity_display.loc[0, "Allocation_%"], 240 / 316 * 100)
         chart = build_allocation_chart(summary)
         self.assertEqual(len(chart.data), 3)
         self.assertTrue(all(trace.type == "bar" for trace in chart.data))
@@ -975,13 +993,19 @@ render_user_settings("settings-test-user")
         self.assertFalse(app.exception)
         app.button(key="add_ai_provider_config").click().run(timeout=20)
         self.assertTrue(
-            any(widget.label == "Suggested model" for widget in app.selectbox)
+            any(widget.label == "Model" for widget in app.selectbox)
         )
-        app.selectbox(key="settings_ai_editor_suggested_model").select(
+        self.assertEqual(
+            app.selectbox(key="settings_ai_editor_model_selection").value,
+            settings.llm_provider_models["Gemini"][0],
+        )
+        model_options = app.selectbox(key="settings_ai_editor_model_selection").options
+        self.assertEqual(model_options[-1], "Other")
+        app.selectbox(key="settings_ai_editor_model_selection").select(
             "gemini-2.5-flash"
         ).run(timeout=20)
         self.assertEqual(
-            app.text_input(key="settings_ai_editor_model").value,
+            app.selectbox(key="settings_ai_editor_model_selection").value,
             "gemini-2.5-flash",
         )
         app.selectbox(key="settings_ai_editor_provider").select(
@@ -991,7 +1015,10 @@ render_user_settings("settings-test-user")
             any(widget.label == "Provider name" for widget in app.text_input)
         )
         self.assertTrue(
-            any(widget.label == "Model" for widget in app.text_input)
+            any(widget.label == "Custom model" for widget in app.text_input)
+        )
+        self.assertTrue(
+            any(widget.label == "Add Provider" for widget in app.button)
         )
 
     def test_ai_provider_and_credentials_are_managed_in_user_settings(self):
@@ -1013,7 +1040,7 @@ render_user_settings("settings-test-user")
         self.assertFalse(app.exception)
         self.assertTrue(
             any(
-                widget.label == "+ AI provider config"
+                widget.label == "Add Provider"
                 for widget in app.button
             )
         )
@@ -1024,11 +1051,9 @@ render_user_settings("settings-test-user")
         self.assertTrue(
             any(widget.label == "API key" for widget in app.text_input)
         )
-        self.assertTrue(
-            any(widget.label == "Test provider setup" for widget in app.button)
-        )
+        self.assertFalse(any("Test provider" in widget.label for widget in app.button))
 
-    def test_custom_model_and_provider_setup_must_pass_test_before_save(self):
+    def test_custom_model_and_provider_can_save_without_setup_test(self):
         from services.user_settings import load_user_settings
 
         app_source = """
@@ -1048,7 +1073,7 @@ render_user_settings("ai-provider-test-user")
             with patch(
                 "services.user_settings.settings",
                 replace(settings, oauth_database_path=str(database_path)),
-            ):
+            ), patch("storage.factory.is_browser_runtime", return_value=False):
                 app = AppTest.from_string(app_source).run(timeout=20)
                 app.button(key="open_user_settings").click().run(timeout=20)
                 app.button(key="add_ai_provider_config").click().run(timeout=20)
@@ -1061,7 +1086,7 @@ render_user_settings("ai-provider-test-user")
                 app.text_input(
                     key="settings_ai_editor_api_key"
                 ).set_value("test-api-key").run(timeout=20)
-                app.text_input(key="settings_ai_editor_model").set_value(
+                app.text_input(key="settings_ai_editor_custom_model").set_value(
                     "openai/gpt-test"
                 ).run(timeout=20)
                 app.text_input(key="settings_ai_editor_base_url").set_value(
@@ -1071,16 +1096,6 @@ render_user_settings("ai-provider-test-user")
                     True
                 ).run(timeout=20)
 
-                with patch(
-                    "ui.user_settings.test_ai_provider_configuration"
-                ) as test_provider:
-                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
-                test_provider.assert_called_once_with(
-                    provider="Custom OpenAI-compatible",
-                    api_key="test-api-key",
-                    model="openai/gpt-test",
-                    base_url="https://openrouter.example/api/v1",
-                )
                 app.button(key="save_ai_provider_config").click().run(timeout=20)
                 saved = load_user_settings("ai-provider-test-user")
                 self.assertEqual(
@@ -1103,21 +1118,40 @@ render_user_settings("ai-provider-test-user")
                 self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 1)
                 config_id = saved["preferences"]["ai_provider_configs"][0]["id"]
                 safe_id = hashlib.sha256(config_id.encode("utf-8")).hexdigest()[:12]
-                app.button(key=f"edit_ai_config_{safe_id}").click().run(timeout=20)
+                app.button(key="add_ai_provider_config").click().run(timeout=20)
+                provider_options = app.selectbox(
+                    key="settings_ai_editor_provider"
+                ).options
+                configured_option = next(
+                    option
+                    for option in provider_options
+                    if option.startswith("Configured: OpenRouter")
+                )
+                self.assertEqual(provider_options[-1], configured_option)
+                app.selectbox(key="settings_ai_editor_provider").select(
+                    configured_option
+                ).run(timeout=20)
                 self.assertEqual(
                     app.text_input(key="settings_ai_editor_api_key").value,
                     "test-api-key",
                 )
-                app.text_input(key="settings_ai_editor_model").set_value(
+                self.assertEqual(
+                    app.text_input(key="settings_ai_editor_custom_model").value,
+                    "openai/gpt-test",
+                )
+                app.text_input(key="settings_ai_editor_custom_model").set_value(
                     "openai/gpt-updated"
                 ).run(timeout=20)
-                with patch("ui.user_settings.test_ai_provider_configuration"):
-                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
                 app.button(key="save_ai_provider_config").click().run(timeout=20)
                 saved = load_user_settings("ai-provider-test-user")
                 self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 1)
                 self.assertEqual(
                     saved["preferences"]["ai_provider_configs"][0]["model"],
+                    "openai/gpt-updated",
+                )
+                app.button(key=f"edit_ai_config_{safe_id}").click().run(timeout=20)
+                self.assertEqual(
+                    app.text_input(key="settings_ai_editor_custom_model").value,
                     "openai/gpt-updated",
                 )
                 app.button(key="add_ai_provider_config").click().run(timeout=20)
@@ -1127,13 +1161,12 @@ render_user_settings("ai-provider-test-user")
                 app.text_input(key="settings_ai_editor_api_key").set_value(
                     "groq-test-key"
                 ).run(timeout=20)
-                app.text_input(key="settings_ai_editor_model").set_value(
+                app.selectbox(key="settings_ai_editor_model_selection").select(
+                    "Other"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_custom_model").set_value(
                     "groq-custom-model"
                 ).run(timeout=20)
-                with patch(
-                    "ui.user_settings.test_ai_provider_configuration"
-                ):
-                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
                 app.button(key="save_ai_provider_config").click().run(timeout=20)
                 saved = load_user_settings("ai-provider-test-user")
                 self.assertEqual(len(saved["preferences"]["ai_provider_configs"]), 2)
@@ -1168,9 +1201,6 @@ render_user_settings("ai-provider-test-user")
                 app.button(key=f"delete_ai_config_{safe_id}").click().run(
                     timeout=20
                 )
-                app.button(key=f"confirm_delete_ai_config_{safe_id}").click().run(
-                    timeout=20
-                )
                 saved = load_user_settings("ai-provider-test-user")
                 self.assertEqual(
                     len(saved["preferences"]["ai_provider_configs"]),
@@ -1202,7 +1232,7 @@ render_user_settings("ai-session-only-user")
             with patch(
                 "services.user_settings.settings",
                 replace(settings, oauth_database_path=str(database_path)),
-            ):
+            ), patch("storage.factory.is_browser_runtime", return_value=False):
                 app = AppTest.from_string(app_source).run(timeout=20)
                 app.button(key="open_user_settings").click().run(timeout=20)
                 app.button(key="add_ai_provider_config").click().run(timeout=20)
@@ -1212,11 +1242,12 @@ render_user_settings("ai-session-only-user")
                 app.text_input(key="settings_ai_editor_api_key").set_value(
                     "private-session-key"
                 ).run(timeout=20)
-                app.text_input(key="settings_ai_editor_model").set_value(
+                app.selectbox(key="settings_ai_editor_model_selection").select(
+                    "Other"
+                ).run(timeout=20)
+                app.text_input(key="settings_ai_editor_custom_model").set_value(
                     "custom-openai-model"
                 ).run(timeout=20)
-                with patch("ui.user_settings.test_ai_provider_configuration"):
-                    app.button(key="test_ai_provider_setup").click().run(timeout=20)
                 app.button(key="save_ai_provider_config").click().run(timeout=20)
                 saved = load_user_settings("ai-session-only-user")
                 self.assertFalse(saved["sensitive_consent"])
@@ -1251,7 +1282,9 @@ render_user_settings("ai-session-only-user")
 
         gemini_client = MagicMock()
         gemini_client.__enter__.return_value = gemini_client
-        gemini_client.models.generate_content.return_value.text = "READY"
+        gemini_client.chats.create.return_value.send_message.return_value.text = (
+            "READY"
+        )
         with patch(
             "services.ai.genai.Client",
             return_value=gemini_client,
@@ -1263,8 +1296,11 @@ render_user_settings("ai-session-only-user")
             )
         create_client.assert_called_once_with(api_key="gemini-test-key")
         self.assertEqual(
-            gemini_client.models.generate_content.call_args.kwargs["model"],
+            gemini_client.chats.create.call_args.kwargs["model"],
             "gemini-test-model",
+        )
+        gemini_client.chats.create.return_value.send_message.assert_called_once_with(
+            "Reply with exactly: READY"
         )
 
         with self.assertRaisesRegex(ValueError, "Enter an API key"):

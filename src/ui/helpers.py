@@ -31,6 +31,65 @@ def broker_connect_button_css() -> str:
     )
 
 
+def signed_in_label_html(profile_name: str) -> str:
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:.35rem;'
+        'white-space:nowrap;color:rgba(250,250,250,.6);font-size:.875rem">'
+        '<svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" '
+        'fill="currentColor"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 '
+        '2c-4.42 0-8 2.24-8 5v1h16v-1c0-2.76-3.58-5-8-5Z"/></svg>'
+        "<span>Signed in as</span>"
+        f"<strong>{escape(profile_name)}</strong>"
+        "</span>"
+    )
+
+
+def workspace_subtabs_css(container_key: str) -> str:
+    scope = f".st-key-{container_key} [data-testid=\"stTabs\"]"
+    return (
+        "<style>"
+        f"{scope} [role=\"tablist\"]{{gap:.55rem;border:0;margin-bottom:.6rem}}"
+        f"{scope} [role=\"tab\"]{{flex:1 1 0;justify-content:center;"
+        "border:1px solid rgba(201,162,39,.32);border-radius:.7rem;"
+        "background:rgba(255,255,255,.025);padding:.6rem .5rem;"
+        "transition:background .18s ease,border-color .18s ease}}"
+        f"{scope} [role=\"tab\"]:hover{{background:rgba(255,255,255,.07);"
+        "border-color:rgba(230,184,0,.7)}}"
+        f"{scope} [role=\"tab\"][aria-selected=\"true\"]{{"
+        "background:linear-gradient(135deg,rgba(230,184,0,.16),"
+        "rgba(201,162,39,.06));border-color:#C9A227;color:#F2C94C}}"
+        f"{scope} [data-baseweb=\"tab-highlight\"]{{display:none}}"
+        "</style>"
+    )
+
+
+def analysis_tab_status_css(statuses: dict[int, str]) -> str:
+    colors = {
+        "positive": ("rgba(22, 101, 52, .28)", "rgba(74, 222, 128, .62)", "#86efac"),
+        "cautious": ("rgba(146, 64, 14, .3)", "rgba(251, 191, 36, .62)", "#fcd34d"),
+        "negative": ("rgba(127, 29, 29, .32)", "rgba(248, 113, 113, .62)", "#fca5a5"),
+    }
+    rules = []
+    for index, status in statuses.items():
+        palette = colors.get(status)
+        if palette is None:
+            continue
+        background, border, text = palette
+        selector = (
+            ".st-key-app_navigation_tabs [data-testid=\"stTabs\"] "
+            f"[role=\"tab\"]:nth-child({index})"
+        )
+        rules.append(
+            f"{selector}{{background:{background};border-color:{border};"
+            f"color:{text}}}"
+        )
+        rules.append(
+            f"{selector}[aria-selected=\"true\"]{{background:{background};"
+            f"border-color:{border};color:{text}}}"
+        )
+    return "<style>" + "".join(rules) + "</style>"
+
+
 def app_animation_css() -> str:
     return """<style>
 @keyframes guru-rise-in {

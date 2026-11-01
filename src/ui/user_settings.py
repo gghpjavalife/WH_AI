@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from uuid import uuid4
 from math import isfinite
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-import requests
 import streamlit as st
 
 from core.config import settings
 from core.constants import LLMProvider, LLMProviderBaseURL
 from core.logging import log_failure
-from services.ai import test_ai_provider_configuration
 from services.user_settings import load_user_settings, save_user_settings
 from services.database import DatabaseError, DatabaseSecurityError
 
@@ -193,6 +191,33 @@ def _broker_settings_widget_key(broker: str, field: str) -> str:
     return f"user_settings_{broker}_{field}"
 
 
+def default_broker_callback_url() -> str:
+    """Return the configured callback or the current app URL."""
+    if settings.upstox_redirect_uri:
+        return settings.upstox_redirect_uri
+    current_url = str(st.context.url or "")
+    if current_url:
+        parts = urlsplit(current_url)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
+    return settings.default_redirect_uri
+
+
+def _validate_callback_url(callback_url: str) -> str | None:
+    if not callback_url:
+        return None
+    try:
+        parts = urlsplit(callback_url)
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.netloc
+            or not parts.hostname
+        ):
+            raise ValueError
+    except ValueError:
+        return "Callback URL must be a complete http:// or https:// address."
+    return None
+
+
 def _split_phone_number(
     phone: str,
     saved_country_name: str = "",
@@ -221,6 +246,14 @@ def apply_settings_to_session(
     """Hydrate the existing broker and analysis flows from the user profile."""
     preferences = _mapping(user_settings.get("preferences"))
     sensitive = _mapping(user_settings.get("sensitive"))
+    callback_url = str(
+        settings.upstox_redirect_uri
+        or preferences.get("broker_callback_url")
+        or default_broker_callback_url()
+    ).strip()
+    st.session_state["broker_callback_url"] = callback_url
+    if initialize_form_state:
+        st.session_state["settings_broker_callback_url"] = callback_url
     profile = _mapping(sensitive.get("profile"))
     legacy_broker_credentials = _mapping(sensitive.get("broker_credentials"))
     ai_api_keys = _mapping(sensitive.get("ai_api_keys"))
@@ -597,38 +630,58 @@ def _selected_ai_configuration() -> dict[str, str]:
         ).strip()
         if not provider_selection:
             raise ValueError("Select or enter an AI provider.")
-        if len(provider_selection) > 80:
+        configured = _configured_ai_provider_options().get(provider_selection)
+        if configured:
+            provider = str(configured["provider"])
+            custom_provider_name = (
+                str(
+                    st.session_state.get("settings_ai_editor_provider_name")
+                    or configured.get("name", "")
+                ).strip()
+                if provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+                else ""
+            )
+            config_id = str(configured.get("id", ""))
+            provider_label = custom_provider_name or provider
+        else:
+            provider = (
+                provider_selection
+                if provider_selection in PROVIDER_OPTIONS
+                else LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+            )
+            custom_provider_name = (
+                str(st.session_state.get("settings_ai_editor_provider_name", "")).strip()
+                if provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+                and provider_selection == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+                else provider_selection
+                if provider_selection not in PROVIDER_OPTIONS
+                else ""
+            )
+            config_id = str(st.session_state.get("settings_ai_editor_id", ""))
+            provider_label = custom_provider_name or provider_selection
+        if not configured and len(provider_selection) > 80:
             raise ValueError("Provider names must be 80 characters or fewer.")
-        known_provider = provider_selection in PROVIDER_OPTIONS
-        provider = (
-            provider_selection
-            if known_provider
-            else LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
-        )
-        custom_provider_name = (
-            str(
-                st.session_state.get("settings_ai_editor_provider_name", "")
-            ).strip()
-            if provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
-            and known_provider
-            else provider_selection
-            if not known_provider
-            else ""
-        )
+        if len(custom_provider_name) > 80:
+            raise ValueError("Provider names must be 80 characters or fewer.")
         if (
             provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
             and not custom_provider_name
         ):
             raise ValueError("Enter a name for the custom AI provider.")
-        provider_label = custom_provider_name or provider_selection
         api_key = str(
             st.session_state.get("settings_ai_editor_api_key", "")
         ).strip()
-        model = str(st.session_state.get("settings_ai_editor_model", "")).strip()
+        selected_model = str(
+            st.session_state.get("settings_ai_editor_model_selection", "")
+        ).strip()
+        model = (
+            str(st.session_state.get("settings_ai_editor_custom_model", "")).strip()
+            if selected_model == "Other"
+            else selected_model
+        )
         base_url = str(
             st.session_state.get("settings_ai_editor_base_url", "")
         ).strip()
-        config_id = str(st.session_state.get("settings_ai_editor_id", ""))
         if len(model) > 200:
             raise ValueError("Model IDs must be 200 characters or fewer.")
         return {
@@ -684,19 +737,39 @@ def _selected_ai_configuration() -> dict[str, str]:
     }
 
 
-def _ai_test_fingerprint(configuration: dict[str, str]) -> str:
-    encoded = json.dumps(
-        configuration,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _configured_ai_provider_options() -> dict[str, dict[str, Any]]:
+    configurations = [
+        item
+        for item in st.session_state.get("settings_ai_provider_configs", [])
+        if isinstance(item, dict)
+    ]
+    options: dict[str, dict[str, Any]] = {}
+    for configuration in configurations:
+        name = str(
+            configuration.get("name")
+            or configuration.get("provider", "Provider")
+        )
+        provider = str(configuration.get("provider", ""))
+        model = str(configuration.get("model", ""))
+        label = f"Configured: {name} ({provider}; {model})"
+        if label in options:
+            label = f"{label} [{str(configuration.get('id', ''))[:8]}]"
+        options[label] = configuration
+    return options
 
 
 def _set_ai_editor(configuration: dict[str, Any] | None = None) -> None:
     configuration = configuration or {}
     st.session_state["settings_ai_editor_id"] = str(configuration.get("id", ""))
-    st.session_state["settings_ai_editor_provider"] = str(
+    configured_option = next(
+        (
+            label
+            for label, saved in _configured_ai_provider_options().items()
+            if str(saved.get("id", "")) == str(configuration.get("id", ""))
+        ),
+        "",
+    )
+    st.session_state["settings_ai_editor_provider"] = configured_option or str(
         configuration.get("provider", PROVIDER_OPTIONS[0])
     )
     st.session_state["settings_ai_editor_provider_name"] = str(
@@ -708,11 +781,13 @@ def _set_ai_editor(configuration: dict[str, Any] | None = None) -> None:
         ).get(str(configuration.get("id", "")), "")
     )
     model = str(configuration.get("model", ""))
-    st.session_state["settings_ai_editor_model"] = model
     provider = str(configuration.get("provider", PROVIDER_OPTIONS[0]))
     models = settings.llm_provider_models.get(provider, ())
-    st.session_state["settings_ai_editor_suggested_model"] = (
-        model if model in models else ""
+    st.session_state["settings_ai_editor_model_selection"] = (
+        model if model in models else "Other" if model else (models[0] if models else "Other")
+    )
+    st.session_state["settings_ai_editor_custom_model"] = (
+        "" if model in models else model
     )
     st.session_state["settings_ai_editor_base_url"] = str(
         configuration.get("base_url", "")
@@ -722,8 +797,26 @@ def _set_ai_editor(configuration: dict[str, Any] | None = None) -> None:
 
 
 def _reset_ai_editor_model() -> None:
-    st.session_state["settings_ai_editor_model"] = ""
-    st.session_state["settings_ai_editor_suggested_model"] = ""
+    provider_selection = str(
+        st.session_state.get("settings_ai_editor_provider", "")
+    ).strip()
+    if provider_selection in _configured_ai_provider_options():
+        configuration = _configured_ai_provider_options()[provider_selection]
+        _set_ai_editor(configuration)
+        return
+    st.session_state["settings_ai_editor_id"] = ""
+    provider = (
+        provider_selection
+        if provider_selection in PROVIDER_OPTIONS
+        else LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+    )
+    models = settings.llm_provider_models.get(provider, ())
+    st.session_state["settings_ai_editor_model_selection"] = (
+        models[0] if models else "Other"
+    )
+    st.session_state["settings_ai_editor_custom_model"] = ""
+    st.session_state["settings_ai_editor_api_key"] = ""
+    st.session_state["settings_ai_editor_base_url"] = ""
     if (
         st.session_state.get("settings_ai_editor_provider")
         == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
@@ -745,24 +838,6 @@ def _reset_ai_editor_model() -> None:
             != LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
         ):
             st.session_state["settings_ai_editor_provider_name"] = ""
-    tested = dict(
-        _mapping(st.session_state.get("tested_ai_provider_fingerprints"))
-    )
-    tested.pop(
-        str(st.session_state.get("settings_ai_editor_id", "")) or "new",
-        None,
-    )
-    st.session_state["tested_ai_provider_fingerprints"] = tested
-
-
-def _use_suggested_ai_model() -> None:
-    selected_model = str(
-        st.session_state.get("settings_ai_editor_suggested_model", "")
-    )
-    if selected_model:
-        st.session_state["settings_ai_editor_model"] = selected_model
-
-
 def _ai_config_matches(
     existing: dict[str, Any],
     configuration: dict[str, str],
@@ -794,10 +869,19 @@ def _delete_ai_provider_configuration(
     owner_identifier: str,
     config_id: str,
 ) -> None:
-    configurations = [
+    current_configurations = [
         dict(item)
         for item in st.session_state.get("settings_ai_provider_configs", [])
-        if isinstance(item, dict) and str(item.get("id", "")) != config_id
+        if isinstance(item, dict)
+    ]
+    removed = next(
+        (item for item in current_configurations if str(item.get("id", "")) == config_id),
+        None,
+    )
+    if removed is None:
+        raise ValueError("The provider configuration no longer exists.")
+    configurations = [
+        item for item in current_configurations if str(item.get("id", "")) != config_id
     ]
     keys = dict(
         _mapping(st.session_state.get("settings_ai_provider_config_keys"))
@@ -834,19 +918,14 @@ def _delete_ai_provider_configuration(
     sensitive = _collect_sensitive_settings()
     sensitive["ai_provider_config_keys"] = keys
     api_keys = dict(_mapping(sensitive.get("ai_api_keys")))
-    removed = next(
-        (
-            item
-            for item in st.session_state.get("settings_ai_provider_configs", [])
-            if isinstance(item, dict) and str(item.get("id", "")) == config_id
-        ),
-        None,
-    )
     if removed and not any(
         item.get("provider") == removed.get("provider")
         for item in configurations
     ):
         api_keys.pop(str(removed.get("provider", "")), None)
+        models = dict(_mapping(preferences.get("ai_models")))
+        models.pop(str(removed.get("provider", "")), None)
+        preferences["ai_models"] = models
     sensitive["ai_api_keys"] = api_keys
     save_user_settings(
         owner_identifier,
@@ -857,6 +936,14 @@ def _delete_ai_provider_configuration(
     st.session_state["settings_ai_provider_configs"] = configurations
     st.session_state["settings_ai_provider_config_keys"] = keys
     st.session_state["settings_ai_active_config_id"] = active_config_id
+    session_keys = dict(
+        _mapping(st.session_state.get("analysis_setup_session_keys"))
+    )
+    session_keys.pop(config_id, None)
+    st.session_state["analysis_setup_session_keys"] = session_keys
+    if str(st.session_state.get("settings_ai_editor_id", "")) == config_id:
+        st.session_state["settings_ai_editor_id"] = ""
+        st.session_state["settings_ai_editor_open"] = False
     st.session_state["user_settings_form_cache"] = {
         "owner": owner_identifier,
         "sensitive": sensitive,
@@ -1003,7 +1090,7 @@ def _render_ai_provider_configurations(owner_identifier: str) -> None:
         if isinstance(item, dict)
     ]
     if st.button(
-        "+ AI provider config",
+        "Add Provider",
         key="add_ai_provider_config",
         type="secondary",
         icon=":material/add:",
@@ -1061,27 +1148,11 @@ def _render_ai_provider_configurations(owner_identifier: str) -> None:
                     _set_ai_editor(configuration)
                     st.rerun()
             with row[4]:
-                if st.session_state.get("settings_ai_delete_pending") == config_id:
-                    confirm_delete = st.button(
-                        "Confirm",
-                        key=f"confirm_delete_ai_config_{safe_id}",
-                        type="primary",
-                    )
-                    cancel_delete = st.button(
-                        "Cancel",
-                        key=f"cancel_delete_ai_config_{safe_id}",
-                    )
-                    if cancel_delete:
-                        st.session_state.pop("settings_ai_delete_pending", None)
-                        st.rerun()
-                elif st.button("Delete", key=f"delete_ai_config_{safe_id}"):
-                    st.session_state["settings_ai_delete_pending"] = config_id
-                    st.rerun()
-                else:
-                    confirm_delete = False
-                if (
-                    st.session_state.get("settings_ai_delete_pending") == config_id
-                    and confirm_delete
+                if st.button(
+                    "Delete",
+                    key=f"delete_ai_config_{safe_id}",
+                    icon=":material/delete:",
+                    help="Delete this provider configuration.",
                 ):
                     try:
                         _delete_ai_provider_configuration(
@@ -1098,7 +1169,6 @@ def _render_ai_provider_configurations(owner_identifier: str) -> None:
                     ) as error:
                         st.error(f"Provider configuration could not be deleted: {error}")
                     else:
-                        st.session_state.pop("settings_ai_delete_pending", None)
                         st.session_state["settings_ai_editor_feedback"] = (
                             "Provider configuration deleted."
                         )
@@ -1115,7 +1185,7 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
         )
         provider_selection = st.selectbox(
             "AI provider",
-            PROVIDER_OPTIONS,
+            (*PROVIDER_OPTIONS, *_configured_ai_provider_options()),
             accept_new_options=True,
             placeholder="Search or select a provider",
             key="settings_ai_editor_provider",
@@ -1126,15 +1196,28 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
             ),
         )
         provider_selection = str(provider_selection).strip()
-        is_custom = provider_selection not in PROVIDER_OPTIONS or (
-            provider_selection == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+        selected_configuration = _configured_ai_provider_options().get(
+            provider_selection
         )
         provider = (
-            provider_selection
+            str(selected_configuration["provider"])
+            if selected_configuration
+            else provider_selection
             if provider_selection in PROVIDER_OPTIONS
             else LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
         )
-        if provider_selection == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value:
+        is_custom = (
+            provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+            or (
+                not selected_configuration
+                and provider_selection not in PROVIDER_OPTIONS
+            )
+        )
+        if (
+            provider_selection == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+            or selected_configuration
+            and provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+        ):
             st.text_input(
                 "Provider name",
                 key="settings_ai_editor_provider_name",
@@ -1154,20 +1237,29 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
             help="The API key is confidential and is saved only with your consent.",
         )
         models = settings.llm_provider_models.get(provider, ())
-        if models:
-            st.selectbox(
-                "Suggested model",
-                models,
-                key="settings_ai_editor_suggested_model",
-                on_change=_use_suggested_ai_model,
-                placeholder="Choose a suggested model (optional)",
-                help="Choose a suggested model or enter a custom model ID below.",
+        model_options = (*models, "Other")
+        if (
+            st.session_state.get("settings_ai_editor_model_selection")
+            not in model_options
+        ):
+            st.session_state["settings_ai_editor_model_selection"] = (
+                models[0] if models else "Other"
             )
-        st.text_input(
+            st.session_state["settings_ai_editor_custom_model"] = str(
+                st.session_state.get("settings_ai_editor_custom_model", "")
+            )
+        model_selection = st.selectbox(
             "Model",
-            key="settings_ai_editor_model",
-            placeholder="Enter a custom model ID",
+            model_options,
+            key="settings_ai_editor_model_selection",
+            help="Choose a suggested model or select Other to enter a model ID.",
         )
+        if model_selection == "Other":
+            st.text_input(
+                "Custom model",
+                key="settings_ai_editor_custom_model",
+                placeholder="Enter a custom model ID",
+            )
         if is_custom:
             st.text_input(
                 "API base URL",
@@ -1175,9 +1267,8 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
                 placeholder="https://api.example.com/v1",
             )
         st.caption(
-            "Test sends a short request with no portfolio data. Provider charges "
-            "may apply. Saving an API key for future sessions requires your "
-            "explicit encrypted-storage consent."
+            "Saving an API key for future sessions requires your explicit "
+            "encrypted-storage consent."
         )
         editor_message = str(
             st.session_state.pop("settings_ai_editor_error", "")
@@ -1190,28 +1281,7 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
             configuration = None
             st.error(str(error))
 
-        button_column, save_column, cancel_column = st.columns((1.4, 1.2, 0.7))
-        with button_column:
-            test_clicked = st.button(
-                "Test provider setup",
-                key="test_ai_provider_setup",
-                icon=":material/wifi_tethering:",
-                disabled=not bool(
-                    configuration
-                    and configuration["api_key"]
-                    and configuration["model"]
-                ),
-            )
-        tested = _mapping(st.session_state.get("tested_ai_provider_fingerprints"))
-        fingerprint_key = (
-            (configuration["config_id"] or "new")
-            if configuration
-            else ""
-        )
-        already_tested = bool(
-            configuration
-            and tested.get(fingerprint_key) == _ai_test_fingerprint(configuration)
-        )
+        save_column, cancel_column = st.columns((1.2, 0.7))
         duplicate_configuration = bool(
             configuration
             and any(
@@ -1234,42 +1304,11 @@ def _render_ai_provider_editor(owner_identifier: str) -> None:
                 key="save_ai_provider_config",
                 type="primary",
                 icon=":material/save:",
-                disabled=not (
-                    already_tested and not duplicate_configuration
-                ),
+                disabled=duplicate_configuration,
                 width="stretch",
             )
         with cancel_column:
             cancel_clicked = st.button("Cancel", key="cancel_ai_provider_editor")
-
-        if test_clicked and configuration:
-            try:
-                test_ai_provider_configuration(
-                    provider=configuration["provider"],
-                    api_key=configuration["api_key"],
-                    model=configuration["model"],
-                    base_url=configuration["base_url"],
-                )
-            except (
-                OSError,
-                requests.RequestException,
-                RuntimeError,
-                ValueError,
-            ) as error:
-                tested = dict(tested)
-                tested.pop(fingerprint_key, None)
-                st.session_state["tested_ai_provider_fingerprints"] = tested
-                st.session_state["settings_ai_editor_error"] = (
-                    f"Provider setup test failed: {error}"
-                )
-            else:
-                tested = dict(tested)
-                tested[fingerprint_key] = _ai_test_fingerprint(configuration)
-                st.session_state["tested_ai_provider_fingerprints"] = tested
-                st.session_state["settings_ai_editor_feedback"] = (
-                    f"{configuration['provider_selection']} setup test succeeded."
-                )
-            st.rerun()
 
         if save_clicked and configuration:
             try:
@@ -1404,8 +1443,12 @@ def _save(owner_identifier: str) -> None:
         if active_configuration
         else str(st.session_state.get("llm_custom_base_url", ""))
     )
+    callback_url = str(
+        st.session_state.get("settings_broker_callback_url", "")
+    ).strip()
     preferences = {
         "broker_profiles": st.session_state.get("registered_broker_profiles", []),
+        "broker_callback_url": callback_url,
         "ai_provider_configs": ai_configurations,
         "ai_active_config_id": active_config_id,
         "ai_provider": ai_provider,
@@ -1419,6 +1462,10 @@ def _save(owner_identifier: str) -> None:
             st.session_state.get("settings_realized_daily_loss_pct", 0.0)
         ),
     }
+    callback_error = _validate_callback_url(callback_url)
+    if callback_error:
+        _show_save_error(callback_error)
+        return
     allocation = preferences["max_allocation_pct"]
     daily_loss = preferences["realized_daily_loss_pct"]
     if not isfinite(allocation) or not 0 <= allocation <= 100:
@@ -1496,6 +1543,18 @@ def _render_broker_registry() -> None:
         "each account below; credentials are confidential and saved only with "
         "your encrypted-storage consent."
     )
+    with st.expander("OAuth callback URL", expanded=False):
+        st.text_input(
+            "Callback URL",
+            key="settings_broker_callback_url",
+            disabled=bool(settings.upstox_redirect_uri),
+            help=(
+                "Shared by Upstox, Zerodha, and Dhan. Register this exact address "
+                "in the broker app. Leave blank to use the current app address."
+            ),
+        )
+        if settings.upstox_redirect_uri:
+            st.caption("This value is managed by the app configuration.")
     for broker in BROKER_CHOICES:
         with st.expander(
             f"{broker} credentials",
@@ -1621,7 +1680,9 @@ def _settings_dialog(owner_identifier: str) -> None:
         st.error(str(feedback.get("message", "")), icon=":material/error:")
 
     profile_tab, broker_tab, ai_tab, risk_tab = st.tabs(
-        ["Profile", "Brokers", "AI providers", "Risk"]
+        ["Profile", "Brokers", "AI providers", "Risk"],
+        key="user_settings_tabs",
+        on_change="rerun",
     )
     with profile_tab:
         st.text_input("Your name", key="settings_profile_name")

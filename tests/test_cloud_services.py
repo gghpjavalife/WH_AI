@@ -248,7 +248,17 @@ class CloudServiceTests(unittest.TestCase):
             "choices": [
                 {
                     "message": {
-                        "content": '{"analysis":"review","cash_deployment_list":[]}'
+                        "content": (
+                            '{"analysis":"review","assessment":'
+                            '{"sentiment":"cautious","summary":"Review risk first.",'
+                            '"strengths":["No unverified deployment."],'
+                            '"warnings":["Concentration is elevated."],'
+                            '"suggestions":["Review position sizing."],'
+                            '"scenarios":[{"title":"Downside","condition":'
+                            '"Concentration worsens.","implication":'
+                            '"Reassess exposure."}]},'
+                            '"cash_deployment_list":[]}'
+                        )
                     }
                 }
             ]
@@ -265,6 +275,11 @@ class CloudServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result["analysis"], "review")
+        self.assertEqual(result["assessment"]["sentiment"], "cautious")
+        self.assertEqual(
+            result["assessment"]["warnings"], ["Concentration is elevated."]
+        )
+        self.assertNotIn("scenarios", result["assessment"])
         self.assertEqual(
             post.call_args.args[0],
             "https://api.groq.com/openai/v1/chat/completions",

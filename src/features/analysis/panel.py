@@ -1,11 +1,288 @@
 """Full-portfolio and scoped AI analysis controls."""
 
 from collections.abc import Callable
+from contextlib import nullcontext
+from datetime import datetime
+import html
+import re
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
+from core.config import settings
 from core.constants import LLMProvider
+
+
+def analysis_sentiment(analysis: object) -> str | None:
+    if not isinstance(analysis, dict):
+        return None
+    assessment = analysis.get("assessment")
+    if not isinstance(assessment, dict):
+        return None
+    sentiment = assessment.get("sentiment")
+    return (
+        sentiment
+        if isinstance(sentiment, str)
+        and sentiment in {"positive", "cautious", "negative"}
+        else None
+    )
+
+
+def analysis_status_icon(analysis: object) -> str | None:
+    sentiment = analysis_sentiment(analysis)
+    if sentiment is None:
+        return None
+    return "🟢" if sentiment == "positive" else "🔴"
+
+
+def analysis_mentions_equity_holdings(
+    analysis: object, holdings: pd.DataFrame
+) -> bool:
+    if not isinstance(analysis, dict) or "Ticker" not in holdings.columns:
+        return False
+    tickers = {
+        str(ticker).strip().upper()
+        for ticker in holdings["Ticker"].dropna()
+        if str(ticker).strip()
+    }
+    if not tickers:
+        return False
+
+    text = " ".join(
+        [
+            str(analysis.get("analysis", "")),
+            str(analysis.get("assessment", "")),
+        ]
+    ).upper()
+    return any(
+        re.search(rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])", text)
+        for ticker in tickers
+    )
+
+
+def format_analysis_time(value: object) -> str:
+    if isinstance(value, datetime):
+        analyzed_at = value
+    elif isinstance(value, str):
+        try:
+            analyzed_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return "Analysis time unavailable"
+    else:
+        return "Analysis time unavailable"
+
+    timezone = ZoneInfo(settings.timezone)
+    if analyzed_at.tzinfo is None:
+        analyzed_at = analyzed_at.replace(tzinfo=timezone)
+    return analyzed_at.astimezone(timezone).strftime("%d %b %Y · %H:%M:%S %Z")
+
+
+def _analysis_time_caption(
+    value: object,
+    metadata: dict[str, object] | None,
+    *,
+    empty_label: str,
+) -> tuple[str, str]:
+    analysis_time = format_analysis_time(value) if value else empty_label
+    details = [analysis_time]
+    if metadata:
+        provenance = [
+            f"{label}: {metadata[key]}"
+            for key, label in (("provider", "Provider"), ("model", "Model"))
+            if metadata.get(key)
+        ]
+        details.extend(provenance)
+    return "Last AI analysis:", " · ".join(details)
+
+
+def _render_analysis_header(
+    run_button: Callable[[], None],
+    *,
+    last_analyzed_at: object,
+    analysis_metadata: dict[str, object] | None,
+    empty_label: str,
+) -> None:
+    action_column, time_column = st.columns(
+        [1.8, 5.2],
+        vertical_alignment="center",
+        gap="medium",
+    )
+    with action_column:
+        run_button()
+    with time_column:
+        caption, analysis_details = _analysis_time_caption(
+            last_analyzed_at,
+            analysis_metadata,
+            empty_label=empty_label,
+        )
+        st.markdown(
+            '<div style="text-align:right;white-space:nowrap;'
+            'color:rgba(250,250,250,.6)">'
+            f"{html.escape(caption)}&nbsp;<strong>"
+            f"{html.escape(analysis_details)}</strong></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_analysis_brief(
+    analysis: dict[str, object] | None,
+    *,
+    title: str,
+    compact: bool = False,
+    placeholder: bool = False,
+    collapsible: bool = False,
+    run_analysis: Callable[[], None] | None = None,
+    last_analyzed_at: object = None,
+    analysis_metadata: dict[str, object] | None = None,
+    storage_error: str | None = None,
+) -> None:
+    analysis_job = st.session_state.get("analysis_job")
+    analysis_running = bool(
+        analysis_job and not analysis_job["future"].done()
+    )
+    analysis_available = analysis is not None
+    run_button_label = (
+        analysis_progress_label(analysis_job)
+        if analysis_running
+        else (
+            "Refresh AI analysis"
+            if analysis_available
+            else "Run AI portfolio analysis"
+        )
+    )
+
+    def render_run_button() -> None:
+        if run_analysis and st.button(
+            run_button_label,
+            type="primary",
+            key="run_analysis_home",
+            icon=":material/auto_awesome:",
+            disabled=analysis_running,
+        ):
+            run_analysis()
+
+    if not analysis_available:
+        if placeholder:
+            section = (
+                st.expander(title, expanded=False, icon=":material/auto_awesome:")
+                if collapsible
+                else st.container(border=True)
+            )
+            with section:
+                _render_analysis_header(
+                    render_run_button,
+                    last_analyzed_at=last_analyzed_at,
+                    analysis_metadata=analysis_metadata,
+                    empty_label="Not run yet",
+                )
+                if storage_error:
+                    st.warning(storage_error)
+        return
+
+    assessment = analysis.get("assessment")
+    if not isinstance(assessment, dict):
+        assessment = {
+            "sentiment": "cautious",
+            "summary": str(analysis.get("analysis", "")).strip()
+            or "The provider did not return categorized assessment details.",
+            "strengths": [],
+            "warnings": ["Structured assessment details are unavailable."],
+            "suggestions": [],
+        }
+    summary = assessment.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = str(analysis.get("analysis", "")).strip() or (
+            "The provider did not return categorized assessment details."
+        )
+    section = (
+        st.expander(title, expanded=False, icon=":material/auto_awesome:")
+        if collapsible
+        else nullcontext()
+    )
+    with section:
+        _render_analysis_header(
+            render_run_button,
+            last_analyzed_at=last_analyzed_at,
+            analysis_metadata=analysis_metadata,
+            empty_label="Time unavailable",
+        )
+        if storage_error:
+            st.warning(storage_error)
+        st.write(summary)
+
+        if not compact:
+            narrative = str(analysis.get("analysis", "")).strip()
+            if narrative and narrative != summary:
+                with st.expander(
+                    "Detailed portfolio overview",
+                    icon=":material/subject:",
+                ):
+                    st.write(narrative)
+
+        categories = (
+            ("Strengths", "strengths", ":material/thumb_up:", "green"),
+            ("Warnings", "warnings", ":material/thumb_down:", "red"),
+            ("Suggestions", "suggestions", ":material/lightbulb:", "blue"),
+        )
+        columns = st.columns(len(categories))
+        for column, (heading, key, icon, color) in zip(
+            columns, categories, strict=True
+        ):
+            with column:
+                st.badge(heading, icon=icon, color=color)
+                items = assessment.get(key, [])
+                if isinstance(items, list) and items:
+                    for item in items:
+                        st.markdown(f"- {item}")
+                else:
+                    st.caption(
+                        f"No {heading.lower()} identified from the supplied data."
+                    )
+
+
+def portfolio_analysis_is_configured() -> bool:
+    selected_provider = str(
+        st.session_state.get("llm_provider", LLMProvider.GEMINI.value)
+    )
+    provider_slug = selected_provider.lower().replace(" ", "_").replace("-", "_")
+    api_key_widget = (
+        "user_gemini_api_key"
+        if selected_provider == LLMProvider.GEMINI.value
+        else f"user_llm_api_key_{provider_slug}"
+    )
+    model = str(
+        st.session_state.get(
+            f"llm_model_selection_{provider_slug}",
+            next(
+                iter(settings.llm_provider_models.get(selected_provider, ())),
+                "",
+            ),
+        )
+    ).strip()
+    if selected_provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value:
+        model = model and bool(
+            str(
+                st.session_state.get(
+                    "llm_custom_base_url", settings.llm_custom_base_url
+                )
+            ).strip()
+        )
+    return bool(str(st.session_state.get(api_key_widget, "")).strip() and model)
+
+
+def analysis_progress_label(analysis_job: dict[str, object] | None) -> str:
+    if not analysis_job:
+        return "Run AI portfolio analysis"
+    if analysis_job.get("stage") == "quotes":
+        return "Refreshing broker quotes..."
+    scope = str(analysis_job.get("scope", "all"))
+    scope_label = {
+        "all": "portfolio",
+        "equity": "equities",
+        "trading": "trading positions",
+    }.get(scope, scope.replace("_", " "))
+    return f"Analyzing {scope_label}..."
 
 
 def render_analysis_panel(
@@ -14,6 +291,10 @@ def render_analysis_panel(
     run_analysis: Callable[[str], None],
     show_approved_trades: Callable[[str], None],
 ) -> None:
+    analysis_job = st.session_state.get("analysis_job")
+    analysis_running = bool(
+        analysis_job and not analysis_job["future"].done()
+    )
     if scope == "all":
         if st.session_state.ai_settings_prompt:
             st.warning(st.session_state.ai_settings_prompt)
@@ -21,40 +302,46 @@ def render_analysis_panel(
             st.session_state.get("llm_provider", LLMProvider.GEMINI.value)
         )
         provider_slug = selected_provider.lower().replace(" ", "_").replace("-", "_")
+        model = str(
+            st.session_state.get(f"llm_model_selection_{provider_slug}", "")
+        ).strip()
         api_key_widget = (
             "user_gemini_api_key"
             if selected_provider == LLMProvider.GEMINI.value
             else f"user_llm_api_key_{provider_slug}"
         )
-        model_key = f"llm_model_selection_{provider_slug}"
-        model = str(st.session_state.get(model_key, "")).strip()
-        api_key_ready = bool(
-            str(st.session_state.get(api_key_widget, "")).strip()
-        )
-        model_ready = bool(model)
-        if selected_provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value:
-            model_ready = model_ready and bool(
-                str(st.session_state.get("llm_custom_base_url", "")).strip()
-            )
         st.caption(
-            f"AI setup: **{selected_provider}** · **{model or 'model not set'}**. "
+            f"AI setup: **{selected_provider}** · "
+            f"**{model or 'model not set'}**. "
             "Manage providers and credentials in User settings."
         )
-        if not api_key_ready:
-            st.info("Add an API key for the selected provider in User settings.")
+        if not str(st.session_state.get(api_key_widget, "")).strip():
+            st.info(
+                "Run portfolio analysis to enter missing provider settings for "
+                "this session."
+            )
         if st.button(
-            "Run AI portfolio analysis",
+            analysis_progress_label(analysis_job)
+            if analysis_running
+            else (
+                "Refresh portfolio analysis"
+                if st.session_state.get("analysis_results", {}).get(scope)
+                else "Run portfolio analysis"
+            ),
             type="primary",
             key=f"run_analysis_{scope}",
-            disabled=not (api_key_ready and model_ready),
             icon=":material/auto_awesome:",
+            disabled=analysis_running,
         ):
             run_analysis(scope)
 
     elif st.button(
-        f"Run {title} analysis",
+        analysis_progress_label(analysis_job)
+        if analysis_running
+        else f"Run {title} analysis",
         type="secondary",
         key=f"run_analysis_{scope}",
+        disabled=analysis_running,
     ):
         run_analysis(scope)
 
@@ -135,7 +422,12 @@ def render_analysis_panel(
         f"Scenario budget: ₹{float(st.session_state.planning_budget_inr):,.2f} · "
         f"actual broker cash: ₹{float(st.session_state.balance):,.2f}"
     )
-    st.write(analysis["analysis"])
+    if scope != "all":
+        render_analysis_brief(
+            analysis,
+            title=f"{title.title()} AI brief",
+            compact=True,
+        )
     candidates = analysis["cash_deployment_list"]
     if candidates:
         st.dataframe(pd.DataFrame(candidates), hide_index=True)

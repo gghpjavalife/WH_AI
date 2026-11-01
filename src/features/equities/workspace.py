@@ -6,14 +6,14 @@ import pandas as pd
 import streamlit as st
 
 from ..analysis.panel import render_analysis_panel
-from .scanner import render_market_scanner
 from ..shared.performance import style_returns
+from .scanner import render_market_scanner
+from ui.helpers import workspace_subtabs_css
 
 
-def render_equity(holdings: pd.DataFrame) -> None:
-    if holdings.empty:
-        st.info("No equity holdings were returned by the connected broker.")
-        return
+def build_equity_holdings_display(
+    holdings: pd.DataFrame, total_investments: float | None = None
+) -> pd.DataFrame:
     display = holdings.copy()
     display["Investment"] = display["Qty"].abs() * display["Avg_Price"]
     display["Market_Value"] = display["Qty"] * display["LTP"]
@@ -24,6 +24,24 @@ def render_equity(holdings: pd.DataFrame) -> None:
         else 0.0,
         axis=1,
     )
+    allocation_base = total_investments
+    if allocation_base is None:
+        allocation_base = float(display["Market_Value"].abs().sum())
+    display["Allocation_%"] = (
+        display["Market_Value"].abs().div(allocation_base).fillna(0.0) * 100
+        if allocation_base > 0
+        else 0.0
+    )
+    return display
+
+
+def render_equity(
+    holdings: pd.DataFrame, total_investments: float | None = None
+) -> None:
+    if holdings.empty:
+        st.info("No equity holdings were returned by the connected broker.")
+        return
+    display = build_equity_holdings_display(holdings, total_investments)
     theme = getattr(st.context.theme, "type", "light")
     st.dataframe(style_returns(display, theme=theme), hide_index=True)
 
@@ -36,16 +54,32 @@ def render_equities_workspace(
     symbols: list[str],
     run_analysis: Callable[..., None],
     show_approved_trades: Callable[[str], None],
+    total_investments: float | None = None,
 ) -> None:
     if data_error:
         st.warning(data_error)
-    render_equity(holdings)
-    render_analysis_panel(
-        "equity", "equity", run_analysis, show_approved_trades
-    )
-    with st.expander("Market scanner", icon=":material/filter_list:"):
-        render_market_scanner(
-            broker_connected=broker_connected,
-            scope="Equities",
-            symbols=symbols,
+    portfolio_value = total_investments
+    if portfolio_value is None:
+        portfolio_value = float(
+            (holdings["Qty"].abs() * holdings["LTP"]).sum()
+        ) if not holdings.empty else 0.0
+    equity_value = float(
+        (holdings["Qty"].abs() * holdings["LTP"]).sum()
+    ) if not holdings.empty else 0.0
+    share = equity_value / portfolio_value * 100 if portfolio_value > 0 else 0.0
+    with st.container(key="equity_workspace_tabs"):
+        st.html(workspace_subtabs_css("equity_workspace_tabs"))
+        holdings_tab, scanner_tab = st.tabs(
+            [f"Holdings · {share:.1f}%", "Market Scanner"]
         )
+        with holdings_tab:
+            render_equity(holdings, total_investments)
+            render_analysis_panel(
+                "equity", "equity", run_analysis, show_approved_trades
+            )
+        with scanner_tab:
+            render_market_scanner(
+                broker_connected=broker_connected,
+                scope="Equities",
+                symbols=symbols,
+            )

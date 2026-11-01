@@ -1,5 +1,6 @@
 import math
 import unittest
+from concurrent.futures import Future
 from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,6 +14,7 @@ from features.equities.scanner import (
     _ai_recommendation_candidates,
     _scan_stocks,
 )
+from features.analysis.panel import analysis_status_icon
 from features.equities.market_data import (
     MarketDataError,
     assess_stock,
@@ -43,6 +45,125 @@ def _equity_master(*symbols: str) -> pd.DataFrame:
 
 
 class MarketResearchTests(unittest.TestCase):
+    def test_analysis_status_indicators_distinguish_caution_from_strength(self):
+        self.assertEqual(
+            analysis_status_icon({"assessment": {"sentiment": "positive"}}),
+            "🟢",
+        )
+        self.assertEqual(
+            analysis_status_icon({"assessment": {"sentiment": "negative"}}),
+            "🔴",
+        )
+        self.assertEqual(analysis_status_icon({"assessment": {}}), None)
+
+    def test_home_shows_categorized_analysis_and_tab_status(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        current_time = pd.Timestamp.now(tz="Asia/Kolkata").to_pydatetime()
+        analysis = {
+            "analysis": "The portfolio is concentrated and should retain cash.",
+            "assessment": {
+                "sentiment": "cautious",
+                "summary": "Concentration is elevated; avoid unverified deployment.",
+                "strengths": ["No unverified deployment was made."],
+                "warnings": ["One holding dominates portfolio value."],
+                "suggestions": ["Review position sizing before adding capital."],
+                "scenarios": [
+                    {
+                        "title": "Downside case",
+                        "condition": "The largest holding weakens further.",
+                        "implication": "Reassess concentration and risk limits.",
+                    }
+                ],
+            },
+            "cash_deployment_list": [],
+        }
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = Mock()
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = current_time
+        app.session_state["profile_fetch_attempted"] = True
+        equity_analysis = {
+            **analysis,
+            "assessment": {
+                **analysis["assessment"],
+                "sentiment": "positive",
+            },
+        }
+        app.session_state["analysis_results"] = {
+            "all": analysis,
+            "equity": equity_analysis,
+            "options": equity_analysis,
+        }
+        app.session_state["app_navigation"] = "Home"
+        app.run(timeout=20)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any("🔴 Home" in tab.label for tab in app.tabs))
+        self.assertTrue(any("🟢 Equities" in tab.label for tab in app.tabs))
+        self.assertTrue(any("🔴 F&O" in tab.label for tab in app.tabs))
+        self.assertTrue(
+            any("Concentration is elevated" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("One holding dominates" in item.value for item in app.markdown)
+        )
+        self.assertTrue(any("Suggestions" in item.value for item in app.markdown))
+        self.assertFalse(any("Downside case" in item.value for item in app.markdown))
+        app.session_state["app_navigation"] = ":material/show_chart: 🔴 Equities"
+        app.session_state["analysis_results"]["equity"]["assessment"][
+            "sentiment"
+        ] = "cautious"
+        app.run(timeout=20)
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            app.session_state["app_navigation"],
+            ":material/show_chart: 🔴 Equities",
+        )
+        app.session_state["analysis_results"]["all"]["assessment"][
+            "sentiment"
+        ] = "positive"
+        app.session_state["analysis_results"]["equity"]["assessment"][
+            "sentiment"
+        ] = "positive"
+        app.run(timeout=20)
+        self.assertFalse(app.exception)
+        self.assertTrue(any("🟢 Equities" in tab.label for tab in app.tabs))
+        self.assertEqual(
+            app.session_state["app_navigation"],
+            ":material/show_chart: 🟢 Equities",
+        )
+
+    def test_equities_tab_shows_its_scoped_ai_brief(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        app.session_state["analysis_results"] = {
+            "equity": {
+                "analysis": "Equity positions show mixed performance.",
+                "assessment": {
+                    "sentiment": "cautious",
+                    "summary": "Concentration and drawdowns need attention.",
+                    "strengths": ["Several positions remain profitable."],
+                    "warnings": ["Loss-making holdings remain in the portfolio."],
+                    "suggestions": ["Review each position against its thesis."],
+                    "scenarios": [],
+                },
+                "cash_deployment_list": [],
+            }
+        }
+        app.session_state["app_navigation"] = "Equities"
+        app.run(timeout=20)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any("Concentration and drawdowns" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("Loss-making holdings" in item.value for item in app.markdown)
+        )
+
 
     def test_public_chart_response_is_normalized_to_daily_history(self):
         timestamps = [1_700_000_000 + day * 86_400 for day in range(60)]
@@ -640,6 +761,8 @@ class MarketResearchTests(unittest.TestCase):
             [
                 ":material/home: Home",
                 ":material/show_chart: Equities",
+                "Holdings · 0.0%",
+                "Market Scanner",
                 ":material/swap_horiz: Trades",
                 ":material/query_stats: F&O",
                 ":material/savings: Mutual Funds",
@@ -696,7 +819,11 @@ class MarketResearchTests(unittest.TestCase):
             any(widget.label == "Choose which stocks to scan" for widget in app.selectbox)
         )
         self.assertFalse(
-            any(tab.label in {"Market research", "Market scanner"} for tab in app.tabs)
+            any(tab.label == "Market research" for tab in app.tabs)
+        )
+        self.assertIn(
+            "Market Scanner",
+            [tab.label for tab in app.tabs],
         )
 
     def test_broker_connection_home_uses_the_compact_account_title(self):
@@ -719,12 +846,314 @@ class MarketResearchTests(unittest.TestCase):
             )
         )
 
+    def test_opening_user_settings_keeps_workspace_rendered(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        ).run(timeout=20)
+
+        app.button(key="open_user_settings").click().run(timeout=20)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.type == "dialog" for item in app))
+        self.assertTrue(
+            any(item.key == "settings_profile_name" for item in app.text_input)
+        )
+        self.assertIn("run_analysis_all", {item.key for item in app.button})
+        self.assertTrue(
+            any(item.key == "selected_broker" for item in app.selectbox)
+        )
+
+    def test_user_settings_remains_available_during_analysis(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        current_time = pd.Timestamp.now(tz="Asia/Kolkata").to_pydatetime()
+        broker = Mock()
+        broker.fetch_live_prices.return_value = {}
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = broker
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = current_time
+        app.session_state["profile_fetch_attempted"] = True
+        app.session_state["user_gemini_api_key"] = "test-api-key"
+        app.session_state["llm_model_selection_gemini"] = "gemini-2.5-flash"
+        quote_future = Future()
+        quote_future.set_result({})
+        analysis_future = Future()
+        with patch(
+            "services.analysis_jobs.submit_analysis_task",
+            return_value=quote_future,
+        ) as quote_submit, patch(
+            "services.analysis_jobs.submit_portfolio_analysis",
+            return_value=analysis_future,
+        ) as analysis_submit:
+            app.run(timeout=20)
+            app.button(key="run_analysis_home").click().run(timeout=20)
+            app.button(key="open_user_settings").click().run(timeout=20)
+
+        quote_submit.assert_called_once()
+        analysis_submit.assert_called_once()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.type == "dialog" for item in app))
+        self.assertTrue(
+            any(item.key == "settings_profile_name" for item in app.text_input)
+        )
+        self.assertFalse(
+            any("AI analysis is running" in item.value for item in app.info)
+        )
+        self.assertTrue(
+            any(
+                item.key == "run_analysis_home"
+                and item.label == "Analyzing portfolio..."
+                and item.disabled
+                for item in app.button
+            )
+        )
+
+    def test_connected_account_context_is_available_in_home_and_equities_tabs(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        current_time = pd.Timestamp.now(tz="Asia/Kolkata").to_pydatetime()
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = Mock()
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = current_time
+        app.session_state["last_sync"] = current_time
+        app.session_state["profile_fetch_attempted"] = True
+        app.session_state["broker_profile_name"] = "Test Investor"
+        app.run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            [tab.label for tab in app.tabs],
+            [
+                ":material/home: Home",
+                "Equities · 0.0%",
+                "Trading · 0.0%",
+                "Mutual Funds · 0.0%",
+                "F&O · 0.0%",
+                ":material/show_chart: Equities",
+                ":material/swap_horiz: Trades",
+                ":material/query_stats: F&O",
+                ":material/savings: Mutual Funds",
+            ],
+        )
+        self.assertTrue(
+            any("Signed in as **Test Investor**" in item.value for item in app.caption)
+        )
+        self.assertFalse(
+            any("Last broker sync:" in item.value for item in app.caption)
+        )
+        self.assertIn("workspace_disconnect_home", {item.key for item in app.button})
+        self.assertIn("run_analysis_home", {item.key for item in app.button})
+        self.assertIn("run_analysis_all", {item.key for item in app.button})
+        app.session_state["app_navigation"] = ":material/show_chart: Equities"
+        app.run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertIn("Holdings · 0.0%", [tab.label for tab in app.tabs])
+        self.assertIn("Market Scanner", [tab.label for tab in app.tabs])
+        self.assertTrue(
+            any("Signed in as **Test Investor**" in item.value for item in app.caption)
+        )
+        self.assertFalse(
+            any("Last broker sync:" in item.value for item in app.caption)
+        )
+        self.assertIn(
+            "workspace_disconnect_equities", {item.key for item in app.button}
+        )
+        self.assertNotIn("run_analysis_home", {item.key for item in app.button})
+        self.assertNotIn("run_analysis_all", {item.key for item in app.button})
+
+    def test_completed_broker_refresh_does_not_leave_success_banner(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        broker = Mock()
+        broker.fetch_balance.return_value = 100.0
+        broker.fetch_positions.return_value = pd.DataFrame(
+            columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+        )
+        broker.fetch_holdings.return_value = pd.DataFrame(
+            columns=["Ticker", "Qty", "Avg_Price", "LTP"]
+        )
+        broker.fetch_mutual_fund_holdings.return_value = pd.DataFrame(
+            columns=["Fund", "Folio", "ISIN", "Units", "Avg_NAV", "Latest_NAV", "NAV_Date"]
+        )
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = broker
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = None
+        app.session_state["profile_fetch_attempted"] = True
+        app.run(timeout=20)
+
+        self.assertFalse(app.exception)
+        self.assertIsNotNone(app.session_state["last_sync"])
+        self.assertFalse(app.status)
+        self.assertTrue(
+            any(
+                item.value == "Upstox portfolio data refreshed."
+                for item in app.get("toast")
+            )
+        )
+
+    def test_portfolio_analysis_opens_setup_dialog_when_provider_key_is_missing(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        current_time = pd.Timestamp.now(tz="Asia/Kolkata").to_pydatetime()
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = Mock()
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = current_time
+        app.session_state["last_sync"] = current_time
+        app.session_state["profile_fetch_attempted"] = True
+        app.session_state["broker_profile_name"] = "Test Investor"
+        app.session_state["llm_model_selection_gemini"] = ""
+        app.run(timeout=10)
+
+        analysis_buttons = [
+            item
+            for item in app.button
+            if item.key in {"run_analysis_home", "run_analysis_all"}
+        ]
+        self.assertEqual(len(analysis_buttons), 2)
+        self.assertTrue(all(not item.disabled for item in analysis_buttons))
+
+        next(
+            item for item in analysis_buttons if item.key == "run_analysis_all"
+        ).click().run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.type == "dialog" for item in app))
+        self.assertTrue(
+            any(item.label == "Gemini API key" for item in app.text_input)
+        )
+        self.assertTrue(any(item.label == "Model ID" for item in app.text_input))
+        app.selectbox(key="analysis_setup_provider_all").select(
+            "Custom OpenAI-compatible"
+        ).run(timeout=10)
+        self.assertTrue(
+            any(item.label == "Provider name" for item in app.text_input)
+        )
+        self.assertTrue(
+            any(item.label == "API base URL" for item in app.text_input)
+        )
+
+    def test_analysis_setup_lists_saved_provider_configurations(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        )
+        current_time = pd.Timestamp.now(tz="Asia/Kolkata").to_pydatetime()
+        app.session_state["token"] = "test-token"
+        app.session_state["broker_state"] = Mock()
+        app.session_state["broker_name"] = "Upstox"
+        app.session_state["last_sync_attempt"] = current_time
+        app.session_state["last_sync"] = current_time
+        app.session_state["profile_fetch_attempted"] = True
+        app.session_state["broker_profile_name"] = "Test Investor"
+        app.session_state["llm_provider"] = "Gemini"
+        app.session_state["settings_ai_provider_configs"] = [
+            {
+                "id": "openai-profile",
+                "provider": "OpenAI",
+                "name": "OpenAI primary",
+                "model": "gpt-4o-mini",
+                "base_url": "",
+            },
+            {
+                "id": "groq-profile",
+                "provider": "Groq",
+                "name": "Groq backup",
+                "model": "llama-3.3-70b-versatile",
+                "base_url": "",
+            },
+        ]
+        app.session_state["settings_ai_provider_config_keys"] = {
+            "openai-profile": "",
+            "groq-profile": "",
+        }
+        app.session_state["settings_ai_active_config_id"] = "openai-profile"
+        app.run(timeout=10)
+        app.session_state["user_llm_api_key_openai"] = ""
+
+        next(
+            item for item in app.button if item.key == "run_analysis_home"
+        ).click().run(timeout=10)
+
+        provider_select = next(
+            item
+            for item in app.selectbox
+            if item.label == "Configured AI provider"
+        )
+        self.assertTrue(
+            any("OpenAI primary" in option for option in provider_select.options)
+        )
+        self.assertTrue(
+            any("Groq backup" in option for option in provider_select.options)
+        )
+        self.assertTrue(
+            any(item.label == "OpenAI primary API key" for item in app.text_input)
+        )
+
+    def test_user_settings_deletes_provider_configuration_in_one_action(self):
+        config = {
+            "id": "openai-profile",
+            "provider": "OpenAI",
+            "name": "OpenAI primary",
+            "model": "gpt-4o-mini",
+            "base_url": "",
+        }
+        saved = {
+            "preferences": {
+                "ai_provider_configs": [config],
+                "ai_active_config_id": config["id"],
+                "ai_provider": "OpenAI",
+                "ai_models": {"OpenAI": config["model"]},
+            },
+            "sensitive": {
+                "ai_provider_config_keys": {config["id"]: "test-api-key"},
+                "ai_api_keys": {"OpenAI": "test-api-key"},
+            },
+            "sensitive_consent": True,
+        }
+        app_source = f"""
+import streamlit as st
+from ui.user_settings import apply_settings_to_session, _render_ai_provider_configurations
+if "delete_test_initialized" not in st.session_state:
+    apply_settings_to_session({saved!r})
+    st.session_state.delete_test_initialized = True
+_render_ai_provider_configurations("delete-test-user")
+"""
+        from hashlib import sha256
+
+        safe_id = sha256(config["id"].encode("utf-8")).hexdigest()[:12]
+        with (
+            patch("ui.user_settings.load_user_settings", return_value=saved),
+            patch("ui.user_settings.save_user_settings") as save_settings,
+        ):
+            app = AppTest.from_string(app_source).run(timeout=10)
+            self.assertFalse(app.exception)
+            app.button(key=f"delete_ai_config_{safe_id}").click().run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.settings_ai_provider_configs, [])
+        save_settings.assert_called_once()
+        persisted_preferences = save_settings.call_args.args[1]
+        self.assertEqual(persisted_preferences["ai_provider_configs"], [])
+        self.assertNotIn("OpenAI", persisted_preferences["ai_models"])
+
     def test_workspace_names_are_not_repeated_as_large_page_titles(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
         app.session_state["app_navigation"] = "Equities"
-        app.run()
+        with patch(
+            "features.equities.scanner.fetch_indian_equity_master",
+            return_value=_equity_master("ALPHA"),
+        ):
+            app.run(timeout=10)
 
         self.assertFalse(app.exception)
         self.assertFalse(
@@ -790,7 +1219,11 @@ class MarketResearchTests(unittest.TestCase):
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
         app.session_state["app_navigation"] = "Equities"
-        app.run()
+        with patch(
+            "features.equities.scanner.fetch_indian_equity_master",
+            return_value=_equity_master("ALPHA"),
+        ):
+            app.run(timeout=10)
 
         self.assertFalse(app.exception)
         self.assertFalse(any(item.value in {"Equities", "Equity analysis"} for item in app.subheader))

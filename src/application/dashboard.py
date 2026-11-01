@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -42,8 +41,14 @@ from features.trades.rules import (
     SECTOR_BY_TICKER,
     buy_execution_block_reason,
 )
-from features.analysis.panel import render_analysis_panel
+from features.analysis.panel import (
+    analysis_mentions_equity_holdings,
+    analysis_sentiment,
+    portfolio_analysis_is_configured,
+    render_analysis_panel,
+)
 from features.home.workspace import render_home_workspace
+from features.portfolio.metrics import calculate_allocation
 from features.equities.scanner import render_market_scanner
 from features.derivatives.workspace import render_derivatives_workspace
 from features.equities.workspace import render_equities_workspace
@@ -59,6 +64,14 @@ from core.logging import log_failure, log_success
 from services.cloud import (
     send_resend_email,
 )
+from services.analysis_jobs import (
+    submit_analysis_task,
+    submit_portfolio_analysis,
+)
+from services.portfolio_analysis import (
+    load_portfolio_analysis,
+    save_portfolio_analysis,
+)
 from services.user_settings import load_user_settings
 from services.database import DatabaseError, DatabaseSecurityError
 from storage import StorageRequestPending, get_storage_provider
@@ -70,21 +83,23 @@ from security.oauth import consume_oauth_state_context, create_oauth_state
 from core.config import settings
 from application.help import answer_app_help_question
 from ui.helpers import (
+    analysis_tab_status_css,
     app_animation_css,
     gold_theme_css,
     broker_connect_button_css,
     same_tab_link_html,
+    signed_in_label_html,
 )
 from ui.header import render_header
 from ui.footer import render_footer
 from ui.user_settings import (
     apply_settings_to_session,
+    default_broker_callback_url,
     open_user_settings_for_broker_credentials,
     render_user_settings,
 )
 from services.ai import (
     LLMProviderError,
-    ask_llm_agent,
     send_whatsapp_update,
     whatsapp_update_is_configured,
 )
@@ -236,6 +251,7 @@ st.session_state.setdefault("chat_history", [])
 st.session_state.setdefault("max_allocation_pct", 100.0)
 st.session_state.setdefault("realized_daily_loss_pct", 0.0)
 st.session_state.setdefault("broker_profile_name", "")
+st.session_state.setdefault("broker_profile_identifier", "")
 st.session_state.setdefault("profile_fetch_attempted", False)
 st.session_state.setdefault("buy_lock_until", None)
 st.session_state.setdefault("broker_state", None)
@@ -266,6 +282,9 @@ st.session_state.setdefault("risk_errors", [])
 st.session_state.setdefault("alerted_risk_channels", [])
 st.session_state.setdefault("analysis_result", None)
 st.session_state.setdefault("analysis_results", {})
+st.session_state.setdefault("analysis_timestamps", {})
+st.session_state.setdefault("analysis_metadata", {})
+st.session_state.setdefault("analysis_storage_errors", {})
 st.session_state.setdefault("analysis_errors", {})
 st.session_state.setdefault("analysis_price_errors", {})
 st.session_state.setdefault("ai_settings_prompt", "")
@@ -305,14 +324,10 @@ st.session_state.setdefault("pending_oauth_expires_at", None)
 
 
 def _redirect_url() -> str:
-    configured = settings.upstox_redirect_uri
-    if configured:
-        return configured
-    current_url = str(st.context.url or "")
-    if current_url:
-        parts = urlsplit(current_url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
-    return settings.default_redirect_uri
+    return str(
+        st.session_state.get("broker_callback_url")
+        or default_broker_callback_url()
+    )
 
 
 def _render_same_tab_link(label: str, url: str) -> None:
@@ -337,13 +352,11 @@ def _render_oauth_tab_link(label: str, url: str) -> None:
     )
 
 
-def _render_app_header(connected_broker: str | None = None) -> None:
+def _render_app_header() -> None:
     render_header(
-        connected_broker,
         render_share=_render_portfolio_share,
         render_settings=lambda: render_user_settings(_tenant_identifier()),
         render_agent=_render_agent,
-        on_disconnect=_logout,
     )
 
 
@@ -402,25 +415,95 @@ def _render_header_tabs():
         if isinstance(current_navigation, str)
         else None
     )
+    selected_index = None
     if legacy_target is not None:
-        st.session_state["app_navigation"] = next(
-            navigation.value
-            for tab, navigation in zip(AppTab, AppNavigation, strict=True)
-            if tab is legacy_target
-        )
-        current_navigation = st.session_state["app_navigation"]
-    if current_navigation in APP_TAB_LABELS:
-        index = APP_TAB_LABELS.index(current_navigation)
-        st.session_state["app_navigation"] = APP_TABS[index]
+        selected_index = APP_TAB_LABELS.index(legacy_target.value)
+    elif isinstance(current_navigation, str):
+        canonical_navigation = current_navigation
+        for status_label in (" · Constructive", " · Review", " · Risk"):
+            canonical_navigation = canonical_navigation.replace(status_label, "")
+        for status_icon in ("🟢", "🔴"):
+            canonical_navigation = canonical_navigation.replace(
+                f" {status_icon} ", " "
+            )
+        if canonical_navigation in APP_TABS:
+            selected_index = APP_TABS.index(canonical_navigation)
+        elif canonical_navigation in APP_TAB_LABELS:
+            selected_index = APP_TAB_LABELS.index(canonical_navigation)
     st.session_state["_run_seq"] = st.session_state.get("_run_seq", 0) + 1
     if st.session_state.pop("return_to_home", False):
-        st.session_state["app_navigation"] = APP_TABS[0]
-    tabs = st.tabs(
-        APP_TABS,
-        key="app_navigation",
-        on_change="rerun",
-        width="stretch",
-    )
+        selected_index = 0
+
+    analysis_results = st.session_state.get("analysis_results")
+    if not isinstance(analysis_results, dict):
+        analysis_results = {}
+    tab_scopes = {
+        "Home": ("all",),
+        "Equities": ("equity",),
+        "Trades": ("trading",),
+        "F&O": ("options", "futures"),
+        "Mutual Funds": ("mutual_funds",),
+    }
+    navigation_labels = []
+    tab_statuses = {}
+    status_labels = {
+        "positive": "Constructive",
+        "cautious": "Review",
+        "negative": "Risk",
+    }
+    for index, (tab_label, navigation_label) in enumerate(
+        zip(APP_TAB_LABELS, APP_TABS, strict=True), start=1
+    ):
+        assessments = [
+            analysis_results.get(scope)
+            for scope in tab_scopes.get(tab_label, ())
+            if analysis_results.get(scope) is not None
+        ]
+        if (
+            tab_label == "Equities"
+            and not assessments
+            and analysis_mentions_equity_holdings(
+                analysis_results.get("all"),
+                st.session_state.get("equity_holdings", pd.DataFrame()),
+            )
+        ):
+            assessments = [analysis_results["all"]]
+
+        if assessments:
+            if tab_label == "F&O":
+                sentiments = [analysis_sentiment(item) for item in assessments]
+                status = (
+                    "positive"
+                    if len(assessments) == len(tab_scopes[tab_label])
+                    and sentiments
+                    and all(item == "positive" for item in sentiments)
+                    else (
+                        "negative"
+                        if "negative" in sentiments
+                        else "cautious"
+                    )
+                )
+            else:
+                status = analysis_sentiment(assessments[0])
+            if status is not None and status in status_labels:
+                navigation_label += f" · {status_labels[status]}"
+                tab_statuses[index] = status
+        navigation_labels.append(navigation_label)
+
+    if selected_index is None:
+        if current_navigation in navigation_labels:
+            selected_index = navigation_labels.index(current_navigation)
+        else:
+            selected_index = 0
+    st.session_state["app_navigation"] = navigation_labels[selected_index]
+    with st.container(key="app_navigation_tabs"):
+        st.html(analysis_tab_status_css(tab_statuses))
+        tabs = st.tabs(
+            navigation_labels,
+            key="app_navigation",
+            on_change="rerun",
+            width="stretch",
+        )
     return {
         label: tab
         for label, tab in zip(APP_TAB_LABELS, tabs, strict=True)
@@ -637,6 +720,7 @@ def _clear_broker_login_inputs() -> None:
             st.session_state.pop(key, None)
     st.session_state.dynamic_broker_states = {}
     st.session_state.broker_profile_name = ""
+    st.session_state.broker_profile_identifier = ""
     st.session_state.profile_fetch_attempted = False
     st.session_state.buy_lock_until = None
     st.session_state.chat_history = []
@@ -799,8 +883,9 @@ def _render_broker_connection() -> None:
     st.html(broker_connect_button_css())
     st.caption(
         "Connect a broker to load your portfolio, cash balance, and supported "
-        "holdings. Configure broker credentials in User settings; they are used "
-        "only for sign-in and are never read from server configuration. Settings "
+        "holdings. Configure broker credentials and callback URL in User settings. "
+        "Credentials are used only for sign-in and are never read from server "
+        "configuration. Settings "
         "explain which values are stored and require explicit consent before "
         "saving confidential values. AI suggestions are informational, not "
         "investment advice; provider availability and charges may apply."
@@ -1010,22 +1095,9 @@ def _render_broker_connection() -> None:
                 "order placement is disabled for custom adapters."
             )
     elif broker_type in {"Upstox", "Zerodha"}:
-        redirect_url = _redirect_url()
         if not callback_broker:
-            _render_broker_credential_field(
-                broker_type,
-                "Callback URL",
-                "Callback URL",
-                value=redirect_url,
-                disabled=True,
-                help_text=(
-                    "Register this exact address in your broker developer app "
-                    "so it can return you here after authorization."
-                ),
-            )
             st.caption(
-                "Credentials are loaded from User settings when saved. "
-                "If missing, enter them above or save them in User settings."
+                "Credentials and callback URL are managed in User settings."
             )
         callback_error = st.query_params.get("error")
         if callback_error or (
@@ -1163,17 +1235,6 @@ def _render_broker_connection() -> None:
 
     elif broker_type == "Dhan":
         if not callback_broker:
-            _render_broker_credential_field(
-                "Dhan",
-                "Callback URL",
-                "Callback URL",
-                value=_redirect_url(),
-                disabled=True,
-                help_text=(
-                    "Register this exact address in your Dhan API app so Dhan "
-                    "can return you here after authorization."
-                ),
-            )
             _show_saved_credentials_reminder()
             required = ("dhan_client_id", "dhan_api_key", "dhan_api_secret")
             st.button(
@@ -1234,6 +1295,8 @@ def _render_broker_connection() -> None:
 def _show_login() -> None:
     _render_sidebar_settings()
     _render_app_header()
+    if st.session_state.get("analysis_job"):
+        _render_analysis_progress()
     with st.container(border=True, gap="medium"):
         tabs = _render_header_tabs()
         if tabs[APP_TAB_LABELS[0]].open:
@@ -1278,10 +1341,7 @@ def polling_sequence() -> None:
             "equity": "Equity holdings refresh",
             "mutual_funds": "Mutual-fund holdings refresh",
         }
-        with st.status(
-            f"Connecting to {broker_name} and loading account data…",
-            expanded=False,
-        ) as sync_status:
+        with st.spinner(f"Loading {broker_name} account data…"):
             with ThreadPoolExecutor(
                 max_workers=len(fetchers), thread_name_prefix="broker-sync"
             ) as executor:
@@ -1289,13 +1349,8 @@ def polling_sequence() -> None:
                     executor.submit(fetcher, token): feed
                     for feed, fetcher in fetchers.items()
                 }
-                completed = 0
                 for future in as_completed(pending):
                     feed = pending[future]
-                    completed += 1
-                    sync_status.update(
-                        label=f"Loading {broker_name} data ({completed}/{len(fetchers)})…"
-                    )
                     try:
                         result = future.result()
                     except BrokerCapabilityError as error:
@@ -1365,48 +1420,19 @@ def polling_sequence() -> None:
                             item_count=item_count,
                         )
                         data_refreshed = True
-            sync_status.update(
-                label=(
-                    f"{broker_name} data loaded"
-                    if not data_errors
-                    else f"{broker_name} connected; some data could not be loaded"
-                ),
-                state="complete",
-            )
 
         st.session_state.broker_data_errors = data_errors
         st.session_state.sync_failed = bool(data_errors)
         if data_refreshed:
             st.session_state.last_sync = datetime.now(ZoneInfo(settings.timezone))
+            if not data_errors:
+                st.toast(
+                    f"{broker_name} portfolio data refreshed.",
+                    icon=":material/check_circle:",
+                )
 
     equity_holdings = st.session_state.equity_holdings
     portfolio = st.session_state.portfolio
-    if st.session_state.sync_failed:
-        failed_feeds = {
-            "cash": "cash balance",
-            "trading": "trading positions",
-            "equity": "equity holdings",
-            "mutual_funds": "mutual-fund holdings",
-        }
-        failed_labels = [
-            failed_feeds[feed]
-            for feed in st.session_state.broker_data_errors
-            if feed in failed_feeds
-        ]
-        st.warning(
-            "Could not refresh "
-            + ", ".join(failed_labels)
-            + "; showing the last successful data."
-        )
-        with st.expander("Refresh diagnostics"):
-            for feed, diagnostic in st.session_state.broker_data_errors.items():
-                st.caption(f"**{feed.replace('_', ' ').title()}:** {diagnostic}")
-    elif st.session_state.last_sync:
-        st.caption(
-            "Last broker sync: "
-            f"{st.session_state.last_sync.strftime('%d %b %Y, %H:%M:%S IST')}"
-        )
-
     risk_rows = st.session_state.risk_alerts
     risk_errors = st.session_state.risk_errors
     high_water = st.session_state.risk_high_water
@@ -1475,12 +1501,6 @@ def polling_sequence() -> None:
             "ATR check unavailable (no exit signal inferred): "
             + "; ".join(sorted(set(risk_errors)))
         )
-    st.caption(
-        "Risk boundary: highest observed price in this session minus 3 × "
-        f"{settings.atr_period}-trading-day ATR. A failed candle/quote request "
-        "is not treated as a breach."
-    )
-
     breached_tickers = {ticker for ticker, _, _ in risk_rows}
     st.session_state.alerted_risk_channels = [
         delivery
@@ -1573,6 +1593,288 @@ def polling_sequence() -> None:
                 st.rerun()
 
 
+def _record_analysis_failure(scope: str, message: str) -> None:
+    st.session_state.analysis_errors[scope] = message
+    st.session_state.analysis_results.pop(scope, None)
+    st.session_state.analysis_timestamps.pop(scope, None)
+    st.session_state.analysis_metadata.pop(scope, None)
+    st.session_state.approved_trades_by_scope[scope] = []
+
+
+def _complete_analysis_job(job: dict[str, Any]) -> None:
+    scope = str(job["scope"])
+    provider = str(job["provider"])
+    selected_model = str(job["model"])
+    api_key = str(job["api_key"])
+    future = job["future"]
+    try:
+        analysis = future.result()
+    except APIError as error:
+        log_failure(f"{provider} portfolio analysis", error)
+        detail = error.details
+        error_info = detail.get("error", detail) if isinstance(detail, dict) else {}
+        error_details = error_info.get("details", [])
+        if not isinstance(error_details, list):
+            error_details = []
+        reasons = {
+            item.get("reason")
+            for item in error_details
+            if isinstance(item, dict)
+        }
+        status = error_info.get("status", error.status)
+        code = error_info.get("code", error.code)
+        try:
+            http_code = int(code)
+        except (TypeError, ValueError):
+            http_code = error.code
+        if "API_KEY_INVALID" in reasons or status in {
+            "UNAUTHENTICATED",
+            "PERMISSION_DENIED",
+        }:
+            message = (
+                "Google rejected this Gemini key. Check the key and project access "
+                "in Google AI Studio, then update the key in User settings."
+            )
+        elif http_code == 429 or status == "RESOURCE_EXHAUSTED":
+            message = (
+                "Gemini API quota or rate limit reached. Check the key's project "
+                "and billing/quota in Google AI Studio, then retry later."
+            )
+        elif http_code == 503 or status == "UNAVAILABLE":
+            message = (
+                "Gemini is temporarily unavailable (HTTP 503). This normally "
+                "indicates a Google-side service/capacity issue, not an invalid API "
+                "key. The app retries transient failures automatically; wait a few "
+                "minutes and run the analysis again. If it persists, check Google "
+                "AI Studio service status and try again later."
+            )
+        elif http_code in {500, 502, 504} or status == "INTERNAL":
+            message = (
+                f"Gemini returned a temporary server error (HTTP {http_code}). "
+                "The app retries transient failures automatically; wait a few "
+                "minutes and run the analysis again."
+            )
+        elif http_code == 404:
+            message = (
+                f"Gemini model {selected_model} is unavailable for this API key or "
+                "project. Check model access and API enablement in Google AI Studio."
+            )
+        elif http_code == 400 or status == "INVALID_ARGUMENT":
+            provider_message = (
+                error_info.get("message")
+                if isinstance(error_info, dict)
+                else None
+            ) or getattr(error, "message", "")
+            provider_message = str(provider_message or "").strip()
+            if api_key:
+                provider_message = provider_message.replace(api_key, "[redacted]")
+            provider_message = " ".join(provider_message.split())
+            safe_message = html.escape(provider_message[:400])
+            message = (
+                "Gemini rejected the analysis request. Check that the selected "
+                f"model ({selected_model}) is supported for this key."
+                + (f" Provider detail: {safe_message}" if safe_message else "")
+            )
+        else:
+            message = (
+                f"Gemini API request failed (HTTP {http_code or 'unknown'}). Check the "
+                "API key, model access, project quota, and network connection."
+            )
+        _record_analysis_failure(scope, message)
+        return
+    except LLMProviderError as error:
+        log_failure(f"{provider} portfolio analysis", error)
+        _record_analysis_failure(scope, str(error))
+        return
+    except (RuntimeError, ValueError) as error:
+        log_failure(f"{provider} portfolio analysis", error)
+        _record_analysis_failure(scope, f"Portfolio analysis failed: {error}")
+        return
+
+    engine = JevRuleEngine(
+        {
+            "cash_balance": min(
+                job["planning_budget"], max(job["balance"], 0.0)
+            ),
+            "actual_broker_balance": job["balance"],
+            "active_positions_count": job["active_positions_count"],
+            "realized_daily_loss_pct": job["realized_daily_loss_pct"],
+            "max_allocation_pct": job["max_allocation_pct"],
+            "live_prices": job["live_prices"],
+            "sector_holdings": job["sectors_held"],
+            "portfolio": job["scoped_portfolio"],
+            "llm_targets": analysis["cash_deployment_list"],
+            "enabled_rules": job["selected_rule_numbers"],
+            "buy_lock_until": job["buy_lock_until"],
+        }
+    )
+    trades, audit_trail = engine.run()
+    st.session_state.buy_lock_until = engine.facts.get("buy_lock_until")
+    st.session_state.analysis_results[scope] = analysis
+    analyzed_at = datetime.now(ZoneInfo(settings.timezone)).isoformat()
+    st.session_state.analysis_timestamps[scope] = analyzed_at
+    st.session_state.analysis_metadata[scope] = {
+        "provider": provider,
+        "model": selected_model,
+    }
+    st.session_state.approved_trades_by_scope[scope] = trades
+    st.session_state.audit_trails_by_scope[scope] = audit_trail
+    st.session_state.jev_rule_selection_after_analysis = job[
+        "selected_rule_numbers"
+    ]
+    st.session_state.analysis_errors.pop(scope, None)
+    if scope == "all":
+        st.session_state.analysis_result = analysis
+        st.session_state.approved_trades = trades
+        st.session_state.audit_trail = audit_trail
+        account_identifier = str(job.get("broker_account_identifier") or "").strip()
+        broker_name = str(job.get("broker_name") or "").strip()
+        if account_identifier and broker_name:
+            try:
+                save_portfolio_analysis(
+                    str(job["owner_identifier"]),
+                    broker_name,
+                    account_identifier,
+                    scope,
+                    analysis,
+                    analyzed_at,
+                    provider=provider,
+                    model=selected_model,
+                )
+            except StorageRequestPending:
+                st.session_state.analysis_storage_errors[scope] = (
+                    "Analysis completed, but browser storage is still processing "
+                    "the save. It will be retried on the next analysis run."
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                log_failure(
+                    "Portfolio analysis save",
+                    error,
+                    broker=broker_name,
+                )
+                st.session_state.analysis_storage_errors[scope] = (
+                    "Analysis completed, but it could not be saved for this broker "
+                    "account."
+                )
+            else:
+                st.session_state.analysis_storage_errors.pop(scope, None)
+        else:
+            st.session_state.analysis_storage_errors[scope] = (
+                "Analysis completed for this session, but this broker did not "
+                "provide a stable account identifier for saving it."
+            )
+
+
+@st.fragment(run_every=1)
+def _render_analysis_progress() -> None:
+    job = st.session_state.get("analysis_job")
+    if not job:
+        return
+    if job["future"].done():
+        if job["stage"] == "quotes":
+            try:
+                live_prices = job["future"].result()
+                if not isinstance(live_prices, dict):
+                    raise TypeError(
+                        "Broker live-price response must be a mapping."
+                    )
+            except (
+                BrokerAPIError,
+                requests.RequestException,
+                RuntimeError,
+                ValueError,
+                TypeError,
+            ) as error:
+                log_failure(
+                    "Analysis live-price refresh",
+                    error,
+                    broker=job["broker_name"],
+                )
+                live_prices = {}
+                price_error = (
+                    "Could not retrieve a fresh broker quote. Analysis will still run, "
+                    "but the app will not submit unpriced recommendations."
+                )
+            else:
+                price_error = (
+                    None
+                    if live_prices
+                    else "The broker returned no current prices; price-based deployments "
+                    "remain disabled."
+                )
+            _submit_analysis_request(job, live_prices, price_error)
+            st.rerun(scope="app")
+        else:
+            st.session_state["analysis_job"] = None
+            _complete_analysis_job(job)
+            st.rerun(scope="app")
+def _submit_analysis_request(
+    job: dict[str, Any],
+    live_prices: dict[str, Any],
+    price_error: str | None,
+) -> None:
+    scope = str(job["scope"])
+    live_prices = {
+        str(ticker).strip().upper(): price
+        for ticker, price in live_prices.items()
+    }
+    st.session_state.analysis_price_errors[scope] = price_error
+    if scope == "all":
+        st.session_state.analysis_price_error = price_error
+    if scope in {"all", "equity", "trading"}:
+        st.session_state.analysis_live_prices_updated_at = datetime.now(
+            ZoneInfo(settings.timezone)
+        )
+        st.session_state.analysis_live_prices = live_prices
+    context = job["context"]
+    context += (
+        "\nThe authenticated quote endpoint returned "
+        + (
+            "current prices for the listed symbols."
+            if live_prices
+            else "no usable current prices. Provide portfolio analysis only and "
+            "return an empty cash_deployment_list; never estimate prices."
+        )
+    )
+    market_candidates = job["market_candidates"]
+    if scope in {"all", "equity", "trading"}:
+        priced_candidates = [
+            item
+            for item in market_candidates
+            if isinstance(item, dict)
+            and str(item.get("Ticker", "")).strip().upper() in live_prices
+        ]
+        candidate_tickers = [
+            str(item["Ticker"]).strip().upper() for item in priced_candidates
+        ]
+        context += (
+            "\nLatest rules-based NSE scan candidates (only Strong Buy/Buy; positive "
+            "indicator checks scored across the complete available indicator set): "
+            + json.dumps(priced_candidates, ensure_ascii=True)
+            + (
+                " Only recommend from these screened and broker-priced candidates."
+                if priced_candidates
+                else " No current scanned and broker-priced Strong Buy/Buy candidates "
+                "are available; return an empty cash_deployment_list."
+            )
+        )
+    else:
+        candidate_tickers = []
+    job["live_prices"] = live_prices
+    job["stage"] = "ai"
+    job["future"] = submit_portfolio_analysis(
+        portfolio_summary=job["summary"],
+        available_cash=job["planning_budget"],
+        market_context=context,
+        live_prices=live_prices,
+        candidate_tickers=candidate_tickers,
+        api_key=job["api_key"],
+        model=job["model"],
+        provider=job["provider"],
+        base_url=job["provider_base_url"],
+    )
+
+
 def _run_analysis(scope: str = "all") -> None:
     scope_titles = {
         "all": "entire portfolio",
@@ -1586,9 +1888,11 @@ def _run_analysis(scope: str = "all") -> None:
         raise ValueError(f"Unsupported analysis scope: {scope}")
 
     def fail(message: str) -> None:
-        st.session_state.analysis_errors[scope] = message
-        st.session_state.analysis_results.pop(scope, None)
-        st.session_state.approved_trades_by_scope[scope] = []
+        _record_analysis_failure(scope, message)
+
+    active_job = st.session_state.get("analysis_job")
+    if active_job and not active_job["future"].done():
+        return
 
     provider = str(
         st.session_state.get("llm_provider", LLMProvider.GEMINI.value)
@@ -1699,173 +2003,13 @@ def _run_analysis(scope: str = "all") -> None:
         for item in market_candidates
         if isinstance(item, dict) and item.get("Ticker")
     ]
+    quote_tickers: list[str] = []
     if scope in {"all", "equity", "trading"}:
         portfolio_tickers = (
             equity_and_positions["Ticker"].dropna().astype(str).str.strip().str.upper()
             .tolist()
         )
         quote_tickers = sorted(set(portfolio_tickers + candidate_tickers))
-        if st.session_state.get("broker_state") and st.session_state.get("token"):
-            try:
-                live_prices = st.session_state.broker_state.fetch_live_prices(
-                    st.session_state.token, quote_tickers
-                )
-            except (
-                BrokerAPIError,
-                requests.RequestException,
-                RuntimeError,
-                ValueError,
-            ) as error:
-                log_failure(
-                    "Analysis live-price refresh",
-                    error,
-                    broker=st.session_state.broker_name,
-                )
-                live_prices = {}
-                price_error = (
-                    "Could not retrieve a fresh broker quote. Analysis will still run, "
-                    "but the app will not submit unpriced recommendations."
-                )
-            else:
-                price_error = (
-                    None
-                    if live_prices
-                    else "The broker returned no current prices; price-based deployments "
-                    "remain disabled."
-                )
-        else:
-            live_prices = {}
-            price_error = (
-                "No broker is connected, so live quotes and price-based deployments "
-                "are unavailable. Portfolio analysis can still run on the supplied data."
-            )
-        st.session_state.analysis_price_errors[scope] = price_error
-        if scope == "all":
-            st.session_state.analysis_price_error = price_error
-        st.session_state.analysis_live_prices_updated_at = datetime.now(
-            ZoneInfo(settings.timezone)
-        )
-        live_prices = {
-            str(ticker).strip().upper(): price
-            for ticker, price in live_prices.items()
-        }
-    else:
-        live_prices = {}
-        price_error = (
-            f"No live broker quote feed is configured for {scope_titles[scope]}; "
-            "this run is portfolio review only."
-        )
-        st.session_state.analysis_price_errors[scope] = price_error
-    if scope in {"all", "equity", "trading"}:
-        st.session_state.analysis_live_prices = live_prices
-    context += (
-        "\nThe authenticated quote endpoint returned "
-        + (
-            "current prices for the listed symbols."
-            if live_prices
-            else "no usable current prices. Provide portfolio analysis only and "
-            "return an empty cash_deployment_list; never estimate prices."
-        )
-    )
-    if scope in {"all", "equity", "trading"}:
-        priced_candidates = [
-            item
-            for item in market_candidates
-            if isinstance(item, dict)
-            and str(item.get("Ticker", "")).strip().upper() in live_prices
-        ]
-        candidate_tickers = [
-            str(item["Ticker"]).strip().upper() for item in priced_candidates
-        ]
-        context += (
-            "\nLatest rules-based NSE scan candidates (only Strong Buy/Buy; positive "
-            "indicator checks scored across the complete available indicator set): "
-            + json.dumps(priced_candidates, ensure_ascii=True)
-            + (
-                " Only recommend from these screened and broker-priced candidates."
-                if priced_candidates
-                else " No current scanned and broker-priced Strong Buy/Buy candidates "
-                "are available; return an empty cash_deployment_list."
-            )
-        )
-    try:
-        analysis = ask_llm_agent(
-            portfolio_summary=summary,
-            available_cash=planning_budget,
-            market_context=context,
-            live_prices=live_prices,
-            candidate_tickers=candidate_tickers,
-            api_key=api_key,
-            model=str(selected_model),
-            provider=provider,
-            base_url=provider_base_url,
-        )
-    except APIError as error:
-        log_failure(f"{provider} portfolio analysis", error)
-        detail = error.details
-        error_info = detail.get("error", detail) if isinstance(detail, dict) else {}
-        error_details = error_info.get("details", [])
-        if not isinstance(error_details, list):
-            error_details = []
-        reasons = {
-            item.get("reason")
-            for item in error_details
-            if isinstance(item, dict)
-        }
-        status = error_info.get("status", error.status)
-        code = error_info.get("code", error.code)
-        try:
-            http_code = int(code)
-        except (TypeError, ValueError):
-            http_code = error.code
-        if "API_KEY_INVALID" in reasons or status in {
-            "UNAUTHENTICATED",
-            "PERMISSION_DENIED",
-        }:
-            message = (
-                "Google rejected this Gemini key. Check the key and project access "
-                "in Google AI Studio, then update the key in User settings."
-            )
-        elif http_code == 429 or status == "RESOURCE_EXHAUSTED":
-            message = (
-                "Gemini API quota or rate limit reached. Check the key's project "
-                "and billing/quota in Google AI Studio, then retry later."
-            )
-        elif http_code == 503 or status == "UNAVAILABLE":
-            message = (
-                "Gemini is temporarily unavailable (HTTP 503). This normally "
-                "indicates a Google-side service/capacity issue, not an invalid API "
-                "key. The app retries transient failures automatically; wait a few "
-                "minutes and run the analysis again. If it persists, check Google "
-                "AI Studio service status and try again later."
-            )
-        elif http_code in {500, 502, 504} or status == "INTERNAL":
-            message = (
-                f"Gemini returned a temporary server error (HTTP {http_code}). "
-                "The app retries transient failures automatically; wait a few "
-                "minutes and run the analysis again."
-            )
-        elif http_code == 404:
-            message = (
-                f"Gemini model {selected_model} is unavailable for this API key or "
-                "project. Check model access and API enablement in Google AI Studio."
-            )
-        else:
-            message = (
-                f"Gemini API request failed (HTTP {http_code or 'unknown'}). Check the "
-                "API key, model access, project quota, and network connection."
-            )
-        fail(message)
-        return
-    except LLMProviderError as error:
-        log_failure(f"{provider} portfolio analysis", error)
-        fail(str(error))
-        return
-    except (RuntimeError, ValueError) as error:
-        log_failure(f"{provider} portfolio analysis", error)
-        fail(f"Portfolio analysis failed: {error}")
-        return
-
     sectors_held = {
         SECTOR_BY_TICKER[ticker]
         for ticker in scoped_portfolio["Ticker"].astype(str).str.upper()
@@ -1876,40 +2020,291 @@ def _run_analysis(scope: str = "all") -> None:
         for rule_number in st.session_state.get("enabled_jev_rules", [1, 2, 3, 4, 5, 6])
         if int(rule_number) in range(1, 7)
     )
-    engine = JevRuleEngine(
-        {
-            "cash_balance": min(
-                planning_budget, max(float(st.session_state.balance), 0.0)
-            ),
-            "actual_broker_balance": float(st.session_state.balance),
-            "active_positions_count": int(
-                equity_and_positions.loc[equity_and_positions["Qty"].ne(0)]
-                .drop_duplicates(subset=["Ticker"])
-                .shape[0]
-            ),
-            "realized_daily_loss_pct": float(
-                st.session_state.realized_daily_loss_pct
-            ),
-            "max_allocation_pct": float(st.session_state.max_allocation_pct),
-            "buy_lock_until": st.session_state.buy_lock_until,
-            "live_prices": live_prices,
-            "sector_holdings": sorted(sectors_held),
-            "portfolio": scoped_portfolio,
-            "llm_targets": analysis["cash_deployment_list"],
-            "enabled_rules": selected_rule_numbers,
+    job = {
+        "scope": scope,
+        "stage": "quotes",
+        "provider": provider,
+        "model": str(selected_model),
+        "owner_identifier": _tenant_identifier(),
+        "broker_name": str(st.session_state.get("broker_name") or ""),
+        "broker_account_identifier": str(
+            st.session_state.get("broker_profile_identifier") or ""
+        ),
+        "api_key": api_key,
+        "provider_base_url": provider_base_url,
+        "summary": summary,
+        "context": context,
+        "market_candidates": list(market_candidates),
+        "planning_budget": planning_budget,
+        "balance": float(st.session_state.balance),
+        "buy_lock_until": st.session_state.buy_lock_until,
+        "realized_daily_loss_pct": float(
+            st.session_state.realized_daily_loss_pct
+        ),
+        "max_allocation_pct": float(st.session_state.max_allocation_pct),
+        "active_positions_count": int(
+            equity_and_positions.loc[equity_and_positions["Qty"].ne(0)]
+            .drop_duplicates(subset=["Ticker"])
+            .shape[0]
+        ),
+        "live_prices": {},
+        "sectors_held": sorted(sectors_held),
+        "scoped_portfolio": scoped_portfolio.copy(),
+        "selected_rule_numbers": selected_rule_numbers,
+    }
+    adapter = st.session_state.get("broker_state")
+    token = st.session_state.get("token")
+    if scope in {"all", "equity", "trading"} and adapter and token:
+        job["broker_name"] = str(st.session_state.get("broker_name", "broker"))
+        job["future"] = submit_analysis_task(
+            adapter.fetch_live_prices,
+            token,
+            quote_tickers,
+        )
+    else:
+        price_error = (
+            f"No live broker quote feed is configured for {scope_titles[scope]}; "
+            "this run is portfolio review only."
+            if scope not in {"all", "equity", "trading"}
+            else "No broker is connected, so live quotes and price-based deployments "
+            "are unavailable. Portfolio analysis can still run on the supplied data."
+        )
+        _submit_analysis_request(job, {}, price_error)
+    st.session_state["analysis_job"] = job
+    st.rerun(scope="app")
+
+
+def _request_analysis(scope: str) -> None:
+    if portfolio_analysis_is_configured():
+        _run_analysis(scope)
+        return
+    st.session_state.analysis_setup_dialog_scope = scope
+
+
+@st.dialog("AI analysis setup")
+def _render_analysis_setup_dialog(scope: str) -> None:
+    configured_providers = [
+        item
+        for item in st.session_state.get("settings_ai_provider_configs", [])
+        if isinstance(item, dict)
+        and item.get("id")
+        and item.get("provider")
+        in {provider.provider.value for provider in LLMProviderBaseURL}
+    ]
+    configured_provider = None
+    if configured_providers:
+        selected_config_key = f"analysis_setup_config_{scope}"
+        valid_ids = {str(item["id"]) for item in configured_providers}
+        selected_config_id = str(
+            st.session_state.get(
+                selected_config_key,
+                st.session_state.get("settings_ai_active_config_id", ""),
+            )
+        )
+        if selected_config_id not in valid_ids:
+            selected_config_id = str(configured_providers[0]["id"])
+        st.session_state[selected_config_key] = selected_config_id
+        configured_by_id = {
+            str(item["id"]): item for item in configured_providers
         }
+        selected_config_id = st.selectbox(
+            "Configured AI provider",
+            options=list(configured_by_id),
+            format_func=lambda config_id: (
+                f"{configured_by_id[config_id].get('name') or configured_by_id[config_id]['provider']} "
+                f"· {configured_by_id[config_id]['model'] or 'model not set'}"
+            ),
+            key=selected_config_key,
+        )
+        configured_provider = configured_by_id[selected_config_id]
+        provider = str(configured_provider["provider"])
+        provider_slug = provider.lower().replace(" ", "_").replace("-", "_")
+        model = str(configured_provider.get("model", "")).strip()
+        base_url = str(configured_provider.get("base_url", "")).strip()
+        config_keys = st.session_state.get(
+            "settings_ai_provider_config_keys", {}
+        )
+        session_config_keys = st.session_state.get(
+            "analysis_setup_session_keys", {}
+        )
+        api_key = str(
+            config_keys.get(selected_config_id)
+            or session_config_keys.get(selected_config_id, "")
+        ).strip()
+        if (
+            not api_key
+            and selected_config_id
+            == str(st.session_state.get("settings_ai_active_config_id", ""))
+        ):
+            api_key = str(
+                st.session_state.get(
+                    "user_gemini_api_key"
+                    if provider == LLMProvider.GEMINI.value
+                    else f"user_llm_api_key_{provider_slug}",
+                    "",
+                )
+            ).strip()
+        provider_label = str(
+            configured_provider.get("name") or provider
+        )
+        st.write(
+            f"Complete the missing **{provider_label}** settings to run this "
+            "analysis. New values are used for this session only."
+        )
+    else:
+        provider_names = [
+            provider.provider.value for provider in LLMProviderBaseURL
+        ]
+        current_provider = str(
+            st.session_state.get("llm_provider", LLMProvider.GEMINI.value)
+        )
+        selected_provider_key = f"analysis_setup_provider_{scope}"
+        if selected_provider_key not in st.session_state:
+            st.session_state[selected_provider_key] = (
+                current_provider
+                if current_provider in provider_names
+                else LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+            )
+        selected_provider = st.selectbox(
+            "AI provider",
+            options=provider_names,
+            accept_new_options=True,
+            key=selected_provider_key,
+            help=(
+                "Choose a provider or enter another provider name that supports "
+                "the OpenAI-compatible API."
+            ),
+        )
+        custom_provider = (
+            selected_provider not in provider_names
+            or selected_provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+        )
+        provider = (
+            LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+            if custom_provider
+            else str(selected_provider)
+        )
+        provider_slug = provider.lower().replace(" ", "_").replace("-", "_")
+        provider_label = str(selected_provider)
+        if custom_provider:
+            manual_name_slug = (
+                str(selected_provider).lower().replace(" ", "_").replace("-", "_")
+            )
+            name_key = f"analysis_setup_provider_name_{scope}_{manual_name_slug}"
+            if name_key not in st.session_state:
+                st.session_state[name_key] = (
+                    ""
+                    if selected_provider
+                    == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+                    else str(selected_provider)
+                )
+            provider_label = st.text_input(
+                "Provider name",
+                key=name_key,
+                placeholder="For example, OpenRouter",
+            )
+            provider_label = str(provider_label or "").strip()
+        model = str(
+            st.session_state.get(
+                f"llm_model_selection_{provider_slug}",
+                next(iter(settings.llm_provider_models.get(provider, ())), ""),
+            )
+        ).strip()
+        base_url = str(
+            st.session_state.get(
+                "llm_custom_base_url", settings.llm_custom_base_url
+            )
+        ).strip()
+        api_key_widget = (
+            "user_gemini_api_key"
+            if provider == LLMProvider.GEMINI.value
+            else f"user_llm_api_key_{provider_slug}"
+        )
+        api_key = str(st.session_state.get(api_key_widget, "")).strip()
+        st.write(
+            f"Enter the missing **{provider_label or provider}** settings. "
+            "Values are used for this session only."
+        )
+
+    api_key_widget = (
+        "user_gemini_api_key"
+        if provider == LLMProvider.GEMINI.value
+        else f"user_llm_api_key_{provider_slug}"
     )
-    trades, audit_trail = engine.run()
-    st.session_state.buy_lock_until = engine.facts.get("buy_lock_until")
-    st.session_state.analysis_results[scope] = analysis
-    st.session_state.approved_trades_by_scope[scope] = trades
-    st.session_state.audit_trails_by_scope[scope] = audit_trail
-    st.session_state.jev_rule_selection_after_analysis = selected_rule_numbers
-    st.session_state.analysis_errors.pop(scope, None)
-    if scope == "all":
-        st.session_state.analysis_result = analysis
-        st.session_state.approved_trades = trades
-        st.session_state.audit_trail = audit_trail
+    model_widget = f"llm_model_selection_{provider_slug}"
+    custom_provider = provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE.value
+    input_suffix = (
+        str(configured_provider["id"])
+        if configured_provider
+        else provider_slug
+    )
+    form_key = (
+        f"analysis_setup_form_{scope}_"
+        f"{input_suffix}"
+    )
+    with st.form(form_key):
+        api_key_input = ""
+        if not api_key:
+            api_key_input = st.text_input(
+                f"{provider_label or provider} API key",
+                type="password",
+                key=f"analysis_setup_api_key_{scope}_{input_suffix}",
+            )
+        model_input = st.text_input(
+            "Model ID",
+            value=model,
+            key=f"analysis_setup_model_{scope}_{input_suffix}",
+        )
+        base_url_input = base_url
+        if custom_provider:
+            base_url_input = st.text_input(
+                "API base URL",
+                value=base_url,
+                key=f"analysis_setup_base_url_{scope}_{input_suffix}",
+                placeholder="https://api.example.com/v1",
+            )
+        submitted = st.form_submit_button(
+            "Continue",
+            type="primary",
+            icon=":material/auto_awesome:",
+        )
+
+    if not submitted:
+        if st.button("Cancel", key=f"analysis_setup_cancel_{scope}"):
+            st.session_state.pop("analysis_setup_dialog_scope", None)
+            st.rerun()
+        return
+    api_key = str(api_key or api_key_input).strip()
+    model = str(model_input).strip()
+    base_url = str(base_url_input).strip()
+    if not api_key:
+        st.error(f"Enter an API key for {provider_label or provider}.")
+        return
+    if not model:
+        st.error(f"Enter a model ID for {provider_label or provider}.")
+        return
+    if custom_provider and not base_url:
+        st.error("Enter an API base URL for the custom provider.")
+        return
+    if custom_provider and not provider_label:
+        st.error("Enter a name for the custom provider.")
+        return
+
+    st.session_state.llm_provider = provider
+    st.session_state[api_key_widget] = api_key
+    st.session_state[model_widget] = model
+    if custom_provider:
+        st.session_state.llm_custom_base_url = base_url
+        st.session_state.settings_ai_custom_provider_name = provider_label
+    if configured_provider:
+        session_config_keys = dict(
+            st.session_state.get("analysis_setup_session_keys", {})
+        )
+        session_config_keys[str(configured_provider["id"])] = api_key
+        st.session_state.analysis_setup_session_keys = session_config_keys
+    st.session_state.pop("analysis_setup_dialog_scope", None)
+    _run_analysis(scope)
+    st.rerun()
 
 
 def _active_equity_position_count(*frames: pd.DataFrame) -> int:
@@ -2119,11 +2514,12 @@ def _show_approved_trades(scope: str) -> None:
 
 def _show_workspace() -> None:
     _render_sidebar_settings()
-    _render_app_header(str(st.session_state.broker_name or "Broker"))
+    _render_app_header()
+    if st.session_state.get("analysis_job"):
+        _render_analysis_progress()
     with st.container(border=True, gap="medium"):
         profile_name = _fetch_broker_profile_name()
-        if profile_name:
-            st.caption(f"Signed in as **{profile_name}**")
+        _restore_saved_portfolio_analysis()
         tabs = _render_header_tabs()
         polling_sequence()
         if st.session_state.planning_budget_inr is None:
@@ -2132,6 +2528,10 @@ def _show_workspace() -> None:
             )
         if tabs[APP_TAB_LABELS[0]].open:
             with tabs[APP_TAB_LABELS[0]]:
+                _render_workspace_account_context(
+                    "home",
+                    profile_name,
+                )
                 render_home_workspace(
                     float(st.session_state.balance),
                     st.session_state.equity_holdings,
@@ -2141,13 +2541,76 @@ def _show_workspace() -> None:
                     live_prices_updated_at=(
                         st.session_state.analysis_live_prices_updated_at
                     ),
+                    run_portfolio_analysis=lambda: _request_analysis("all"),
                     render_portfolio_review=_render_portfolio_ai_review,
                 )
         for asset in APP_TAB_LABELS[1:]:
             if tabs[asset].open:
                 with tabs[asset]:
+                    _render_workspace_account_context(
+                        asset.casefold().replace("&", "and").replace(" ", "_"),
+                        profile_name,
+                    )
                     _render_asset_workspace(asset, broker_connected=True)
         render_footer()
+
+
+def _render_workspace_account_context(
+    scope: str,
+    profile_name: str,
+) -> None:
+    status_column, account_column = st.columns(
+        [2, 3],
+        vertical_alignment="center",
+        gap="small",
+    )
+    with status_column:
+        last_sync = st.session_state.last_sync
+        account_status = f"{st.session_state.broker_name} connected"
+        st.badge(
+            account_status,
+            icon=":material/check_circle:",
+            color="green",
+        )
+        if last_sync:
+            st.markdown(
+                ":gray[Last broker sync:] "
+                '<span style="color:rgba(250,250,250,.6);font-size:.875rem">'
+                f"<strong>{last_sync.strftime('%d %b %Y, %H:%M:%S IST')}</strong>"
+                "</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("Broker data sync pending")
+    with account_column:
+        with st.container(
+            horizontal=True,
+            horizontal_alignment="right",
+            vertical_alignment="center",
+            gap="small",
+            wrap=False,
+        ):
+            if profile_name:
+                st.html(
+                    signed_in_label_html(profile_name),
+                    width="content",
+                )
+            st.button(
+                " ",
+                key=f"workspace_disconnect_{scope}",
+                type="primary",
+                on_click=_logout,
+                icon=":material/swap_horiz:",
+                help="Disconnect this broker and connect another account.",
+            )
+    if st.session_state.sync_failed:
+        st.warning(
+            "Some broker data could not be refreshed; showing the last "
+            "successful data."
+        )
+        with st.expander("Refresh diagnostics"):
+            for feed, diagnostic in st.session_state.broker_data_errors.items():
+                st.caption(f"**{feed.replace('_', ' ').title()}:** {diagnostic}")
 
 
 def _fetch_broker_profile_name() -> str:
@@ -2156,6 +2619,9 @@ def _fetch_broker_profile_name() -> str:
     st.session_state.profile_fetch_attempted = True
     adapter = st.session_state.broker_state
     token = st.session_state.token
+    st.session_state.broker_profile_identifier = str(
+        getattr(adapter, "client_id", "") or ""
+    ).strip()
     if adapter is None or not token:
         return ""
     try:
@@ -2174,7 +2640,76 @@ def _fetch_broker_profile_name() -> str:
         return ""
     name = profile.get("name", "").strip() if isinstance(profile, dict) else ""
     st.session_state.broker_profile_name = name
+    profile_identifier = (
+        profile.get("user_id") or profile.get("client_id")
+        if isinstance(profile, dict)
+        else ""
+    )
+    st.session_state.broker_profile_identifier = str(
+        profile_identifier or st.session_state.broker_profile_identifier or name
+    ).strip()
     return name
+
+
+def _restore_saved_portfolio_analysis() -> None:
+    broker_name = str(st.session_state.get("broker_name") or "").strip()
+    account_identifier = str(
+        st.session_state.get("broker_profile_identifier") or ""
+    ).strip()
+    if not broker_name or not account_identifier:
+        return
+
+    account_context = (
+        _tenant_identifier(),
+        broker_name.casefold(),
+        account_identifier,
+    )
+    if st.session_state.get("analysis_account_context") != account_context:
+        st.session_state.analysis_results = {}
+        st.session_state.analysis_timestamps = {}
+        st.session_state.analysis_metadata = {}
+        st.session_state.analysis_storage_errors = {}
+        st.session_state.analysis_errors = {}
+        st.session_state.analysis_price_errors = {}
+        st.session_state.analysis_price_error = None
+        st.session_state.analysis_live_prices = {}
+        st.session_state.analysis_live_prices_updated_at = None
+        st.session_state.analysis_result = None
+        st.session_state.approved_trades = []
+        st.session_state.approved_trades_by_scope = {}
+        st.session_state.audit_trail = []
+        st.session_state.audit_trails_by_scope = {}
+        st.session_state.analysis_account_context = account_context
+        st.session_state.analysis_loaded_for_account = None
+
+    if st.session_state.get("analysis_loaded_for_account") == account_context:
+        return
+    try:
+        saved = load_portfolio_analysis(
+            account_context[0],
+            broker_name,
+            account_identifier,
+            "all",
+        )
+    except StorageRequestPending:
+        return
+    except (OSError, RuntimeError, ValueError) as error:
+        log_failure("Saved portfolio analysis lookup", error, broker=broker_name)
+        st.session_state.analysis_storage_errors["all"] = (
+            "The saved analysis for this broker account could not be loaded."
+        )
+        st.session_state.analysis_loaded_for_account = account_context
+        return
+
+    if saved is not None:
+        st.session_state.analysis_results["all"] = saved["analysis"]
+        st.session_state.analysis_result = saved["analysis"]
+        st.session_state.analysis_timestamps["all"] = saved["analyzed_at"]
+        st.session_state.analysis_metadata["all"] = {
+            "provider": saved["provider"],
+            "model": saved["model"],
+        }
+    st.session_state.analysis_loaded_for_account = account_context
 
 
 def _portfolio_report() -> tuple[str, str]:
@@ -2398,8 +2933,14 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
             st.session_state.broker_data_errors.get("equity"),
             broker_connected=broker_connected,
             symbols=_workspace_symbols(st.session_state.equity_holdings),
-            run_analysis=_run_analysis,
+            run_analysis=_request_analysis,
             show_approved_trades=_show_approved_trades,
+            total_investments=calculate_allocation(
+                float(st.session_state.balance),
+                st.session_state.equity_holdings,
+                st.session_state.portfolio,
+                st.session_state.mutual_funds,
+            )["total_investments"],
         )
     elif asset == "Trades":
         render_trades_workspace(
@@ -2407,7 +2948,7 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
             st.session_state.broker_data_errors.get("trading"),
             broker_connected=broker_connected,
             symbols=_workspace_symbols(st.session_state.portfolio),
-            run_analysis=_run_analysis,
+            run_analysis=_request_analysis,
             show_approved_trades=_show_approved_trades,
         )
     elif asset == "F&O":
@@ -2417,7 +2958,7 @@ def _render_asset_workspace(asset: str, *, broker_connected: bool) -> None:
             st.session_state.mutual_funds,
             st.session_state.broker_data_errors.get("mutual_funds")
             or st.session_state.mutual_fund_error,
-            run_analysis=_run_analysis,
+            run_analysis=_request_analysis,
             show_approved_trades=_show_approved_trades,
             render_local_asset_research=render_local_asset_research_view,
         )
@@ -2531,11 +3072,17 @@ def _render_portfolio_ai_review() -> None:
             "actual cash. Candidates below 70% confidence will not be approved."
         )
         render_analysis_panel(
-            "all", "your full portfolio", _run_analysis, _show_approved_trades
+            "all",
+            "your full portfolio",
+            _request_analysis,
+            _show_approved_trades,
         )
 
 def _logout() -> None:
     st.session_state.return_to_home = True
+    active_analysis_job = st.session_state.pop("analysis_job", None)
+    if active_analysis_job:
+        active_analysis_job["future"].cancel()
     for key in (
         "token",
         "broker_state",
@@ -2553,8 +3100,16 @@ def _logout() -> None:
         "last_sync_attempt",
         "sync_failed",
         "broker_data_errors",
+        "broker_profile_name",
+        "broker_profile_identifier",
+        "profile_fetch_attempted",
         "analysis_result",
         "analysis_results",
+        "analysis_timestamps",
+        "analysis_metadata",
+        "analysis_storage_errors",
+        "analysis_account_context",
+        "analysis_loaded_for_account",
         "analysis_errors",
         "ai_settings_prompt",
         "analysis_price_errors",
@@ -2577,6 +3132,7 @@ def _logout() -> None:
         "pending_broker_adapter",
         "pending_login_url",
         "pending_redirect_url",
+        "broker_callback_url",
         "pending_oauth_fingerprint",
         "pending_oauth_expires_at",
     ):
@@ -2590,6 +3146,9 @@ def _logout() -> None:
     st.session_state.risk_alerts = []
     st.session_state.risk_errors = []
     st.session_state.analysis_results = {}
+    st.session_state.analysis_timestamps = {}
+    st.session_state.analysis_metadata = {}
+    st.session_state.analysis_storage_errors = {}
     st.session_state.analysis_errors = {}
     st.session_state.analysis_price_errors = {}
     st.session_state.market_ai_candidates = []
@@ -2622,6 +3181,7 @@ def _logout_oidc() -> None:
             "user_settings_form_cache",
             "user_settings_dialog_open",
             "user_settings_feedback",
+            "analysis_setup_session_keys",
             "tested_ai_provider_fingerprints",
         }:
             st.session_state.pop(key, None)
@@ -2634,5 +3194,9 @@ if st.session_state.token is None:
     _show_login()
 else:
     _show_workspace()
+
+analysis_setup_scope = st.session_state.get("analysis_setup_dialog_scope")
+if analysis_setup_scope:
+    _render_analysis_setup_dialog(str(analysis_setup_scope))
 
 process_browser_storage_bridge()

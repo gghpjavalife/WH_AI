@@ -99,12 +99,10 @@ def render_feature_badges() -> None:
 
 
 def render_header(
-    connected_broker: str | None,
     *,
     render_share: Callable[[], None],
     render_settings: Callable[[], None],
     render_agent: Callable[[], None],
-    on_disconnect: Callable[[], None],
 ) -> None:
     with st.container(border=True, gap="medium"):
         with st.container(
@@ -133,28 +131,3 @@ def render_header(
             wrap=True,
         ):
             render_feature_badges()
-            if connected_broker:
-                with st.container(
-                    horizontal=True,
-                    vertical_alignment="center",
-                    gap="small",
-                    wrap=True,
-                ):
-                    st.badge(
-                        f"{connected_broker} connected",
-                        icon=":material/check_circle:",
-                        color="green",
-                    )
-                    st.button(
-                        "Switch account",
-                        key="header_disconnect_broker",
-                        on_click=on_disconnect,
-                        icon=":material/swap_horiz:",
-                        help="Disconnect this broker and connect another account.",
-                    )
-            else:
-                st.badge(
-                    "No broker connected",
-                    icon=":material/link_off:",
-                    color="gray",
-                )

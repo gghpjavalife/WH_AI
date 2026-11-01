@@ -49,14 +49,14 @@ def test_ai_provider_configuration(
     if provider == LLMProvider.GEMINI:
         try:
             with genai.Client(api_key=api_key) as client:
-                response = client.models.generate_content(
+                chat = client.chats.create(
                     model=model,
-                    contents="Reply with exactly: READY",
                     config=types.GenerateContentConfig(
                         temperature=0,
                         max_output_tokens=8,
                     ),
                 )
+                response = chat.send_message("Reply with exactly: READY")
         except APIError as exc:
             raise LLMProviderError(
                 "Gemini rejected the test request. Check the API key, model, "
@@ -287,6 +287,13 @@ If that list is empty, return an empty cash_deployment_list.
 Return a JSON object with exactly these top-level properties:
 {{
   "analysis": "Concise analysis of the supplied active holdings and cash.",
+  "assessment": {{
+    "sentiment": "positive, cautious, or negative",
+    "summary": "One-sentence, evidence-based executive summary.",
+    "strengths": ["Evidence-based portfolio strength"],
+    "warnings": ["Material risk or data limitation"],
+    "suggestions": ["Practical, non-binding next step"]
+  }},
   "cash_deployment_list": [
     {{
       "Ticker": "one ticker from the broker-quoted list",
@@ -303,6 +310,15 @@ Return a JSON object with exactly these top-level properties:
     }}
   ]
 }}
+Assessment rules:
+- Use positive only when supplied data supports a favorable overall posture;
+  use cautious for mixed evidence, missing information, or no clear edge; use
+  negative only when material risks dominate. An empty candidate list alone is
+  not evidence of a negative portfolio.
+- Keep each category concise and tied to supplied data. Return empty arrays
+  when there is no supported item; do not invent facts to fill a category.
+- Warnings should include concentration, drawdown, stale/missing quotes, or
+  other material limitations when supported. Suggestions must be non-binding.
 Every numeric price must be a positive INR number, with Target_Price >
 Entry_Price > Stop_Loss. Confidence_Score must be 0-100. Do not represent
 confidence as a probability of profit. Entry_Price is a suggested entry, not a
@@ -444,11 +460,55 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
         result.get("cash_deployment_list"), list
     ):
         raise RuntimeError(f"{provider} response is missing the required JSON fields.")
-    if set(result) != {"analysis", "cash_deployment_list"}:
+    if set(result) not in (
+        {"analysis", "cash_deployment_list"},
+        {"analysis", "assessment", "cash_deployment_list"},
+    ):
         raise RuntimeError(f"{provider} returned unexpected top-level JSON fields.")
     analysis = result.get("analysis")
     if not isinstance(analysis, str):
         raise RuntimeError(f"{provider} analysis must be a string.")
+    if "assessment" not in result:
+        assessment = {
+            "sentiment": "cautious",
+            "summary": analysis,
+            "strengths": [],
+            "warnings": [
+                "The provider did not return categorized assessment details."
+            ],
+            "suggestions": [],
+        }
+    else:
+        assessment = result["assessment"]
+    assessment_fields = {
+        "sentiment",
+        "summary",
+        "strengths",
+        "warnings",
+        "suggestions",
+    }
+    if not isinstance(assessment, dict) or set(assessment) not in (
+        assessment_fields,
+        assessment_fields | {"scenarios"},
+    ):
+        raise RuntimeError(f"{provider} returned an invalid portfolio assessment.")
+    if not isinstance(assessment["sentiment"], str) or assessment[
+        "sentiment"
+    ] not in {"positive", "cautious", "negative"}:
+        raise RuntimeError(f"{provider} returned an invalid assessment sentiment.")
+    if not isinstance(assessment["summary"], str) or not assessment["summary"].strip():
+        raise RuntimeError(f"{provider} returned an empty assessment summary.")
+    for category in ("strengths", "warnings", "suggestions"):
+        entries = assessment[category]
+        if (
+            not isinstance(entries, list)
+            or len(entries) > 5
+            or any(not isinstance(item, str) or not item.strip() for item in entries)
+        ):
+            raise RuntimeError(
+                f"{provider} returned invalid assessment {category}."
+            )
+    assessment.pop("scenarios", None)
 
     targets = []
     seen_tickers: set[str] = set()
@@ -532,7 +592,11 @@ Do not wrap the JSON in Markdown fences or add text outside the object.
             f"\n\n{rejected_targets} recommendation(s) were excluded because "
             "they were duplicate or lacked a supported authenticated live quote."
         )
-    return {"analysis": analysis, "cash_deployment_list": targets}
+    return {
+        "analysis": analysis,
+        "assessment": assessment,
+        "cash_deployment_list": targets,
+    }
 
 
 def calculate_atr(

@@ -252,7 +252,9 @@ shows an authorization link; complete Dhan authorization in the same browser
 tab because its callback does not include a state parameter. Users switching
 Upstox accounts should sign out of the hosted login (or use a private browser
 window) before authorizing another account. Callback URLs must match the
-registered URL exactly.
+registered URL exactly. Review or change the shared callback address under
+**User settings → Brokers → OAuth callback URL**; it is no longer shown in the
+broker connection panel.
 
 Angel One requires account-specific API key, Client ID, password, and TOTP
 secret. Dhan requires a matching Client ID, API key, and API secret; one
