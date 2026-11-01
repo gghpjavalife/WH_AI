@@ -130,12 +130,14 @@ def render_analysis_brief(
     *,
     title: str,
     compact: bool = False,
+    portfolio_overview: bool = False,
     placeholder: bool = False,
     collapsible: bool = False,
     run_analysis: Callable[[], None] | None = None,
     last_analyzed_at: object = None,
     analysis_metadata: dict[str, object] | None = None,
     storage_error: str | None = None,
+    analysis_error: str | None = None,
 ) -> None:
     analysis_job = st.session_state.get("analysis_job")
     analysis_running = bool(
@@ -178,6 +180,8 @@ def render_analysis_brief(
                 )
                 if storage_error:
                     st.warning(storage_error)
+                if analysis_error:
+                    st.error(analysis_error)
         return
 
     assessment = analysis.get("assessment")
@@ -209,9 +213,16 @@ def render_analysis_brief(
         )
         if storage_error:
             st.warning(storage_error)
+        if analysis_error:
+            st.error(analysis_error)
         st.write(summary)
+        if portfolio_overview:
+            st.caption(
+                "Collective portfolio overview only; no deployment recommendations "
+                "or JEV rule scans are included."
+            )
 
-        if not compact:
+        if not compact and not portfolio_overview:
             narrative = str(analysis.get("analysis", "")).strip()
             if narrative and narrative != summary:
                 with st.expander(
@@ -225,6 +236,8 @@ def render_analysis_brief(
             ("Warnings", "warnings", ":material/thumb_down:", "red"),
             ("Suggestions", "suggestions", ":material/lightbulb:", "blue"),
         )
+        if portfolio_overview:
+            categories = categories[:2]
         columns = st.columns(len(categories))
         for column, (heading, key, icon, color) in zip(
             columns, categories, strict=True

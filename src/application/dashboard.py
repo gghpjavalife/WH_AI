@@ -42,8 +42,6 @@ from features.trades.rules import (
     buy_execution_block_reason,
 )
 from features.analysis.panel import (
-    analysis_mentions_equity_holdings,
-    analysis_sentiment,
     portfolio_analysis_is_configured,
     render_analysis_panel,
 )
@@ -83,7 +81,6 @@ from security.oauth import consume_oauth_state_context, create_oauth_state
 from core.config import settings
 from application.help import answer_app_help_question
 from ui.helpers import (
-    analysis_tab_status_css,
     app_animation_css,
     gold_theme_css,
     broker_connect_button_css,
@@ -286,6 +283,9 @@ st.session_state.setdefault("analysis_timestamps", {})
 st.session_state.setdefault("analysis_metadata", {})
 st.session_state.setdefault("analysis_storage_errors", {})
 st.session_state.setdefault("analysis_errors", {})
+st.session_state.setdefault("portfolio_overview_analysis", None)
+st.session_state.setdefault("portfolio_overview_timestamp", None)
+st.session_state.setdefault("portfolio_overview_metadata", None)
 st.session_state.setdefault("analysis_price_errors", {})
 st.session_state.setdefault("ai_settings_prompt", "")
 st.session_state.setdefault("llm_provider_settings", {})
@@ -434,72 +434,12 @@ def _render_header_tabs():
     if st.session_state.pop("return_to_home", False):
         selected_index = 0
 
-    analysis_results = st.session_state.get("analysis_results")
-    if not isinstance(analysis_results, dict):
-        analysis_results = {}
-    tab_scopes = {
-        "Home": ("all",),
-        "Equities": ("equity",),
-        "Trades": ("trading",),
-        "F&O": ("options", "futures"),
-        "Mutual Funds": ("mutual_funds",),
-    }
-    navigation_labels = []
-    tab_statuses = {}
-    status_labels = {
-        "positive": "Constructive",
-        "cautious": "Review",
-        "negative": "Risk",
-    }
-    for index, (tab_label, navigation_label) in enumerate(
-        zip(APP_TAB_LABELS, APP_TABS, strict=True), start=1
-    ):
-        assessments = [
-            analysis_results.get(scope)
-            for scope in tab_scopes.get(tab_label, ())
-            if analysis_results.get(scope) is not None
-        ]
-        if (
-            tab_label == "Equities"
-            and not assessments
-            and analysis_mentions_equity_holdings(
-                analysis_results.get("all"),
-                st.session_state.get("equity_holdings", pd.DataFrame()),
-            )
-        ):
-            assessments = [analysis_results["all"]]
-
-        if assessments:
-            if tab_label == "F&O":
-                sentiments = [analysis_sentiment(item) for item in assessments]
-                status = (
-                    "positive"
-                    if len(assessments) == len(tab_scopes[tab_label])
-                    and sentiments
-                    and all(item == "positive" for item in sentiments)
-                    else (
-                        "negative"
-                        if "negative" in sentiments
-                        else "cautious"
-                    )
-                )
-            else:
-                status = analysis_sentiment(assessments[0])
-            if status is not None and status in status_labels:
-                navigation_label += f" · {status_labels[status]}"
-                tab_statuses[index] = status
-        navigation_labels.append(navigation_label)
-
     if selected_index is None:
-        if current_navigation in navigation_labels:
-            selected_index = navigation_labels.index(current_navigation)
-        else:
-            selected_index = 0
-    st.session_state["app_navigation"] = navigation_labels[selected_index]
+        selected_index = 0
+    st.session_state["app_navigation"] = APP_TABS[selected_index]
     with st.container(key="app_navigation_tabs"):
-        st.html(analysis_tab_status_css(tab_statuses))
         tabs = st.tabs(
-            navigation_labels,
+            APP_TABS,
             key="app_navigation",
             on_change="rerun",
             width="stretch",
@@ -768,6 +708,9 @@ def _authenticate_angel_one() -> None:
         st.session_state.alerted_risk_channels = []
         st.session_state.risk_high_water = {}
         st.session_state.analysis_result = None
+        st.session_state.portfolio_overview_analysis = None
+        st.session_state.portfolio_overview_timestamp = None
+        st.session_state.portfolio_overview_metadata = None
         st.session_state.approved_trades = []
         st.session_state.mutual_fund_manual_import = True
         st.session_state.login_error = None
@@ -1599,6 +1542,10 @@ def _record_analysis_failure(scope: str, message: str) -> None:
     st.session_state.analysis_timestamps.pop(scope, None)
     st.session_state.analysis_metadata.pop(scope, None)
     st.session_state.approved_trades_by_scope[scope] = []
+    if scope == "portfolio_overview":
+        st.session_state.portfolio_overview_analysis = None
+        st.session_state.portfolio_overview_timestamp = None
+        st.session_state.portfolio_overview_metadata = None
 
 
 def _complete_analysis_job(job: dict[str, Any]) -> None:
@@ -1691,6 +1638,43 @@ def _complete_analysis_job(job: dict[str, Any]) -> None:
         _record_analysis_failure(scope, f"Portfolio analysis failed: {error}")
         return
 
+    if job.get("portfolio_overview_only"):
+        st.session_state.portfolio_overview_analysis = analysis
+        analyzed_at = datetime.now(ZoneInfo(settings.timezone)).isoformat()
+        st.session_state.portfolio_overview_timestamp = analyzed_at
+        st.session_state.portfolio_overview_metadata = {
+            "provider": provider,
+            "model": selected_model,
+        }
+        st.session_state.analysis_errors.pop("portfolio_overview", None)
+        account_identifier = str(job.get("broker_account_identifier") or "").strip()
+        broker_name = str(job.get("broker_name") or "").strip()
+        if account_identifier and broker_name:
+            try:
+                save_portfolio_analysis(
+                    str(job["owner_identifier"]),
+                    broker_name,
+                    account_identifier,
+                    "overview",
+                    analysis,
+                    analyzed_at,
+                    provider=provider,
+                    model=selected_model,
+                )
+            except StorageRequestPending:
+                st.session_state.analysis_storage_errors["overview"] = (
+                    "The overview completed, but browser storage is still "
+                    "processing the save."
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                log_failure("Portfolio overview save", error, broker=broker_name)
+                st.session_state.analysis_storage_errors["overview"] = (
+                    "The overview completed, but it could not be saved."
+                )
+            else:
+                st.session_state.analysis_storage_errors.pop("overview", None)
+        return
+
     engine = JevRuleEngine(
         {
             "cash_balance": min(
@@ -1763,7 +1747,6 @@ def _complete_analysis_job(job: dict[str, Any]) -> None:
                 "Analysis completed for this session, but this broker did not "
                 "provide a stable account identifier for saving it."
             )
-
 
 @st.fragment(run_every=1)
 def _render_analysis_progress() -> None:
@@ -2074,11 +2057,113 @@ def _run_analysis(scope: str = "all") -> None:
     st.rerun(scope="app")
 
 
+def _run_portfolio_overview() -> None:
+    active_job = st.session_state.get("analysis_job")
+    if active_job and not active_job["future"].done():
+        return
+
+    provider = str(
+        st.session_state.get("llm_provider", LLMProvider.GEMINI.value)
+    )
+    provider_slug = provider.lower().replace(" ", "_").replace("-", "_")
+    api_key_widget = (
+        "user_gemini_api_key"
+        if provider == LLMProvider.GEMINI
+        else f"user_llm_api_key_{provider_slug}"
+    )
+    api_key = str(st.session_state.get(api_key_widget) or "").strip()
+    model = str(
+        st.session_state.get(
+            f"llm_model_selection_{provider_slug}",
+            settings.llm_provider_models[provider][0]
+            if settings.llm_provider_models.get(provider)
+            else "",
+        )
+    ).strip()
+    if not api_key or not model:
+        _record_analysis_failure(
+            "portfolio_overview",
+            f"Set a {provider} API key and model in User settings before analysis.",
+        )
+        return
+
+    provider_base_url = (
+        str(
+            st.session_state.get("llm_custom_base_url")
+            or settings.llm_custom_base_url
+        ).strip()
+        if provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE
+        else None
+    )
+    if provider == LLMProvider.CUSTOM_OPENAI_COMPATIBLE and not provider_base_url:
+        _record_analysis_failure(
+            "portfolio_overview",
+            "Set the custom provider's API base URL before analysis.",
+        )
+        return
+
+    summary = json.dumps(
+        {
+            "long_term_equity_holdings": (
+                st.session_state.equity_holdings.to_dict(orient="records")
+            ),
+            "open_trading_positions": (
+                st.session_state.portfolio.to_dict(orient="records")
+            ),
+            "mutual_fund_holdings": (
+                st.session_state.mutual_funds.to_dict(orient="records")
+            ),
+            "reported_broker_cash_inr": float(st.session_state.balance),
+        },
+        ensure_ascii=True,
+    )
+    job = {
+        "scope": "portfolio_overview",
+        "stage": "overview",
+        "portfolio_overview_only": True,
+        "provider": provider,
+        "model": model,
+        "api_key": api_key,
+        "provider_base_url": provider_base_url,
+        "owner_identifier": _tenant_identifier(),
+        "broker_name": str(st.session_state.get("broker_name") or ""),
+        "broker_account_identifier": str(
+            st.session_state.get("broker_profile_identifier") or ""
+        ),
+        "future": submit_portfolio_analysis(
+            portfolio_summary=summary,
+            available_cash=0.0,
+            market_context=(
+                "Only broker-reported holding quantities, prices, NAVs, and cash "
+                "were supplied; they may be stale. No external market scan, "
+                "deployment budget, or JEV rule data was supplied."
+            ),
+            live_prices={},
+            candidate_tickers=[],
+            api_key=api_key,
+            model=model,
+            provider=provider,
+            base_url=provider_base_url,
+            portfolio_only=True,
+        ),
+    }
+    st.session_state.analysis_errors.pop("portfolio_overview", None)
+    st.session_state["analysis_job"] = job
+    st.rerun(scope="app")
+
+
 def _request_analysis(scope: str) -> None:
     if portfolio_analysis_is_configured():
         _run_analysis(scope)
         return
     st.session_state.analysis_setup_dialog_scope = scope
+
+
+def _request_portfolio_overview() -> None:
+    if portfolio_analysis_is_configured():
+        _run_portfolio_overview()
+        return
+    st.session_state.analysis_setup_dialog_scope = "portfolio_overview"
 
 
 @st.dialog("AI analysis setup")
@@ -2303,7 +2388,10 @@ def _render_analysis_setup_dialog(scope: str) -> None:
         session_config_keys[str(configured_provider["id"])] = api_key
         st.session_state.analysis_setup_session_keys = session_config_keys
     st.session_state.pop("analysis_setup_dialog_scope", None)
-    _run_analysis(scope)
+    if scope == "portfolio_overview":
+        _run_portfolio_overview()
+    else:
+        _run_analysis(scope)
     st.rerun()
 
 
@@ -2541,7 +2629,7 @@ def _show_workspace() -> None:
                     live_prices_updated_at=(
                         st.session_state.analysis_live_prices_updated_at
                     ),
-                    run_portfolio_analysis=lambda: _request_analysis("all"),
+                    run_portfolio_analysis=_request_portfolio_overview,
                     render_portfolio_review=_render_portfolio_ai_review,
                 )
         for asset in APP_TAB_LABELS[1:]:
@@ -2670,6 +2758,9 @@ def _restore_saved_portfolio_analysis() -> None:
         st.session_state.analysis_metadata = {}
         st.session_state.analysis_storage_errors = {}
         st.session_state.analysis_errors = {}
+        st.session_state.portfolio_overview_analysis = None
+        st.session_state.portfolio_overview_timestamp = None
+        st.session_state.portfolio_overview_metadata = None
         st.session_state.analysis_price_errors = {}
         st.session_state.analysis_price_error = None
         st.session_state.analysis_live_prices = {}
@@ -2708,6 +2799,30 @@ def _restore_saved_portfolio_analysis() -> None:
         st.session_state.analysis_metadata["all"] = {
             "provider": saved["provider"],
             "model": saved["model"],
+        }
+    try:
+        saved_overview = load_portfolio_analysis(
+            account_context[0],
+            broker_name,
+            account_identifier,
+            "overview",
+        )
+    except StorageRequestPending:
+        return
+    except (OSError, RuntimeError, ValueError) as error:
+        log_failure("Saved portfolio overview lookup", error, broker=broker_name)
+        st.session_state.analysis_storage_errors["overview"] = (
+            "The saved portfolio overview could not be loaded."
+        )
+        st.session_state.analysis_loaded_for_account = account_context
+        return
+
+    if saved_overview is not None:
+        st.session_state.portfolio_overview_analysis = saved_overview["analysis"]
+        st.session_state.portfolio_overview_timestamp = saved_overview["analyzed_at"]
+        st.session_state.portfolio_overview_metadata = {
+            "provider": saved_overview["provider"],
+            "model": saved_overview["model"],
         }
     st.session_state.analysis_loaded_for_account = account_context
 
@@ -3105,6 +3220,9 @@ def _logout() -> None:
         "profile_fetch_attempted",
         "analysis_result",
         "analysis_results",
+        "portfolio_overview_analysis",
+        "portfolio_overview_timestamp",
+        "portfolio_overview_metadata",
         "analysis_timestamps",
         "analysis_metadata",
         "analysis_storage_errors",

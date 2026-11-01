@@ -36,16 +36,6 @@ RECOMMENDED_FILTERS = {
     "minimum_average_volume": 100_000.0,
     "require_above_sma50": True,
 }
-TRADING_FILTERS = {
-    "minimum_price": 10.0,
-    "maximum_price": 10_000.0,
-    "minimum_rsi": 25.0,
-    "maximum_rsi": 75.0,
-    "minimum_average_volume": 200_000.0,
-    "require_above_sma50": False,
-    "minimum_relative_volume": 1.0,
-    "minimum_atr_pct": 1.0,
-}
 OPEN_FILTERS = {
     "minimum_price": 0.0,
     "maximum_price": 1_000_000.0,
@@ -56,10 +46,6 @@ OPEN_FILTERS = {
 }
 
 
-def _numeric_filter(value: float | int | None, fallback: float) -> float:
-    return float(fallback if value is None else value)
-
-
 SCAN_METHOD = (
     "Every stock is scored on all of its indicators and each one is checked "
     "for a positive reading: price against the 20, 50 and 200-day averages, "
@@ -67,7 +53,7 @@ SCAN_METHOD = (
     "Stochastic, CCI, money flow (MFI), OBV, Bollinger position, volume "
     "against its 20-day average, 1 and 3-month returns, and the position in "
     "the 52-week range. The more positive checks a stock has, the stronger "
-    "its signal: Strong Buy, Buy, Hold or Sell. No price, RSI or volume "
+    "its signal: Strong Buy, Buy, Hold, Sell or Strong Sell. No price, RSI or volume "
     "filter is applied by default."
 )
 DEFAULT_SCAN_SYMBOLS = [
@@ -137,6 +123,7 @@ def _render_stock_result(
         "BUY": st.success,
         "HOLD": st.warning,
         "SELL": st.error,
+        "STRONG SELL": st.error,
     }[recommendation]
     notice(
         f"**{recommendation} — {label or symbol}**  \n{assessment['reason']}",
@@ -145,6 +132,7 @@ def _render_stock_result(
             "BUY": ":material/trending_up:",
             "HOLD": ":material/pause_circle:",
             "SELL": ":material/trending_down:",
+            "STRONG SELL": ":material/trending_down:",
         }[recommendation],
     )
     first, second, third = st.columns(3)
@@ -281,7 +269,13 @@ def _render_single_stock_search(
 
 
 RESULTS_PAGE_SIZE = 10
-_SIGNAL_RANK = {"STRONG BUY": 0, "BUY": 1, "HOLD": 2, "SELL": 3}
+_SIGNAL_RANK = {
+    "STRONG BUY": 0,
+    "BUY": 1,
+    "HOLD": 2,
+    "SELL": 3,
+    "STRONG SELL": 4,
+}
 _TOOLTIP_FORMATS = (
     ("As_of", "As of", "{}"),
     ("Daily_change_%", "Daily change", "{:+.2f}%"),
@@ -505,7 +499,7 @@ _CHECK_INFO_KEY = {
 _TONE_CLASS = {_POS: "pos", _NEG: "neg"}
 
 
-def _scan_table_payload(
+def build_scan_table_payload(
     rows: list[dict[str, object]], labels: dict[str, str]
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Rows and settings for the interactive, browser-side results table."""
@@ -565,6 +559,9 @@ def _scan_table_payload(
         "checkInfo": _CHECK_INFO_KEY,
     }
     return payload, config
+
+
+_scan_table_payload = build_scan_table_payload
 
 
 _FAILURE_NO_DATA = "Not available on Yahoo Finance"
@@ -731,9 +728,7 @@ def _scan_stocks(
     results.sort(
         key=lambda row: (
             not bool(row["Passes_filters"]),
-            {"STRONG BUY": 0, "BUY": 1, "HOLD": 2, "SELL": 3}[
-                str(row["Recommendation"])
-            ],
+            _SIGNAL_RANK[str(row["Recommendation"])],
             -int(row.get("Positive_signals", 0)),
             -int(row.get("Signal_score", 0)),
             str(row["Ticker"]),
@@ -790,23 +785,12 @@ def _save_scanner_state(prefix: str) -> None:
 def _render_scanner(
     *, scope: str, suggested_symbols: list[str] | None = None
 ) -> None:
-    if scope == "Trading":
-        st.caption(
-            "Screen active trade candidates using price, RSI, average liquidity, "
-            "relative volume, and ATR-normalized movement. Full indicator values "
-            "remain visible for stocks that do not pass every filter."
-        )
-    else:
-        st.caption(
-            "Screen longer-term equity candidates using price, RSI, average "
-            "liquidity, and trend filters. Full indicator values remain visible "
-            "for stocks that do not pass every filter."
-        )
+    st.caption(
+        "Review technical indicators for the selected stocks. Use the result "
+        "table filters to narrow the scanned results."
+    )
     prefix = scope.lower().replace(" ", "_")
     _restore_scanner_state(prefix)
-    recommended_filters = (
-        TRADING_FILTERS if scope == "Trading" else RECOMMENDED_FILTERS
-    )
     with st.container(horizontal=True, vertical_alignment="center"):
         refresh_symbols = st.button(
             "Refresh stock list",
@@ -829,37 +813,11 @@ def _render_scanner(
             f"{len(master):,} active Indian equities available across NSE "
             "and BSE · lists refresh automatically every 24 hours."
         )
-        with st.expander("What do the stock counts mean?", icon=":material/help:"):
-            st.markdown(
-                "- **Listed stocks**: securities in the combined active NSE/BSE "
-                "exchange list. The scan universe may also include broker-mapped "
-                "or portfolio tickers.\n"
-                "- **Fetched**: selected symbols for which enough daily price history "
-                "was retrieved to calculate indicators. Unavailable symbols are "
-                "reported separately as scan failures.\n"
-                "- **Buy / Strong Buy signals**: fetched stocks whose technical "
-                "indicator score is classified as Buy or Strong Buy. With custom "
-                "filters enabled, this count includes only stocks that pass them.\n"
-                "- **NSE candidates for portfolio analysis**: the latest Equities "
-                "scan's Buy/Strong Buy stocks that pass custom filters (when enabled) "
-                "and are NSE tickers. BSE `.BO` listings are excluded. The LLM can "
-                "recommend only candidates with usable broker quotes."
-            )
         st.markdown(
             "[BSE listed-equity feed ↗](https://www.bseindia.com/) · "
             "[NSE equity security master ↗]"
             "(https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv)"
         )
-    for filter_name, default_value in recommended_filters.items():
-        st.session_state.setdefault(
-            f"market_{prefix}_{filter_name}", default_value
-        )
-    minimum_price: float
-    maximum_price: float
-    minimum_rsi: float
-    maximum_rsi: float
-    minimum_average_volume: float
-    require_above_sma50: bool
     requested_defaults = [
         symbol
         for symbol in (suggested_symbols or DEFAULT_SCAN_SYMBOLS)
@@ -945,149 +903,18 @@ def _render_scanner(
                 "workspace are included in the suggested list."
             ),
         )
-    use_custom = st.toggle(
-        "Use custom filters",
-        key=f"market_{prefix}_use_custom",
-        help="Narrow the scan by price, RSI, volume and trend. Suggested "
-        "values are pre-filled.",
-    )
     st.caption(SCAN_METHOD)
-    extra_filters: dict[str, float] = {}
-    if use_custom:
-        left, middle, right = st.columns(3)
-        with left:
-            minimum_price = _numeric_filter(st.number_input(
-                "Minimum price (₹)",
-                min_value=0.0,
-                max_value=1_000_000.0,
-                step=5.0,
-                key=f"market_{prefix}_minimum_price",
-            ), 0.0)
-            minimum_rsi = _numeric_filter(st.number_input(
-                "Minimum RSI",
-                min_value=0.0,
-                max_value=100.0,
-                step=1.0,
-                key=f"market_{prefix}_minimum_rsi",
-            ), 0.0)
-        with middle:
-            maximum_price = _numeric_filter(st.number_input(
-                "Maximum price (₹)",
-                min_value=1.0,
-                max_value=1_000_000.0,
-                step=100.0,
-                key=f"market_{prefix}_maximum_price",
-            ), 1_000_000.0)
-            maximum_rsi = _numeric_filter(st.number_input(
-                "Maximum RSI",
-                min_value=0.0,
-                max_value=100.0,
-                step=1.0,
-                key=f"market_{prefix}_maximum_rsi",
-            ), 100.0)
-        with right:
-            minimum_average_volume = _numeric_filter(st.number_input(
-                "Minimum 20-day average volume",
-                min_value=0.0,
-                max_value=1_000_000_000.0,
-                step=10_000.0,
-                key=f"market_{prefix}_minimum_average_volume",
-                format="%.0f",
-                help=(
-                    "Screens out thinly traded stocks; this is a share count, "
-                    "not a rupee value."
-                ),
-            ), 0.0)
-            require_above_sma50 = st.checkbox(
-                "Require price above the 50-day average",
-                key=f"market_{prefix}_require_above_sma50",
-            )
-        if scope == "Trading":
-            relative_volume_column, atr_column = st.columns(2)
-            with relative_volume_column:
-                extra_filters["minimum_relative_volume"] = _numeric_filter(st.number_input(
-                    "Minimum volume / 20-day average",
-                    min_value=0.0,
-                    max_value=100.0,
-                    step=0.1,
-                    key=f"market_{prefix}_minimum_relative_volume",
-                    help="Targets active sessions with above-average traded volume.",
-                ), 0.0)
-            with atr_column:
-                extra_filters["minimum_atr_pct"] = _numeric_filter(st.number_input(
-                    "Minimum ATR / price (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    step=0.1,
-                    key=f"market_{prefix}_minimum_atr_pct",
-                    help="Targets stocks with a minimum daily true-range movement.",
-                ), 0.0)
-
-    else:
-        minimum_price = 0.0
-        maximum_price = 1_000_000.0
-        minimum_rsi = 0.0
-        maximum_rsi = 100.0
-        minimum_average_volume = 0.0
-        require_above_sma50 = False
-
-    current_filters: dict[str, float | bool] = {
-        "minimum_price": minimum_price,
-        "maximum_price": maximum_price,
-        "minimum_rsi": minimum_rsi,
-        "maximum_rsi": maximum_rsi,
-        "minimum_average_volume": minimum_average_volume,
-        "require_above_sma50": require_above_sma50,
-        **extra_filters,
-    }
-    custom_filters = use_custom and current_filters != recommended_filters
-    if not use_custom:
-        pass
-    elif custom_filters:
-        st.warning(
-            "These filters differ from the suggested defaults. Review them before "
-            "scanning; custom filters may return weaker or fewer matches."
-        )
-    else:
-        st.caption(
-            (
-                "Suggested trade filters favor active volume and sufficient "
-                "daily price movement."
-                if scope == "Trading"
-                else "Suggested equity filters favor established prices, liquid "
-                "trading, non-extreme RSI, and positive medium-term trend."
-            )
-        )
-    if minimum_price > maximum_price:
-        st.error("Minimum price must not exceed maximum price.")
-    if minimum_rsi > maximum_rsi:
-        st.error("Minimum RSI must not exceed maximum RSI.")
-
-    if custom_filters:
-        st.html(
-            f"<style>.st-key-market_{prefix}_scan_button button"
-            "{background:#b42318!important;"
-            "border-color:#b42318!important;color:#fff!important}</style>"
-        )
-    can_scan = (
-        bool(symbols)
-        and minimum_price <= maximum_price
-        and minimum_rsi <= maximum_rsi
-    )
+    current_filters = OPEN_FILTERS.copy()
     with st.container(horizontal=True, vertical_alignment="center"):
         scan_clicked = st.button(
             "Scan selected stocks",
             key=f"market_{prefix}_scan_button",
             type="primary",
             icon=":material/troubleshoot:",
-            disabled=not can_scan,
-            help=(
-                "The button turns red when filters differ from the suggested defaults."
-                if custom_filters
-                else "Fetch delayed public daily candles and evaluate the selected stocks."
-            ),
+            disabled=not bool(symbols),
+            help="Fetch delayed public daily candles and evaluate the selected stocks.",
         )
-        
+
     scan_requested = scan_clicked
     results: list[dict[str, object]] = []
     failures: dict[str, str] = {}
@@ -1106,23 +933,20 @@ def _render_scanner(
     failures_key = f"market_{prefix}_scan_failures"
     filters_key = f"market_{prefix}_scan_filters"
     symbols_key = f"market_{prefix}_scan_symbols_used"
-    custom_key = f"market_{prefix}_scan_custom"
     if scan_requested:
         st.session_state[results_key] = results
         st.session_state[failures_key] = failures
         st.session_state[filters_key] = current_filters.copy()
         st.session_state[symbols_key] = symbols.copy()
-        st.session_state[custom_key] = use_custom
         if scope == "Equities":
             st.session_state.market_ai_candidates = _ai_recommendation_candidates(
-                results, use_custom_filters=use_custom
+                results
             )
             st.session_state.market_ai_candidates_updated_at = datetime.now()
 
     previous_results = st.session_state.get(results_key, [])
     previous_filters = st.session_state.get(filters_key)
     previous_symbols = st.session_state.get(symbols_key)
-    used_custom = bool(st.session_state.get(custom_key))
     if previous_results and (
         previous_filters != current_filters or previous_symbols != symbols
     ):
@@ -1139,7 +963,6 @@ def _render_scanner(
                 1
                 for row in previous_results
                 if row["Recommendation"] in {"BUY", "STRONG BUY"}
-                and (not used_custom or row["Passes_filters"])
             )
             metric_label = "Buy / Strong Buy signals"
             metric_value = buy_count
@@ -1168,8 +991,8 @@ def _render_scanner(
                 + update_note
             )
         if matches:
-            payload, config = _scan_table_payload(matches, labels)
-            config["showFilters"] = used_custom and not select_all
+            payload, config = build_scan_table_payload(matches, labels)
+            config["showFilters"] = False
             show_scan_table(payload, config)
         else:
             st.info(empty_message)

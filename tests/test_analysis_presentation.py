@@ -8,10 +8,7 @@ from features.analysis.panel import (
     analysis_sentiment,
     format_analysis_time,
 )
-from ui.helpers import (
-    analysis_tab_status_css,
-    signed_in_label_html,
-)
+from ui.helpers import signed_in_label_html
 
 
 class AnalysisPresentationTests(unittest.TestCase):
@@ -47,17 +44,6 @@ class AnalysisPresentationTests(unittest.TestCase):
         }
 
         self.assertFalse(analysis_mentions_equity_holdings(analysis, holdings))
-
-    def test_analysis_tab_status_css_styles_status_backgrounds(self):
-        css = analysis_tab_status_css({1: "cautious", 2: "positive"})
-
-        self.assertIn("[role=\"tab\"]:nth-child(1)", css)
-        self.assertIn("rgba(146, 64, 14, .3)", css)
-        self.assertIn("[role=\"tab\"]:nth-child(2)", css)
-        self.assertIn("rgba(22, 101, 52, .28)", css)
-
-    def test_analysis_tab_status_css_ignores_unknown_status(self):
-        self.assertEqual(analysis_tab_status_css({1: "unknown"}), "<style></style>")
 
     def test_analysis_summary_stays_visible_with_details_collapsed(self):
         app = AppTest.from_string(
@@ -153,6 +139,26 @@ render_analysis_brief(
         app.button[0].click().run()
 
         self.assertTrue(app.session_state["analysis_clicked"])
+
+    def test_ai_analysis_panel_does_not_render_holdings_table(self):
+        app = AppTest.from_string(
+            """
+from features.analysis.panel import render_analysis_brief
+
+render_analysis_brief(
+    None,
+    title="AI Portfolio Analysis",
+    placeholder=True,
+    portfolio_overview=True,
+)
+"""
+        ).run()
+
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.dataframe), 0)
+        self.assertFalse(
+            any("Portfolio holdings signals" in item.value for item in app.subheader)
+        )
 
     def test_signed_in_identity_is_icon_text_not_a_button(self):
         app = AppTest.from_string(

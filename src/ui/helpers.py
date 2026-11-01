@@ -63,33 +63,6 @@ def workspace_subtabs_css(container_key: str) -> str:
     )
 
 
-def analysis_tab_status_css(statuses: dict[int, str]) -> str:
-    colors = {
-        "positive": ("rgba(22, 101, 52, .28)", "rgba(74, 222, 128, .62)", "#86efac"),
-        "cautious": ("rgba(146, 64, 14, .3)", "rgba(251, 191, 36, .62)", "#fcd34d"),
-        "negative": ("rgba(127, 29, 29, .32)", "rgba(248, 113, 113, .62)", "#fca5a5"),
-    }
-    rules = []
-    for index, status in statuses.items():
-        palette = colors.get(status)
-        if palette is None:
-            continue
-        background, border, text = palette
-        selector = (
-            ".st-key-app_navigation_tabs [data-testid=\"stTabs\"] "
-            f"[role=\"tab\"]:nth-child({index})"
-        )
-        rules.append(
-            f"{selector}{{background:{background};border-color:{border};"
-            f"color:{text}}}"
-        )
-        rules.append(
-            f"{selector}[aria-selected=\"true\"]{{background:{background};"
-            f"border-color:{border};color:{text}}}"
-        )
-    return "<style>" + "".join(rules) + "</style>"
-
-
 def app_animation_css() -> str:
     return """<style>
 @keyframes guru-rise-in {

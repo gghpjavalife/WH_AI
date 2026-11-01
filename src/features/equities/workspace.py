@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from ..analysis.panel import render_analysis_panel
-from ..shared.performance import style_returns
+from ..analysis.holdings import render_stock_holdings_table
 from .scanner import render_market_scanner
 from ui.helpers import workspace_subtabs_css
 
@@ -43,7 +43,12 @@ def render_equity(
         return
     display = build_equity_holdings_display(holdings, total_investments)
     theme = getattr(st.context.theme, "type", "light")
-    st.dataframe(style_returns(display, theme=theme), hide_index=True)
+    render_stock_holdings_table(
+        display,
+        key="equities_holdings_table",
+        theme=theme,
+        layout="equity",
+    )
 
 
 def render_equities_workspace(

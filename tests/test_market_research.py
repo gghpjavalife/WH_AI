@@ -56,7 +56,7 @@ class MarketResearchTests(unittest.TestCase):
         )
         self.assertEqual(analysis_status_icon({"assessment": {}}), None)
 
-    def test_home_shows_categorized_analysis_and_tab_status(self):
+    def test_home_shows_categorized_analysis_without_sentiment_tab_labels(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
@@ -100,9 +100,17 @@ class MarketResearchTests(unittest.TestCase):
         app.run(timeout=20)
 
         self.assertFalse(app.exception)
-        self.assertTrue(any("🔴 Home" in tab.label for tab in app.tabs))
-        self.assertTrue(any("🟢 Equities" in tab.label for tab in app.tabs))
-        self.assertTrue(any("🔴 F&O" in tab.label for tab in app.tabs))
+        tab_labels = [tab.label for tab in app.tabs]
+        self.assertTrue(any("Home" in label for label in tab_labels))
+        self.assertTrue(any("Equities" in label for label in tab_labels))
+        self.assertTrue(any("F&O" in label for label in tab_labels))
+        self.assertFalse(
+            any(
+                status in label
+                for label in tab_labels
+                for status in ("Review", "Constructive", "Risk")
+            )
+        )
         self.assertTrue(
             any("Concentration is elevated" in item.value for item in app.markdown)
         )
@@ -119,7 +127,7 @@ class MarketResearchTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(
             app.session_state["app_navigation"],
-            ":material/show_chart: 🔴 Equities",
+            ":material/show_chart: Equities",
         )
         app.session_state["analysis_results"]["all"]["assessment"][
             "sentiment"
@@ -129,10 +137,16 @@ class MarketResearchTests(unittest.TestCase):
         ] = "positive"
         app.run(timeout=20)
         self.assertFalse(app.exception)
-        self.assertTrue(any("🟢 Equities" in tab.label for tab in app.tabs))
+        self.assertFalse(
+            any(
+                status in tab.label
+                for tab in app.tabs
+                for status in ("Review", "Constructive", "Risk")
+            )
+        )
         self.assertEqual(
             app.session_state["app_navigation"],
-            ":material/show_chart: 🟢 Equities",
+            ":material/show_chart: Equities",
         )
 
     def test_equities_tab_shows_its_scoped_ai_brief(self):
@@ -157,6 +171,17 @@ class MarketResearchTests(unittest.TestCase):
         app.run(timeout=20)
 
         self.assertFalse(app.exception)
+        self.assertFalse(
+            any(
+                status in tab.label
+                for tab in app.tabs
+                for status in ("Review", "Constructive", "Risk")
+            )
+        )
+        self.assertEqual(
+            app.session_state["app_navigation"],
+            ":material/show_chart: Equities",
+        )
         self.assertTrue(
             any("Concentration and drawdowns" in item.value for item in app.markdown)
         )
@@ -528,7 +553,7 @@ class MarketResearchTests(unittest.TestCase):
         self.assertIn("CCI (20)", unavailable_names)
         self.assertIn("Money flow index (14)", unavailable_names)
         self.assertIn("20-day OBV change", unavailable_names)
-        self.assertEqual(sell["recommendation"], "SELL")
+        self.assertEqual(sell["recommendation"], "STRONG SELL")
         self.assertIn("negative", sell["reason"])
 
     def test_assessment_scores_all_available_indicator_groups(self):
@@ -1263,22 +1288,31 @@ _render_ai_provider_configurations("delete-test-user")
         self.assertIn(json.dumps("ABC \u00b7 Alpha", ensure_ascii=False), html)
 
 
-    def test_trades_workspace_uses_trading_specific_scanner_filters(self):
+    def test_trades_workspace_does_not_render_custom_scanner_filters(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
         )
         app.session_state["app_navigation"] = "Trades"
         app.run(timeout=10)
-        app.toggle(key="market_trading_use_custom").set_value(True).run()
 
         self.assertFalse(app.exception)
-        self.assertEqual(
-            app.number_input(key="market_trading_minimum_relative_volume").value,
-            1.0,
+        self.assertFalse(
+            any(widget.label == "Use custom filters" for widget in app.toggle)
         )
-        self.assertEqual(
-            app.number_input(key="market_trading_minimum_atr_pct").value,
-            1.0,
+        self.assertFalse(
+            any(
+                widget.label
+                in {
+                    "Minimum price (₹)",
+                    "Maximum price (₹)",
+                    "Minimum 20-day average volume",
+                    "Minimum RSI",
+                    "Maximum RSI",
+                    "Minimum volume / 20-day average",
+                    "Minimum ATR / price (%)",
+                }
+                for widget in app.number_input
+            )
         )
 
     def test_mutual_fund_workspace_uses_nav_and_return_filters(self):

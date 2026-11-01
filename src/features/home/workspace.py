@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from ..analysis.panel import render_analysis_brief
+from ..analysis.holdings import render_stock_holdings_table
 from ..equities.workspace import build_equity_holdings_display
 from ..portfolio.metrics import calculate_allocation
 from ..shared.performance import style_returns
@@ -211,8 +212,11 @@ def _render_home_holdings(
                 equity_display = build_equity_holdings_display(
                     equity_holdings, total_investments
                 )
-                st.dataframe(
-                    style_returns(equity_display, theme=theme), hide_index=True
+                render_stock_holdings_table(
+                    equity_display,
+                    key="home_equity_holdings_table",
+                    theme=theme,
+                    layout="home_equity",
                 )
 
         with trading_tab:
@@ -243,8 +247,11 @@ def _render_home_holdings(
                     if total_investments > 0
                     else 0.0
                 )
-                st.dataframe(
-                    style_returns(trading_display, theme=theme), hide_index=True
+                render_stock_holdings_table(
+                    trading_display,
+                    key="home_trading_positions_table",
+                    theme=theme,
+                    layout="trading",
                 )
 
         with funds_tab:
@@ -275,6 +282,7 @@ def _render_home_holdings(
                     if total_investments > 0
                     else 0.0
                 )
+                fund_display["Signal"] = "Not rated"
                 st.dataframe(
                     style_returns(fund_display, theme=theme), hide_index=True
                 )
@@ -323,17 +331,19 @@ def render_home_workspace(
             )
             st.dataframe(prices, hide_index=True)
     render_analysis_brief(
-        st.session_state.get("analysis_results", {}).get("all"),
+        st.session_state.get("portfolio_overview_analysis"),
         title="AI Portfolio Analysis",
         placeholder=True,
         collapsible=True,
+        portfolio_overview=True,
         run_analysis=run_portfolio_analysis,
-        last_analyzed_at=st.session_state.get("analysis_timestamps", {}).get(
-            "all"
-        ),
-        analysis_metadata=st.session_state.get("analysis_metadata", {}).get("all"),
+        last_analyzed_at=st.session_state.get("portfolio_overview_timestamp"),
+        analysis_metadata=st.session_state.get("portfolio_overview_metadata"),
         storage_error=st.session_state.get("analysis_storage_errors", {}).get(
-            "all"
+            "overview"
+        ),
+        analysis_error=st.session_state.get("analysis_errors", {}).get(
+            "portfolio_overview"
         ),
     )
     render_portfolio_review()

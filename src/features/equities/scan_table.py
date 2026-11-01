@@ -1,4 +1,4 @@
-"""Self-contained interactive results table for the stock scanner.
+"""Self-contained interactive table shared by scanner and holdings research.
 
 The table renders inside an iframe so it can sort, filter, paginate, expand
 rows and copy data entirely in the browser without re-running the Streamlit
@@ -63,12 +63,16 @@ tr.open .caret{transform:rotate(90deg);}
 .pill.B{background:rgba(34,197,94,.22);color:var(--pos);}
 .pill.H{background:rgba(234,179,8,.22);color:#EAB308;}
 .pill.S{background:rgba(239,68,68,.22);color:var(--neg);}
+.pill.SS{background:#B91C1C;color:#fff;}
+.pill.NR{background:var(--soft);color:var(--muted);}
 .pos{color:var(--pos);font-weight:600;}.neg{color:var(--neg);font-weight:600;}.neu{color:var(--fg);}
 .meter{display:flex;align-items:center;gap:.4rem;min-width:7rem;}
 .meter i{flex:1;height:7px;border-radius:999px;background:var(--line);overflow:hidden;}
 .meter i b{display:block;height:100%;background:linear-gradient(90deg,#E6B800,#22C55E);}
 .tag{display:inline-block;margin:.1rem .25rem .1rem 0;padding:.05rem .5rem;border-radius:999px;
  font-size:.76rem;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.5);}
+.tag.news{white-space:normal;text-decoration:none;color:var(--fg);max-width:100%;}
+.tag.news:hover{background:rgba(201,162,39,.2);border-color:var(--gold);}
 tr.detail td{padding:0;background:var(--soft);}
 .panel{padding:1rem 1.2rem 1.2rem;animation:pop .18s ease-out;}
 @keyframes pop{from{opacity:0;transform:translateY(-4px);}to{opacity:1;transform:none;}}
@@ -141,16 +145,17 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
    r.setProperty('--gold','#B8860B');}
  }catch(e){}
 })();
-const RANK={'STRONG BUY':3,'BUY':2,'HOLD':1,'SELL':0};
-const PILL={'STRONG BUY':'SB','BUY':'B','HOLD':'H','SELL':'S'};
+const RANK={'STRONG BUY':4,'BUY':3,'HOLD':2,'SELL':1,'STRONG SELL':0,'NOT RATED':-1};
+const PILL={'STRONG BUY':'SB','BUY':'B','HOLD':'H','SELL':'S','STRONG SELL':'SS','NOT RATED':'NR'};
 const st={f:{q:'',pmin:'',pmax:'',chg:'',rmin:'',rmax:'',sig:'',m1:'',vol:'',str:'',pass:''},key:'signal',dir:-1,page:1,size:10,open:new Set()};
-const COLS=[['stock','Stock',0],['price','Price',1],['chg','Day change',1],['m1','1 month',1],['rsi','RSI 14',1],
+const COLS=CFG.columns||[['stock','Stock',0],['price','Price',1],['chg','Day change',1],['m1','1 month',1],['rsi','RSI 14',1],
  ['vol','Volume',1],['signal','Signal',0],['strength','Strength',0]];
 if(CFG.showFilters)COLS.push(['pass','Filters',0]);
 const sortVal={
  stock:r=>r.label.toLowerCase(),price:r=>r.price,chg:r=>r.chg,m1:r=>r.m1,vol:r=>r.vol,rsi:r=>r.rsi,
- signal:r=>RANK[r.signal]*1000+r.score,strength:r=>r.total?r.pos/r.total:0,
+ signal:r=>(RANK[r.signal]??-1)*1000+(Number(r.score)||0),strength:r=>r.total?r.pos/r.total:0,
  pass:r=>r.pass?1:0};
+COLS.forEach(([key])=>{if(!sortVal[key])sortVal[key]=r=>r[key];});
 const tone=(v,pos)=>v==null?'neu':(pos?'pos':'neg');
 
 function filtered(){
@@ -171,17 +176,26 @@ function filtered(){
  return rows;
 }
 const info=k=>{const i=CFG.info[k];return i?`<a class="i" href="${esc(i[1])}" target="_blank" rel="noopener noreferrer" title="${esc(i[0])} Click to learn more.">i</a>`:'';};
+const safeNewsUrl=v=>{try{const u=new URL(v);return u.protocol==='https:'&&u.hostname.endsWith('yahoo.com')?esc(u.href):'#';}catch{return '#';}};
 function detail(r){
- const groups=CFG.groups.map(([title,items])=>{
+ const groups=[...(CFG.groups||[]),...(r.extraGroups||[])].map(([title,items])=>{
   const kv=items.filter(([k])=>r.ind[k]).map(([k,l])=>
    `<div class="kv"><span>${esc(l)}${info(k)}</span><span class="${r.ind[k][1]}">${esc(r.ind[k][0])}</span></div>`).join('');
   return kv?`<div class="group"><h4>${esc(title)}</h4>${kv}</div>`:'';
  }).join('');
  const checks=r.checks.map(([n,v,s])=>
   `<span class="ck ${s==='p'?'p':s==='n'?'n':''}" title="${esc(v)}">${s==='p'?'&#10003;':s==='n'?'&#10007;':'&#8211;'} ${esc(n)}${info(CFG.checkInfo[n])}</span>`).join('');
- return `<div class="panel"><div class="verdict"><span class="pill ${PILL[r.signal]}">${r.signal}</span>
-  <span>${esc(r.reason)}</span></div><div class="groups">${groups}</div>
-  <div class="checks"><h4>Signal checks &middot; ${r.pos} positive of ${r.total}</h4>${checks}</div></div>`;
+ const sections=(r.extraSections||[]).map(section=>{
+  const links=(section.items||[]).map(item=>
+   `<a class="tag news" href="${safeNewsUrl(item.url)}" target="_blank" rel="noopener noreferrer" title="${esc(item.publisher||'')} · ${esc(item.published||'')} · ${esc(item.sentimentLabel||'')}">${esc(item.title)}</a>`).join('');
+  const values=(section.values||[]).map(([label,value])=>
+   `<div class="kv"><span>${esc(label)}</span><span>${esc(value)}</span></div>`).join('');
+  return `<div class="checks"><h4>${esc(section.title)}</h4>${section.note?`<p>${esc(section.note)}</p>`:''}${links}${values||''}</div>`;
+ }).join('');
+ const indicatorChecks=r.checks.length?`<div class="checks"><h4>Signal checks &middot; ${r.pos} positive of ${r.total}</h4>${checks}</div>`:'';
+ return `<div class="panel"><div class="verdict"><span class="pill ${PILL[r.signal]||'H'}">${esc(r.signal)}</span>
+  <span>${esc(r.reason)}</span></div>${r.summary?`<p>${esc(r.summary)}</p>`:''}<div class="groups">${groups}</div>
+  ${indicatorChecks}${sections}</div>`;
 }
 const VIEW={rows:[],slice:[]};
 function render(){
@@ -191,19 +205,23 @@ function render(){
  const start=(st.page-1)*size, slice=rows.slice(start,start+size);
  $('head').innerHTML='<th class="nosort"></th>'+COLS.map(([k,l,n])=>
   `<th data-k="${k}" class="${n?'num':''} ${k==='pass'?'nosort':''}">${l}<span class="arrow">${st.key===k?(st.dir>0?'&#9650;':'&#9660;'):''}</span></th>`).join('');
+ const cell=(key,type,r)=>{
+  if(key==='stock')return `<td class="name">${esc(r.label)}</td>`;
+  if(key==='signal')return `<td><span class="pill ${PILL[r.signal]||'H'}">${esc(r.signal)}</span></td>`;
+  if(key==='strength')return `<td><div class="meter"><i><b style="width:${r.total?Math.round(r.pos/r.total*100):0}%"></b></i><span>${r.pos}/${r.total}</span></div></td>`;
+  if(key==='pass')return `<td class="${r.pass?'pos':'neg'}">${r.pass?'&#10003;':'&#10007;'}</td>`;
+  const value=r[key], format=type||({price:'currency',chg:'percent',m1:'percent',rsi:'number',vol:'multiplier'}[key]||'text');
+  if(value==null||value===''||(typeof value==='number'&&!Number.isFinite(value)))return `<td class="${COLS.find(c=>c[0]===key)?.[2]?'num':''}">—</td>`;
+  if(format==='currency'||format==='currency-change')return `<td class="num ${format==='currency-change'?(Number(value)>=0?'pos':'neg'):''}">&#8377;${Number(value).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`;
+  if(format==='percent')return `<td class="num ${Number(value)>=0?'pos':'neg'}">${Number(value)>=0?'+':''}${Number(value).toFixed(2)}%</td>`;
+  if(format==='multiplier')return `<td class="num ${Number(value)>=1?'pos':'neu'}">${Number(value).toFixed(2)}x</td>`;
+  if(format==='number')return `<td class="num">${Number(value).toLocaleString('en-IN',{maximumFractionDigits:2})}</td>`;
+  return `<td class="${COLS.find(c=>c[0]===key)?.[2]?'num':''}">${esc(value)}</td>`;
+ };
  $('body').innerHTML=slice.length?slice.map(r=>{
   const open=st.open.has(r.ticker);
   const main=`<tr class="row ${open?'open':''}" data-t="${esc(r.ticker)}">
-   <td><span class="caret">&#9656;</span></td>
-   <td class="name">${esc(r.label)}</td>
-   <td class="num">&#8377;${r.price.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-   <td class="num ${r.chg>=0?'pos':'neg'}">${r.chg>=0?'+':''}${r.chg.toFixed(2)}%</td>
-   <td class="num ${r.m1>=0?'pos':'neg'}">${r.m1>=0?'+':''}${r.m1.toFixed(1)}%</td>
-   <td class="num ${r.rsiTone}">${r.rsi.toFixed(1)}</td>
-   <td class="num ${r.vol>=1?'pos':'neu'}">${r.vol.toFixed(2)}x</td>
-   <td><span class="pill ${PILL[r.signal]}">${r.signal}</span></td>
-   <td><div class="meter"><i><b style="width:${r.total?Math.round(r.pos/r.total*100):0}%"></b></i><span>${r.pos}/${r.total}</span></div></td>
-   ${CFG.showFilters?`<td class="${r.pass?'pos':'neg'}">${r.pass?'&#10003;':'&#10007;'}</td>`:''}</tr>`;
+   <td><span class="caret">&#9656;</span></td>${COLS.map(([key,, ,type])=>cell(key,type,r)).join('')}</tr>`;
   return main+(open?`<tr class="detail"><td colspan="${COLS.length+1}">${detail(r)}</td></tr>`:'');
  }).join(''):`<tr><td colspan="${COLS.length+1}" class="empty">No stocks match these filters.</td></tr>`;
  $('count').textContent=rows.length?`Showing ${(start+1).toLocaleString()}\u2013${(start+slice.length).toLocaleString()} of ${rows.length.toLocaleString()}`:'0 results';
@@ -215,15 +233,19 @@ function render(){
 }
 function tableText(rows,sep){
  const cell=v=>{v=v==null?'':String(v);return sep===','&&/[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
- const head=['Stock','Ticker','Signal','Signal score','Positive checks','Total checks',...CFG.rawCols,'Reason','Passes filters'];
+ const head=CFG.exportColumns?CFG.exportColumns.map(([,label])=>label):
+  ['Stock','Ticker','Signal','Signal score','Positive checks','Total checks',...CFG.rawCols,'Reason','Passes filters'];
  const lines=[head.map(cell).join(sep)];
- rows.forEach(r=>lines.push([r.label,r.ticker,r.signal,r.score,r.pos,r.total,...r.raw,r.reason,r.pass?'Yes':'No'].map(cell).join(sep)));
+ rows.forEach(r=>lines.push((CFG.exportColumns?
+  CFG.exportColumns.map(([key])=>r[key]??''):
+  [r.label,r.ticker,r.signal,r.score,r.pos,r.total,...r.raw,r.reason,r.pass?'Yes':'No']).map(cell).join(sep)));
  return lines.join('\n');
 }
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
 const opt=(v,l)=>`<option value="${v}">${l}</option>`;
 const CELL={
  stock:'<input data-f="q" type="search" placeholder="Search symbol or company">',
+ ticker:'<input data-f="q" type="search" placeholder="Search ticker">',
  price:'<div class="rng"><input data-f="pmin" type="number" placeholder="Min"><input data-f="pmax" type="number" placeholder="Max"></div>',
  chg:'<select data-f="chg">'+opt('','All')+opt('up','Gainers')+opt('down','Losers')+'</select>',
  rsi:'<div class="rng"><input data-f="rmin" type="number" placeholder="Min"><input data-f="rmax" type="number" placeholder="Max"></div>',
@@ -232,8 +254,10 @@ const CELL={
  m1:'<select data-f="m1">'+opt('','All')+opt('0','Positive')+opt('10','10%+')+'</select>',
  vol:'<select data-f="vol">'+opt('','All')+opt('1','1x+')+opt('2','2x+')+'</select>',
  pass:'<select data-f="pass">'+opt('','All')+opt('y','Pass')+opt('n','Fail')+'</select>'};
-$('filt').innerHTML='<td></td>'+COLS.map(([k])=>`<td>${CELL[k]}</td>`).join('');
-$('filt').oninput=$('filt').onchange=e=>{const k=e.target.dataset.f;if(!k)return;st.f[k]=e.target.value;st.page=1;render();};
+if(CFG.showColumnFilters!==false){
+ $('filt').innerHTML='<td></td>'+COLS.map(([k])=>`<td>${CELL[k]||''}</td>`).join('');
+ $('filt').oninput=$('filt').onchange=e=>{const k=e.target.dataset.f;if(!k)return;st.f[k]=e.target.value;st.page=1;render();};
+}else $('filt').remove();
 $('head').onclick=e=>{const th=e.target.closest('th[data-k]');if(!th||th.classList.contains('nosort'))return;
  const k=th.dataset.k;if(st.key===k)st.dir*=-1;else{st.key=k;st.dir=k==='stock'?1:-1;}render();};
 $('body').onclick=e=>{const tr=e.target.closest('tr.row');if(!tr)return;const t=tr.dataset.t;
