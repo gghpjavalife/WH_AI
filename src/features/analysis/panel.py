@@ -136,7 +136,6 @@ def render_analysis_brief(
     run_analysis: Callable[[], None] | None = None,
     last_analyzed_at: object = None,
     analysis_metadata: dict[str, object] | None = None,
-    storage_error: str | None = None,
     analysis_error: str | None = None,
 ) -> None:
     analysis_job = st.session_state.get("analysis_job")
@@ -178,8 +177,6 @@ def render_analysis_brief(
                     analysis_metadata=analysis_metadata,
                     empty_label="Not run yet",
                 )
-                if storage_error:
-                    st.warning(storage_error)
                 if analysis_error:
                     st.error(analysis_error)
         return
@@ -211,8 +208,6 @@ def render_analysis_brief(
             analysis_metadata=analysis_metadata,
             empty_label="Time unavailable",
         )
-        if storage_error:
-            st.warning(storage_error)
         if analysis_error:
             st.error(analysis_error)
         st.write(summary)

@@ -152,8 +152,13 @@ with patch("features.analysis.holdings.configured_value", return_value="token"),
         "Avg_Price": 100, "LTP": 101, "Investment": 100, "Market_Value": 101,
         "P&L": 1, "Returns_%": 1, "Allocation_%": 100,
     }]), key="test_context", theme="dark")
+    for future in st.session_state.get("holding_research_jobs", {}).values():
+        future.result(timeout=20)
 """)
         with patch("features.equities.scan_table.show_scan_table") as table:
+            app.run(timeout=20)
+            for future in app.session_state["holding_research_jobs"].values():
+                future.result(timeout=20)
             app.run(timeout=20)
         self.assertFalse(app.exception)
         self.assertFalse(any(exp.label == "Full source data and context" for exp in app.expander))

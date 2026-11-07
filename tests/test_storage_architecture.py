@@ -1,4 +1,6 @@
 import secrets
+import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,7 +10,8 @@ from unittest.mock import patch
 import services.database as secure_database
 from core.config import settings
 from storage.factory import get_storage_provider
-from storage.indexeddb_provider import IndexedDBStorageProvider
+from storage.indexeddb_provider import IndexedDBStorageProvider, process_browser_storage_bridge
+from storage.provider import StorageRequestPending
 from storage.sqlite_provider import SQLiteStorageProvider
 
 
@@ -99,6 +102,108 @@ class StorageArchitectureTests(unittest.TestCase):
                 "sensitive_consent",
                 "updated_at",
             },
+        )
+
+    def test_sqlite_delete_collection_is_scoped_and_idempotent(self):
+        provider = SQLiteStorageProvider(self.configured_settings)
+        settings_value = {
+            "preferences_json": '{"theme":"dark"}',
+            "sensitive_json": '{"api_key":"secret"}',
+            "sensitive_consent": True,
+        }
+        provider.put("user_settings", "owner", settings_value)
+        device_id = provider.get_or_create_device_id()
+        provider.put("portfolio_analysis", "first", {"analysis": 1})
+        provider.put("portfolio_analysis", "second", {"analysis": 2})
+        provider.put("portfolio_analysis_extra", "first", {"keep": True})
+        provider.put("drafts", "first", {"keep": True})
+        provider.put("oauth_states", "ab" * 32, {"expires_at": 9999999999})
+
+        provider.delete_collection("portfolio_analysis")
+        provider.delete_collection("portfolio_analysis")
+
+        self.assertIsNone(provider.get("portfolio_analysis", "first"))
+        self.assertIsNone(provider.get("portfolio_analysis", "second"))
+        self.assertEqual(provider.get("portfolio_analysis_extra", "first"), {"keep": True})
+        self.assertEqual(provider.get("drafts", "first"), {"keep": True})
+        self.assertEqual(provider.get("user_settings", "owner"), settings_value)
+        self.assertEqual(provider.get_or_create_device_id(), device_id)
+        self.assertEqual(provider.get("oauth_states", "ab" * 32)["expires_at"], 9999999999)
+        for invalid in ("", "portfolio_analysis:other"):
+            with self.assertRaises(ValueError):
+                provider.delete_collection(invalid)
+
+    def test_browser_delete_collection_waits_for_ack_and_invalidates_cache(self):
+        session = {
+            "_local_storage_cache": {
+                "portfolio_analysis:first": {"old": True},
+                "portfolio_analysis:second": {"old": True},
+                "portfolio_analysis_extra:first": {"keep": True},
+                "user_settings:owner": {"keep": True},
+            }
+        }
+        provider = IndexedDBStorageProvider()
+        with patch("storage.indexeddb_provider._state", return_value=session), \
+                patch("storage.indexeddb_provider.st.rerun"):
+            with self.assertRaises(StorageRequestPending):
+                provider.delete_collection("portfolio_analysis")
+            with self.assertRaises(StorageRequestPending):
+                provider.delete_collection("portfolio_analysis")
+            self.assertEqual(len(session["_local_storage_queue"]), 1)
+            self.assertEqual(
+                session["_local_storage_cache"],
+                {"portfolio_analysis_extra:first": {"keep": True},
+                 "user_settings:owner": {"keep": True}},
+            )
+            request = session["_local_storage_queue"][0]
+            session["_local_storage_cache"]["portfolio_analysis:first"] = {"stale": True}
+            with patch("storage.indexeddb_provider._storage_component", return_value={
+                "request_id": request["request_id"], "value": True,
+            }):
+                process_browser_storage_bridge()
+            provider.delete_collection("portfolio_analysis")
+            self.assertNotIn("portfolio_analysis:first", session["_local_storage_cache"])
+            self.assertFalse(session["_local_storage_queue"])
+            with self.assertRaises(StorageRequestPending):
+                provider.delete_collection("portfolio_analysis")
+
+    def test_browser_delete_collection_reports_failure(self):
+        session = {}
+        provider = IndexedDBStorageProvider()
+        with patch("storage.indexeddb_provider._state", return_value=session), \
+                patch("storage.indexeddb_provider.st.rerun"):
+            with self.assertRaises(StorageRequestPending):
+                provider.delete_collection("portfolio_analysis")
+            request = session["_local_storage_queue"][0]
+            with patch("storage.indexeddb_provider._storage_component", return_value={
+                "request_id": request["request_id"], "error": "transaction aborted",
+            }):
+                process_browser_storage_bridge()
+            with self.assertRaisesRegex(RuntimeError, "transaction aborted"):
+                provider.delete_collection("portfolio_analysis")
+            for invalid in ("", "portfolio_analysis:other"):
+                with self.assertRaises(ValueError):
+                    provider.delete_collection(invalid)
+
+    def test_browser_delete_collection_is_a_queue_ordering_barrier(self):
+        session = {}
+        provider = IndexedDBStorageProvider()
+        with patch("storage.indexeddb_provider._state", return_value=session):
+            provider.put("portfolio_analysis", "key", {"version": 1})
+            with self.assertRaises(StorageRequestPending):
+                provider.delete_collection("portfolio_analysis")
+            provider.put("portfolio_analysis", "key", {"version": 2})
+            queue = session["_local_storage_queue"]
+            self.assertEqual([item["action"] for item in queue],
+                             ["put", "delete_collection", "put"])
+            self.assertEqual(queue[0]["value"], {"version": 1})
+            self.assertEqual(queue[2]["value"], {"version": 2})
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the browser bridge test")
+    def test_browser_collection_delete_transaction(self):
+        subprocess.run(
+            ["node", str(Path(__file__).with_name("test_indexeddb_cleanup.cjs"))],
+            check=True,
         )
 
 

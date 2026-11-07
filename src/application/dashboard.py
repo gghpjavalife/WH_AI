@@ -45,10 +45,11 @@ from features.analysis.panel import (
     portfolio_analysis_is_configured,
     render_analysis_panel,
 )
+from features.analysis.holdings import _cancel_holding_jobs
 from features.home.workspace import render_home_workspace
 from features.cart.workspace import render_cart_workspace
 from features.portfolio.metrics import calculate_allocation
-from features.equities.scanner import render_market_scanner
+from features.equities.scanner import cancel_scanner_jobs, render_market_scanner
 from features.derivatives.workspace import render_derivatives_workspace
 from features.equities.workspace import render_equities_workspace
 from features.mutual_funds.workspace import (
@@ -61,15 +62,13 @@ from features.mutual_funds.research import (
 )
 from core.logging import log_failure, log_success
 from services.cloud import (
+    clear_legacy_dynamic_brokers,
     send_resend_email,
+    turso_is_configured,
 )
 from services.analysis_jobs import (
     submit_analysis_task,
     submit_portfolio_analysis,
-)
-from services.portfolio_analysis import (
-    load_portfolio_analysis,
-    save_portfolio_analysis,
 )
 from services.user_settings import load_user_settings
 from services.database import DatabaseError, DatabaseSecurityError
@@ -88,7 +87,7 @@ from ui.helpers import (
     same_tab_link_html,
     signed_in_label_html,
 )
-from ui.header import render_header
+from ui.header import render_brand_lockup, render_header
 from ui.footer import render_footer
 from ui.user_settings import (
     apply_settings_to_session,
@@ -221,108 +220,54 @@ BROKER_LOGIN_INPUT_KEYS = {
 }
 
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon=":material/verified_user:",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-st.html(app_animation_css())
-st.html(gold_theme_css())
-
-
 def _user_is_authenticated() -> bool:
     return bool(st.user.get("is_logged_in", False))
 
 
-if settings.require_login and not _user_is_authenticated():
-    _render_brand_lockup()
-    st.caption("Sign in securely to open your private investment workspace.")
-    if st.button("Sign in", type="primary", icon=":material/login:"):
-        st.login()
-    st.stop()
-
-st.session_state.setdefault("login_steps", [])
-st.session_state.setdefault("dynamic_broker_states", {})
-st.session_state.setdefault("user_preferences", {})
-st.session_state.setdefault("chat_history", [])
-st.session_state.setdefault("stock_cart", [])
-st.session_state.setdefault("max_allocation_pct", 100.0)
-st.session_state.setdefault("realized_daily_loss_pct", 0.0)
-st.session_state.setdefault("broker_profile_name", "")
-st.session_state.setdefault("broker_profile_identifier", "")
-st.session_state.setdefault("profile_fetch_attempted", False)
-st.session_state.setdefault("buy_lock_until", None)
-st.session_state.setdefault("broker_state", None)
-st.session_state.setdefault("broker_name", None)
-st.session_state.setdefault("token", None)
-st.session_state.setdefault(
-    "portfolio", pd.DataFrame(columns=PORTFOLIO_COLUMNS)
-)
-st.session_state.setdefault(
-    "equity_holdings", pd.DataFrame(columns=PORTFOLIO_COLUMNS)
-)
-st.session_state.setdefault(
-    "mutual_funds", pd.DataFrame(columns=MUTUAL_FUND_COLUMNS)
-)
-st.session_state.setdefault("mutual_fund_error", None)
-st.session_state.setdefault("mutual_fund_updated_at", None)
-st.session_state.setdefault("mutual_fund_manual_import", False)
-st.session_state.setdefault("mutual_fund_upload_digest", None)
-st.session_state.setdefault("mutual_fund_upload_error", None)
-st.session_state.setdefault("balance", 0.0)
-st.session_state.setdefault("last_sync", None)
-st.session_state.setdefault("last_sync_attempt", None)
-st.session_state.setdefault("sync_failed", False)
-st.session_state.setdefault("broker_data_errors", {})
-st.session_state.setdefault("risk_high_water", {})
-st.session_state.setdefault("risk_alerts", [])
-st.session_state.setdefault("risk_errors", [])
-st.session_state.setdefault("alerted_risk_channels", [])
-st.session_state.setdefault("analysis_result", None)
-st.session_state.setdefault("analysis_results", {})
-st.session_state.setdefault("analysis_timestamps", {})
-st.session_state.setdefault("analysis_metadata", {})
-st.session_state.setdefault("analysis_storage_errors", {})
-st.session_state.setdefault("analysis_errors", {})
-st.session_state.setdefault("portfolio_overview_analysis", None)
-st.session_state.setdefault("portfolio_overview_timestamp", None)
-st.session_state.setdefault("portfolio_overview_metadata", None)
-st.session_state.setdefault("analysis_price_errors", {})
-st.session_state.setdefault("ai_settings_prompt", "")
-st.session_state.setdefault("llm_provider_settings", {})
-st.session_state.pop("sidebar_openrouter_api_key", None)
-st.session_state.pop("user_llm_api_key_openrouter", None)
-st.session_state.pop("llm_model_selection_openrouter", None)
-if isinstance(st.session_state.llm_provider_settings, dict):
-    st.session_state.llm_provider_settings.pop("OpenRouter", None)
-if st.session_state.get("llm_provider") not in SUPPORTED_LLM_PROVIDERS:
-    st.session_state.llm_provider = LLMProvider.GEMINI.value
-st.session_state.setdefault("planning_budget_inr", 100_000.0)
-st.session_state.setdefault("analysis_live_prices", {})
-st.session_state.setdefault("analysis_live_prices_updated_at", None)
-st.session_state.setdefault("market_ai_candidates", [])
-st.session_state.setdefault("market_ai_candidates_updated_at", None)
-if not isinstance(st.session_state.market_ai_candidates, list):
-    st.session_state.market_ai_candidates = []
-st.session_state.setdefault("analysis_price_error", None)
-st.session_state.setdefault("approved_trades", [])
-st.session_state.setdefault("approved_trades_by_scope", {})
-st.session_state.setdefault("audit_trail", [])
-st.session_state.setdefault("audit_trails_by_scope", {})
-st.session_state.setdefault("enabled_jev_rules", [1, 2, 3, 4, 5, 6])
-st.session_state.setdefault("jev_rule_selection_before_analysis", [1, 2, 3, 4, 5, 6])
-st.session_state.setdefault("jev_rule_selection_after_analysis", [1, 2, 3, 4, 5, 6])
-st.session_state.setdefault("max_allocation_pct", 30.0)
-st.session_state.setdefault("realized_daily_loss_pct", 0.0)
-st.session_state.setdefault("buy_lock_until", None)
-st.session_state.setdefault("login_error", None)
-st.session_state.setdefault("pending_broker_name", None)
-st.session_state.setdefault("pending_broker_adapter", None)
-st.session_state.setdefault("pending_login_url", None)
-st.session_state.setdefault("pending_redirect_url", None)
-st.session_state.setdefault("pending_oauth_fingerprint", None)
-st.session_state.setdefault("pending_oauth_expires_at", None)
+def _initialize_session() -> None:
+    defaults = {
+        "login_steps": [], "dynamic_broker_states": {}, "user_preferences": {},
+        "chat_history": [], "stock_cart": [], "max_allocation_pct": 100.0,
+        "realized_daily_loss_pct": 0.0, "broker_profile_name": "",
+        "broker_profile_identifier": "", "profile_fetch_attempted": False,
+        "buy_lock_until": None, "broker_state": None, "broker_name": None,
+        "token": None, "portfolio": pd.DataFrame(columns=PORTFOLIO_COLUMNS),
+        "equity_holdings": pd.DataFrame(columns=PORTFOLIO_COLUMNS),
+        "mutual_funds": pd.DataFrame(columns=MUTUAL_FUND_COLUMNS),
+        "mutual_fund_error": None, "mutual_fund_updated_at": None,
+        "mutual_fund_manual_import": False, "mutual_fund_upload_digest": None,
+        "mutual_fund_upload_error": None, "balance": 0.0, "last_sync": None,
+        "last_sync_attempt": None, "sync_failed": False, "broker_data_errors": {},
+        "risk_high_water": {}, "risk_alerts": [], "risk_errors": [],
+        "alerted_risk_channels": [], "analysis_result": None,
+        "analysis_results": {}, "analysis_timestamps": {}, "analysis_metadata": {},
+        "analysis_errors": {}, "portfolio_overview_analysis": None,
+        "portfolio_overview_timestamp": None, "portfolio_overview_metadata": None,
+        "analysis_price_errors": {}, "ai_settings_prompt": "",
+        "llm_provider_settings": {}, "planning_budget_inr": 100_000.0,
+        "analysis_live_prices": {}, "analysis_live_prices_updated_at": None,
+        "market_ai_candidates": [], "market_ai_candidates_updated_at": None,
+        "analysis_price_error": None, "approved_trades": [],
+        "approved_trades_by_scope": {}, "audit_trail": [], "audit_trails_by_scope": {},
+        "enabled_jev_rules": [1, 2, 3, 4, 5, 6],
+        "jev_rule_selection_before_analysis": [1, 2, 3, 4, 5, 6],
+        "jev_rule_selection_after_analysis": [1, 2, 3, 4, 5, 6],
+        "login_error": None, "pending_broker_name": None,
+        "pending_broker_adapter": None, "pending_login_url": None,
+        "pending_redirect_url": None, "pending_oauth_fingerprint": None,
+        "pending_oauth_expires_at": None,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+    for key in ("sidebar_openrouter_api_key", "user_llm_api_key_openrouter",
+                "llm_model_selection_openrouter"):
+        st.session_state.pop(key, None)
+    if isinstance(st.session_state.llm_provider_settings, dict):
+        st.session_state.llm_provider_settings.pop("OpenRouter", None)
+    if st.session_state.get("llm_provider") not in SUPPORTED_LLM_PROVIDERS:
+        st.session_state.llm_provider = LLMProvider.GEMINI.value
+    if not isinstance(st.session_state.market_ai_candidates, list):
+        st.session_state.market_ai_candidates = []
 
 
 def _redirect_url() -> str:
@@ -397,7 +342,33 @@ def _load_user_settings_for_user() -> None:
     st.session_state["user_settings_error"] = None
 
 
-_load_user_settings_for_user()
+def _clear_legacy_analysis_storage() -> None:
+    if st.session_state.get("legacy_analysis_storage_cleared"):
+        return
+    try:
+        get_storage_provider(settings).delete_collection("portfolio_analysis")
+    except StorageRequestPending:
+        return
+    except (OSError, RuntimeError, DatabaseError, ValueError) as error:
+        log_failure("Legacy analysis storage cleanup", error)
+        st.warning("Previously saved AI analysis could not be cleared from this device.")
+        return
+    st.session_state.legacy_analysis_storage_cleared = True
+
+
+def _clear_legacy_cloud_brokers_for_user() -> None:
+    if not turso_is_configured():
+        return
+    owner = _tenant_identifier()
+    if st.session_state.get("legacy_cloud_cleanup_owner") == owner:
+        return
+    try:
+        clear_legacy_dynamic_brokers(owner)
+    except (OSError, requests.RequestException, RuntimeError, ValueError) as error:
+        log_failure("Legacy broker storage cleanup", error)
+        st.warning("Legacy broker storage could not be cleared for this user.")
+        return
+    st.session_state.legacy_cloud_cleanup_owner = owner
 
 
 def _render_sidebar_settings() -> None:
@@ -705,22 +676,7 @@ def _authenticate_angel_one() -> None:
             "and network connection."
         )
     else:
-        st.session_state.token = token
-        st.session_state.broker_state = adapter
-        st.session_state.broker_name = "Angel One"
-        st.session_state.stock_context_cache = {}
-        st.session_state.last_sync = None
-        st.session_state.last_sync_attempt = None
-        st.session_state.broker_data_errors = {}
-        st.session_state.alerted_risk_channels = []
-        st.session_state.risk_high_water = {}
-        st.session_state.analysis_result = None
-        st.session_state.portfolio_overview_analysis = None
-        st.session_state.portfolio_overview_timestamp = None
-        st.session_state.portfolio_overview_metadata = None
-        st.session_state.approved_trades = []
-        st.session_state.mutual_fund_manual_import = True
-        st.session_state.login_error = None
+        _complete_broker_login("Angel One", adapter, token)
     finally:
         _clear_sensitive_angel_inputs()
 
@@ -768,6 +724,11 @@ def _start_dhan_login() -> None:
 def _complete_broker_login(
     broker_name: str, adapter: BrokerInterface, token: str
 ) -> None:
+    _cancel_holding_jobs()
+    cancel_scanner_jobs()
+    active_job = st.session_state.pop("analysis_job", None)
+    if active_job:
+        active_job["future"].cancel()
     st.session_state.token = token
     st.session_state.broker_state = adapter
     st.session_state.broker_name = broker_name
@@ -784,7 +745,17 @@ def _complete_broker_login(
     st.session_state.risk_high_water = {}
     st.session_state.analysis_result = None
     st.session_state.analysis_results = {}
+    st.session_state.analysis_timestamps = {}
+    st.session_state.analysis_metadata = {}
     st.session_state.analysis_errors = {}
+    st.session_state.portfolio_overview_analysis = None
+    st.session_state.portfolio_overview_timestamp = None
+    st.session_state.portfolio_overview_metadata = None
+    st.session_state.analysis_price_errors = {}
+    st.session_state.analysis_price_error = None
+    st.session_state.analysis_live_prices = {}
+    st.session_state.analysis_live_prices_updated_at = None
+    st.session_state.broker_profile_identifier = ""
     st.session_state.approved_trades = []
     st.session_state.approved_trades_by_scope = {}
     st.session_state.audit_trail = []
@@ -1658,32 +1629,6 @@ def _complete_analysis_job(job: dict[str, Any]) -> None:
             "model": selected_model,
         }
         st.session_state.analysis_errors.pop("portfolio_overview", None)
-        account_identifier = str(job.get("broker_account_identifier") or "").strip()
-        broker_name = str(job.get("broker_name") or "").strip()
-        if account_identifier and broker_name:
-            try:
-                save_portfolio_analysis(
-                    str(job["owner_identifier"]),
-                    broker_name,
-                    account_identifier,
-                    "overview",
-                    analysis,
-                    analyzed_at,
-                    provider=provider,
-                    model=selected_model,
-                )
-            except StorageRequestPending:
-                st.session_state.analysis_storage_errors["overview"] = (
-                    "The overview completed, but browser storage is still "
-                    "processing the save."
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
-                log_failure("Portfolio overview save", error, broker=broker_name)
-                st.session_state.analysis_storage_errors["overview"] = (
-                    "The overview completed, but it could not be saved."
-                )
-            else:
-                st.session_state.analysis_storage_errors.pop("overview", None)
         return
 
     engine = JevRuleEngine(
@@ -1722,42 +1667,6 @@ def _complete_analysis_job(job: dict[str, Any]) -> None:
         st.session_state.analysis_result = analysis
         st.session_state.approved_trades = trades
         st.session_state.audit_trail = audit_trail
-        account_identifier = str(job.get("broker_account_identifier") or "").strip()
-        broker_name = str(job.get("broker_name") or "").strip()
-        if account_identifier and broker_name:
-            try:
-                save_portfolio_analysis(
-                    str(job["owner_identifier"]),
-                    broker_name,
-                    account_identifier,
-                    scope,
-                    analysis,
-                    analyzed_at,
-                    provider=provider,
-                    model=selected_model,
-                )
-            except StorageRequestPending:
-                st.session_state.analysis_storage_errors[scope] = (
-                    "Analysis completed, but browser storage is still processing "
-                    "the save. It will be retried on the next analysis run."
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
-                log_failure(
-                    "Portfolio analysis save",
-                    error,
-                    broker=broker_name,
-                )
-                st.session_state.analysis_storage_errors[scope] = (
-                    "Analysis completed, but it could not be saved for this broker "
-                    "account."
-                )
-            else:
-                st.session_state.analysis_storage_errors.pop(scope, None)
-        else:
-            st.session_state.analysis_storage_errors[scope] = (
-                "Analysis completed for this session, but this broker did not "
-                "provide a stable account identifier for saving it."
-            )
 
 @st.fragment(run_every=1)
 def _render_analysis_progress() -> None:
@@ -2019,11 +1928,6 @@ def _run_analysis(scope: str = "all") -> None:
         "stage": "quotes",
         "provider": provider,
         "model": str(selected_model),
-        "owner_identifier": _tenant_identifier(),
-        "broker_name": str(st.session_state.get("broker_name") or ""),
-        "broker_account_identifier": str(
-            st.session_state.get("broker_profile_identifier") or ""
-        ),
         "api_key": api_key,
         "provider_base_url": provider_base_url,
         "summary": summary,
@@ -2136,11 +2040,6 @@ def _run_portfolio_overview() -> None:
         "model": model,
         "api_key": api_key,
         "provider_base_url": provider_base_url,
-        "owner_identifier": _tenant_identifier(),
-        "broker_name": str(st.session_state.get("broker_name") or ""),
-        "broker_account_identifier": str(
-            st.session_state.get("broker_profile_identifier") or ""
-        ),
         "future": submit_portfolio_analysis(
             portfolio_summary=summary,
             available_cash=0.0,
@@ -2618,7 +2517,6 @@ def _show_workspace() -> None:
         _render_analysis_progress()
     with st.container(border=True, gap="medium"):
         profile_name = _fetch_broker_profile_name()
-        _restore_saved_portfolio_analysis()
         tabs = _render_header_tabs()
         polling_sequence()
         if st.session_state.planning_budget_inr is None:
@@ -2751,94 +2649,6 @@ def _fetch_broker_profile_name() -> str:
         profile_identifier or st.session_state.broker_profile_identifier or name
     ).strip()
     return name
-
-
-def _restore_saved_portfolio_analysis() -> None:
-    broker_name = str(st.session_state.get("broker_name") or "").strip()
-    account_identifier = str(
-        st.session_state.get("broker_profile_identifier") or ""
-    ).strip()
-    if not broker_name or not account_identifier:
-        return
-
-    account_context = (
-        _tenant_identifier(),
-        broker_name.casefold(),
-        account_identifier,
-    )
-    if st.session_state.get("analysis_account_context") != account_context:
-        st.session_state.analysis_results = {}
-        st.session_state.analysis_timestamps = {}
-        st.session_state.analysis_metadata = {}
-        st.session_state.analysis_storage_errors = {}
-        st.session_state.analysis_errors = {}
-        st.session_state.portfolio_overview_analysis = None
-        st.session_state.portfolio_overview_timestamp = None
-        st.session_state.portfolio_overview_metadata = None
-        st.session_state.analysis_price_errors = {}
-        st.session_state.analysis_price_error = None
-        st.session_state.analysis_live_prices = {}
-        st.session_state.analysis_live_prices_updated_at = None
-        st.session_state.analysis_result = None
-        st.session_state.approved_trades = []
-        st.session_state.approved_trades_by_scope = {}
-        st.session_state.audit_trail = []
-        st.session_state.audit_trails_by_scope = {}
-        st.session_state.analysis_account_context = account_context
-        st.session_state.analysis_loaded_for_account = None
-
-    if st.session_state.get("analysis_loaded_for_account") == account_context:
-        return
-    try:
-        saved = load_portfolio_analysis(
-            account_context[0],
-            broker_name,
-            account_identifier,
-            "all",
-        )
-    except StorageRequestPending:
-        return
-    except (OSError, RuntimeError, ValueError) as error:
-        log_failure("Saved portfolio analysis lookup", error, broker=broker_name)
-        st.session_state.analysis_storage_errors["all"] = (
-            "The saved analysis for this broker account could not be loaded."
-        )
-        st.session_state.analysis_loaded_for_account = account_context
-        return
-
-    if saved is not None:
-        st.session_state.analysis_results["all"] = saved["analysis"]
-        st.session_state.analysis_result = saved["analysis"]
-        st.session_state.analysis_timestamps["all"] = saved["analyzed_at"]
-        st.session_state.analysis_metadata["all"] = {
-            "provider": saved["provider"],
-            "model": saved["model"],
-        }
-    try:
-        saved_overview = load_portfolio_analysis(
-            account_context[0],
-            broker_name,
-            account_identifier,
-            "overview",
-        )
-    except StorageRequestPending:
-        return
-    except (OSError, RuntimeError, ValueError) as error:
-        log_failure("Saved portfolio overview lookup", error, broker=broker_name)
-        st.session_state.analysis_storage_errors["overview"] = (
-            "The saved portfolio overview could not be loaded."
-        )
-        st.session_state.analysis_loaded_for_account = account_context
-        return
-
-    if saved_overview is not None:
-        st.session_state.portfolio_overview_analysis = saved_overview["analysis"]
-        st.session_state.portfolio_overview_timestamp = saved_overview["analyzed_at"]
-        st.session_state.portfolio_overview_metadata = {
-            "provider": saved_overview["provider"],
-            "model": saved_overview["model"],
-        }
-    st.session_state.analysis_loaded_for_account = account_context
 
 
 def _portfolio_report() -> tuple[str, str]:
@@ -3133,9 +2943,6 @@ def _reevaluate_analysis_rules(
         st.session_state.audit_trail = audit
 
 
-st.session_state.reevaluate_analysis_rules = _reevaluate_analysis_rules
-
-
 def _render_portfolio_ai_review() -> None:
     with st.expander(
         "Portfolio planning & safeguards",
@@ -3208,6 +3015,8 @@ def _render_portfolio_ai_review() -> None:
         )
 
 def _logout() -> None:
+    _cancel_holding_jobs()
+    cancel_scanner_jobs()
     st.session_state.return_to_home = True
     st.session_state.stock_context_cache = {}
     active_analysis_job = st.session_state.pop("analysis_job", None)
@@ -3240,9 +3049,6 @@ def _logout() -> None:
         "portfolio_overview_metadata",
         "analysis_timestamps",
         "analysis_metadata",
-        "analysis_storage_errors",
-        "analysis_account_context",
-        "analysis_loaded_for_account",
         "analysis_errors",
         "ai_settings_prompt",
         "analysis_price_errors",
@@ -3281,7 +3087,6 @@ def _logout() -> None:
     st.session_state.analysis_results = {}
     st.session_state.analysis_timestamps = {}
     st.session_state.analysis_metadata = {}
-    st.session_state.analysis_storage_errors = {}
     st.session_state.analysis_errors = {}
     st.session_state.analysis_price_errors = {}
     st.session_state.market_ai_candidates = []
@@ -3323,13 +3128,29 @@ def _logout_oidc() -> None:
     st.logout()
 
 
-if st.session_state.token is None:
-    _show_login()
-else:
-    _show_workspace()
-
-analysis_setup_scope = st.session_state.get("analysis_setup_dialog_scope")
-if analysis_setup_scope:
-    _render_analysis_setup_dialog(str(analysis_setup_scope))
-
-process_browser_storage_bridge()
+def main() -> None:
+    st.set_page_config(
+        page_title=APP_TITLE, page_icon=":material/verified_user:",
+        layout="wide", initial_sidebar_state="collapsed",
+    )
+    st.html(app_animation_css())
+    st.html(gold_theme_css())
+    if settings.require_login and not _user_is_authenticated():
+        render_brand_lockup()
+        st.caption("Sign in securely to open your private investment workspace.")
+        if st.button("Sign in", type="primary", icon=":material/login:"):
+            st.login()
+        st.stop()
+    _initialize_session()
+    _load_user_settings_for_user()
+    _clear_legacy_analysis_storage()
+    _clear_legacy_cloud_brokers_for_user()
+    st.session_state.reevaluate_analysis_rules = _reevaluate_analysis_rules
+    if st.session_state.token is None:
+        _show_login()
+    else:
+        _show_workspace()
+    analysis_setup_scope = st.session_state.get("analysis_setup_dialog_scope")
+    if analysis_setup_scope:
+        _render_analysis_setup_dialog(str(analysis_setup_scope))
+    process_browser_storage_bridge()

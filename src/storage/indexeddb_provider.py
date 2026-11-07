@@ -28,6 +28,21 @@ def _cache_key(collection: str, key: str) -> str:
     return f"{collection}:{key}"
 
 
+def _failure_key(action: str, collection: str, key: str) -> str | tuple[str, str]:
+    if action == "delete_collection":
+        return (action, collection)
+    return _cache_key(collection, key)
+
+
+def _clear_collection_cache(session: Any, collection: str) -> None:
+    prefix = f"{collection}:"
+    for name in ("_local_storage_cache", "_local_storage_consume_results"):
+        cache = session.setdefault(name, {})
+        for key in list(cache):
+            if key.startswith(prefix):
+                del cache[key]
+
+
 def _enqueue(
         action: str,
         collection: str,
@@ -35,13 +50,19 @@ def _enqueue(
         value: dict[str, Any] | None = None,
 ) -> None:
     session = _state()
-    request_key = _cache_key(collection, key)
+    request_key = _failure_key(action, collection, key)
     failures = session.setdefault("_local_storage_failures", {})
     if request_key in failures:
         raise RuntimeError(failures[request_key])
 
     queue = session.setdefault("_local_storage_queue", [])
-    for existing in queue:
+    for existing in reversed(queue):
+        if existing["collection"] == collection and (
+            existing["action"] == "delete_collection" or action == "delete_collection"
+        ):
+            if existing["action"] == action:
+                return
+            break
         if (
                 existing["collection"] == collection
                 and existing["key"] == key
@@ -86,6 +107,18 @@ class IndexedDBStorageProvider:
         )
         _enqueue("delete", collection, key)
 
+    def delete_collection(self, collection: str) -> None:
+        if not isinstance(collection, str) or not collection or ":" in collection:
+            raise ValueError("A nonempty collection name without ':' is required.")
+        session = _state()
+        results = session.setdefault("_local_storage_collection_delete_results", set())
+        if collection in results:
+            results.remove(collection)
+            return
+        _enqueue("delete_collection", collection, "")
+        _clear_collection_cache(session, collection)
+        raise StorageRequestPending("Waiting for browser storage.")
+
     def consume(self, collection: str, key: str) -> dict[str, Any] | None:
         session = _state()
         result_key = _cache_key(collection, key)
@@ -128,7 +161,7 @@ def process_browser_storage_bridge() -> None:
     if response.get("error"):
         message = str(response["error"])
         session.setdefault("_local_storage_failures", {})[
-            _cache_key(active["collection"], active["key"])
+            _failure_key(active["action"], active["collection"], active["key"])
         ] = message
         session["_local_storage_error"] = message
     elif active["action"] == "get_device_id":
@@ -147,6 +180,18 @@ def process_browser_storage_bridge() -> None:
         session.setdefault("_local_storage_consume_results", {})[
             _cache_key(active["collection"], active["key"])
         ] = response.get("value")
+    elif active["action"] == "delete_collection":
+        if response.get("value") is True:
+            _clear_collection_cache(session, active["collection"])
+            session.setdefault("_local_storage_collection_delete_results", set()).add(
+                active["collection"]
+            )
+        else:
+            message = "Browser storage did not confirm collection deletion."
+            session.setdefault("_local_storage_failures", {})[
+                _failure_key(active["action"], active["collection"], active["key"])
+            ] = message
+            session["_local_storage_error"] = message
 
     if queue and queue[0].get("request_id") == active.get("request_id"):
         queue.pop(0)

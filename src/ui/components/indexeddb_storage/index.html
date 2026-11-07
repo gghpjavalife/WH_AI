@@ -148,6 +148,25 @@
         };
       }
 
+      function deleteCollection(database, collection) {
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE, "readwrite");
+          const store = transaction.objectStore(STORE);
+          const prefix = `${collection}:`;
+          const request = store.openKeyCursor(IDBKeyRange.lowerBound(prefix));
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor || !cursor.key.startsWith(prefix)) return;
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error);
+          transaction.oncomplete = () => resolve(true);
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error || new Error("Collection deletion aborted."));
+        });
+      }
+
       async function execute(command) {
         const database = await openDatabase();
         try {
@@ -173,6 +192,14 @@
               }
             }
             return record.value;
+          }
+
+          if (command.action === "delete_collection") {
+            if (typeof command.collection !== "string" ||
+                !command.collection || command.collection.includes(":")) {
+              throw new Error("A nonempty collection name without ':' is required.");
+            }
+            return await deleteCollection(database, command.collection);
           }
 
           const recordKey = `${command.collection}:${command.key}`;

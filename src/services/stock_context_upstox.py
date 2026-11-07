@@ -31,8 +31,8 @@ def equity_isin(instrument_key: str) -> str | None:
 
 
 def _get(path: str, *, params: dict | None = None, session: requests.Session | None = None,
-         version: str = "v2") -> dict:
-    token = str(configured_value("UPSTOX_ANALYTICS_TOKEN", "")).strip()
+         version: str = "v2", token: str | None = None) -> dict:
+    token = str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") if token is None else token).strip()
     if not token:
         raise ValueError("UPSTOX_ANALYTICS_TOKEN is required for Upstox data.")
     client = session or requests
@@ -49,10 +49,11 @@ def _get(path: str, *, params: dict | None = None, session: requests.Session | N
     return payload
 
 
-def fetch_upstox_quote(instrument_key: str, *, session: requests.Session | None = None) -> dict[str, Any]:
+def fetch_upstox_quote(instrument_key: str, *, session: requests.Session | None = None,
+                       token: str | None = None) -> dict[str, Any]:
     """Fetch a v2 full quote; never persist or log the bearer token."""
     key = _validate_key(instrument_key)
-    payload = _get("market-quote/quotes", params={"instrument_key": key}, session=session)
+    payload = _get("market-quote/quotes", params={"instrument_key": key}, session=session, token=token)
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         raise ValueError("Upstox returned an invalid full-quote response.")
@@ -63,23 +64,25 @@ def fetch_upstox_quote(instrument_key: str, *, session: requests.Session | None 
     return matching[0]
 
 
-def fetch_upstox_shareholdings(instrument_key: str, *, session: requests.Session | None = None) -> dict:
+def fetch_upstox_shareholdings(instrument_key: str, *, session: requests.Session | None = None,
+                               token: str | None = None) -> dict:
     """Fetch all quarterly ownership categories, not promoter pledges."""
     key = _validate_key(instrument_key)
     isin = equity_isin(key)
     if isin is None:
         raise ValueError("An Indian equity instrument key containing a valid ISIN is required.")
-    payload = _get(f"fundamentals/{isin}/share-holdings", session=session)
+    payload = _get(f"fundamentals/{isin}/share-holdings", session=session, token=token)
     if not isinstance(payload.get("data"), list):
         raise ValueError("Upstox returned invalid shareholding data.")
     return payload
 
 
-def fetch_upstox_corporate_actions(instrument_key: str, *, session: requests.Session | None = None) -> dict:
+def fetch_upstox_corporate_actions(instrument_key: str, *, session: requests.Session | None = None,
+                                   token: str | None = None) -> dict:
     isin = equity_isin(instrument_key)
     if isin is None:
         raise ValueError("An Indian equity instrument key containing a valid ISIN is required.")
-    payload = _get(f"fundamentals/{isin}/corporate-actions", session=session)
+    payload = _get(f"fundamentals/{isin}/corporate-actions", session=session, token=token)
     if not isinstance(payload.get("data"), list):
         raise ValueError("Upstox returned invalid corporate action data.")
     return payload
@@ -160,7 +163,8 @@ def parse_promoter_pledge(payload: dict) -> tuple[float | None, bool]:
         return 0.0, False
 
 
-def fetch_upstox_news(instrument_key: str, *, session: requests.Session | None = None) -> tuple[list[dict], list[dict]]:
+def fetch_upstox_news(instrument_key: str, *, session: requests.Session | None = None,
+                      token: str | None = None) -> tuple[list[dict], list[dict]]:
     """Retrieve every available page of the seven-day instrument news feed."""
     key = _validate_key(instrument_key)
     articles, pages = [], []
@@ -168,7 +172,7 @@ def fetch_upstox_news(instrument_key: str, *, session: requests.Session | None =
     expected_total = expected_records = None
     while True:
         payload = _get("news", params={"category": "instrument_keys", "instrument_keys": key,
-                                      "page_number": page_number, "page_size": 100}, session=session)
+                                      "page_number": page_number, "page_size": 100}, session=session, token=token)
         metadata = payload.get("metadata")
         page = metadata.get("page") if isinstance(metadata, dict) else None
         data = payload.get("data")

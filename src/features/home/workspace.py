@@ -350,9 +350,6 @@ def render_home_workspace(
         run_analysis=run_portfolio_analysis,
         last_analyzed_at=st.session_state.get("portfolio_overview_timestamp"),
         analysis_metadata=st.session_state.get("portfolio_overview_metadata"),
-        storage_error=st.session_state.get("analysis_storage_errors", {}).get(
-            "overview"
-        ),
         analysis_error=st.session_state.get("analysis_errors", {}).get(
             "portfolio_overview"
         ),
