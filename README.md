@@ -12,8 +12,188 @@ database setup is needed for this runtime.
 
 ```powershell
 uv sync
-streamlit run app.py
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
+
+Use the project interpreter rather than a global `streamlit` command: the
+global installation may not contain the project's SQLCipher dependency.
+
+## Local stock context engine
+
+`services.stock_context.fetch_and_build_market_context` builds a Pydantic v2
+context without calling an LLM. It uses Yahoo's quote-summary modules, annual
+financial statements, full returned option chain, and daily history. Set
+`UPSTOX_ANALYTICS_TOKEN` in the project-root `.env` or the environment to use
+an Upstox instrument key; the token is never included in the output. The v2
+REST full quote has five depth levels, not 30. Intraday contexts instead
+require an Upstox V3 `full_d30` stream, which requires the appropriate Upstox
+Plus entitlement. Access-token validity and renewal follow Upstox's current
+rules; analytics tokens are documented as valid for one year, not indefinitely.
+
+After a broker connects, stock holdings display their local context and
+gatekeeper results alongside the existing rules-based research, grouped by
+data category. Upstox equity positions use their broker-returned instrument
+keys; unclassified positions and derivatives are not treated as stocks.
+Other brokers' equity holdings use the existing Yahoo ticker convention and
+do not have Upstox-specific data unless an instrument key is available.
+Contexts are held in the user's session for at most 15 minutes and refreshed
+on the next view or the holdings refresh button. Provider failures are shown
+without treating missing inputs as safe. This local assessment does not call
+an LLM and does not gate the existing separate portfolio AI workflow.
+The stock tables start unfiltered: use their column controls for primary
+filters (opened on demand) and use **Add filters** to search for and add
+indicator or context columns. Added columns can be sorted and filtered like
+the standard columns. Active filters exclude missing values; clearing them
+restores all rows. Copy uses the current filtered page; CSV
+includes all filtered results. Filter controls are kept in memory and reset
+when a Streamlit rerun remounts the table. Additional fields marked "fraction"
+use 0.1 for 10%; fields marked "%" use percentage points.
+Select individual stocks and use **Add to cart** to stage them for review in Cart.
+The header checkbox selects or clears all filtered stocks, including other pages;
+stocks outside the current filter are unchanged.
+Selections remain while filtering and paging, and reset when table data changes
+or the component remounts. The cart is kept in the current Streamlit session;
+adding stocks does not place orders or create reports.
+Cart retains signed quantities for the current session: positive means buy and
+negative means sell. Quantities use whole shares; arrows beside the read-only
+sell percentage change the quantity by one share. The percentage is unavailable
+when the holding is unknown. When a holding is known, sell quantities cannot
+exceed its whole shares; an unknown holding cannot be checked against this
+limit. Existing fractional or excessive quantities must be adjusted before checkout.
+Signals are snapshots refreshed when a stock is added again. Per-stock and
+all-stock checkout open a review only; they do not trigger an external call or
+submit broker orders.
+The cart's eye icon opens the saved research panels from the stock table;
+re-add an older cart entry if its research snapshot is unavailable.
+Cart buy costs and sell proceeds are estimates calculated from the saved table
+LTP and quantity in the stock's quote currency. Prices may be delayed; estimates
+exclude fees and taxes and are not guaranteed execution prices.
+Cart totals are displayed only when every active stock has a usable price and
+a known matching quote currency; no currency conversion is assumed.
+When both sources provide the same metric, the newer context value is displayed;
+the existing research value is used only when context data is unavailable.
+Older assessments are not counted against a differing context value, although
+the separate research signal still uses its original inputs.
+Stock detail panels are stacked and can be expanded individually. Their ratings
+count positive directional assessments among assessed checks; unassessed data is
+not interpreted as positive or negative. Related details are grouped in priority
+order, starting with company and ownership; metrics wrap as space permits.
+The 22 local daily technical fields appear in **Trend & momentum** (averages,
+ADX, RSI, MACD and money flow), **Risk & intraday** (Bollinger bands, ATR
+percentile, choppiness, squeeze and 30-day volatility), and **Performance &
+volume** (current and average volume and volume-price trend). The availability
+count refers to the context snapshot; a research value may be shown as a
+fallback. Open **How the research signal was scored** inside Trend & momentum
+for the separate research checks and their original inputs.
+When context supplies fundamentals but the research signal lacks them, the data
+availability note makes that signal limitation explicit. News ratings use only the explicit
+keyword-based headline signals and are not investment recommendations. Fetching a
+large portfolio or scan can take time and may hit provider rate limits.
+
+Run the local phase from PowerShell without sending data to an LLM:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m services.stock_context RELIANCE.NS --instrument-key "NSE_EQ|INE002A01018"
+```
+
+The JSON output contains the full context and local gatekeeper result.
+`--sector-symbol` accepts a Yahoo sector benchmark; `--supplemental` accepts
+a JSON file containing independently verified sections such as
+`{"shareholders":{"promoter_pledged_shares_pct":0.12}}`. The pledge value must
+be the fraction of promoter-held shares that are pledged, not promoter
+ownership or the fraction of all shares. Only use an actual sourced value.
+The gate also requires `fundamentals.altman_model_applicable` to be set to
+`true` in that file after independently confirming that the public-manufacturing
+Altman model is appropriate for the issuer; otherwise it blocks analysis.
+If the gate passes, call `run_triggered_analysis` with an explicit
+`triggered=True` and a user-selected LLM callable accepting the complete JSON
+payload. The call revalidates the gate and includes warnings and penalties;
+it never happens during ingestion. Rebuild intraday contexts immediately
+before the user triggers analysis: streaming trade timestamps older than
+30 seconds are rejected.
+
+`UpstoxMicrostructureStream` accepts cumulative historical volume norms keyed
+by exchange-local `HH:MM`. `fetch_upstox_volume_baseline` builds these from
+past one-minute Upstox candles, excludes incomplete sessions and returns the
+raw response and warnings; pass those into `baseline_source` and
+`baseline_warnings` on the stream to retain provenance. Relative volume
+compares cumulative volume through the last fully completed minute with the
+same historical interval, and remains unavailable if any live minute is
+missing. Register error/close callbacks with
+`create_streamer`, connect it before the market opens, and disconnect it when
+finished. It requires fresh ticks and all completed one-minute opening bars;
+it does not guess relative volume or reconstruct missing bars. The caller must
+associate the Yahoo ticker with the correct Upstox instrument key. For NSE/BSE
+equities the ISIN is extracted from the supplied instrument-master key; it is
+not independently matched against the Yahoo ticker.
+
+The v2 full quote supplies optional circuit bands. Lower-circuit distance is
+`(price - lower_limit) / lower_limit * 100`, in percentage points; below 1.5
+the local gate blocks analysis. Streamed contexts use the live trade price and
+only combine it with quote bands from the same India-local calendar date.
+Non-streamed contexts use the Upstox snapshot price (which may be stale), not
+the Yahoo price. Missing, invalid or mismatched bands leave proximity unknown
+and produce a warning, not a safety clearance or a new mandatory intraday
+field. Verify quote freshness and exchange bands independently before use.
+
+For Indian equities, the Upstox fundamentals corporate-actions feed is retained
+in `source_data`. Events with an ex/effective date from today through 30 days
+ahead, inclusive, are considered upcoming in the India timezone. Split or bonus
+events take priority over dividends and suppress only the technical-divergence
+rule; they do not bypass other risk blocks. `NONE` means no supported event in
+the returned feed in that window, not a guarantee of feed completeness.
+Unavailable or malformed relevant dates yield an unknown (`null`) status.
+Independently sourced events can be provided in
+`supplemental.news.upcoming_corporate_action_event`; the caller is responsible
+for their accuracy and timing.
+
+Upstox's quarterly shareholding data is retained separately; promoter
+ownership is not a measure of pledging. Its paginated news endpoint covers
+only the latest seven days. The public feeds do not reliably provide promoter pledges, dealer gamma
+positioning, historical IV percentile, commercial futures positions, block
+trade direction, complete holder counts, or headline sentiment. Supply
+independently verified data through the `supplemental` sections rather than
+assuming unavailable values are zero. Missing critical financial risk inputs
+block the local gate. Missing price, SMA 200 or RSI skips the technical
+divergence rule with a warning instead; a false divergence flag in that case
+means "not assessed", not a clean result. The retained Yahoo option-chain frame is subject to yahooquery replacing
+missing cells with zero, so option volume and open-interest totals may be
+incomplete. If no instrument key or other news feed was supplied, an empty
+news list does not imply there was no news. `services.stock_context_news.parse_news_rss` parses caller-fetched RSS
+or Atom; it does not invent sentiment. Raw provider responses are retained in
+`source_data`, subject to transformations already performed by yahooquery.
+
+Ownership, annual growth and dividend yields are fractions; market/sector returns, volatility,
+VWAP distance and analyst upside are percentage points. Altman Z uses the
+public-manufacturing formula and should not be treated as calibrated for banks
+or other non-manufacturers; it is unavailable when statement and quote
+currencies cannot be matched. This is a research context, not an execution or
+investment-advice system. Yahoo data may be delayed or incomplete; validate
+source provenance, timestamps, currencies, and supplemental values before use.
+Missing values in existing daily OHLCV rows are forward-filled then
+backward-filled for technical calculations, with a warning and the original
+history retained. These are estimates, not actual trades; completely absent
+sessions are not inferred without an exchange calendar. Unfillable or
+inconsistent candles still prevent technical calculations and produce a
+warning; other local risk checks continue. The Altman
+verification matrix and currency check are retained in `source_data`.
+The documented Upstox shareholding feed does not supply pledged shares. If a
+response explicitly contains a malformed pledge field, an unverified zero is
+recorded and the local gate remains blocked until independently verified data
+is supplied.
+Technical indicators use in-memory pandas and NumPy calculations on all
+supported Python versions. EMA and Wilder-style smoothing use recursive
+exponential weighting (`adjust=False`); their initialization can differ from
+other indicator libraries. Insufficient history or undefined ratios remain
+null, rather than being presented as valid numbers.
+
+`services.stock_context_housekeeping.ContextRotatingFileHandler` provides
+size-limited logging and removes only aged, explicitly retired context
+artifacts (`retired-stock-context-*.frame`, `.stream`, or `.cache`) from its
+configured directory on rollover. Attach it to the desired logger and close
+it when no longer needed. This opt-in utility does not delete unrelated
+system caches or active in-memory dataframes.
 
 ## Keep a free deployment responsive
 

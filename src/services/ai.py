@@ -212,12 +212,6 @@ def send_email_update(
     )
 
 
-try:
-    import pandas_ta as ta
-except ModuleNotFoundError:
-    ta = None
-
-
 def _ticker_universe() -> str:
     return ", ".join(sorted(TICKER_MAP))
 
@@ -647,7 +641,8 @@ def calculate_atr(
     high: pd.Series, low: pd.Series, close: pd.Series,
     length: int | None = None,
 ) -> float:
-    """Compute the latest Wilder ATR, preferring pandas-ta when installed."""
+    """Compute the latest Wilder ATR using local pandas calculations."""
+    from .stock_context_technical import average_true_range
     length = settings.atr_period if length is None else length
     high = pd.to_numeric(high, errors="coerce")
     low = pd.to_numeric(low, errors="coerce")
@@ -655,21 +650,7 @@ def calculate_atr(
     if min(len(high), len(low), len(close)) < length + 1:
         raise ValueError(f"At least {length + 1} daily candles are required for ATR.")
 
-    if ta is not None:
-        atr_series = ta.atr(high=high, low=low, close=close, length=length)
-    else:
-        previous_close = close.shift(1)
-        true_range = pd.concat(
-            [
-                high - low,
-                (high - previous_close).abs(),
-                (low - previous_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr_series = true_range.ewm(
-            alpha=1 / length, min_periods=length, adjust=False
-        ).mean()
+    atr_series = average_true_range(high, low, close, length)
 
     if atr_series is None or atr_series.dropna().empty:
         raise ValueError("ATR could not be calculated from the supplied candles.")

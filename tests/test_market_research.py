@@ -791,6 +791,7 @@ class MarketResearchTests(unittest.TestCase):
                 ":material/swap_horiz: Trades",
                 ":material/query_stats: F&O",
                 ":material/savings: Mutual Funds",
+                ":material/shopping_cart: Cart (0)",
             ],
         )
         self.assertGreaterEqual(len(app.get("popover")), 2)
@@ -962,6 +963,7 @@ class MarketResearchTests(unittest.TestCase):
                 ":material/swap_horiz: Trades",
                 ":material/query_stats: F&O",
                 ":material/savings: Mutual Funds",
+                ":material/shopping_cart: Cart (0)",
             ],
         )
         self.assertTrue(

@@ -46,6 +46,7 @@ from features.analysis.panel import (
     render_analysis_panel,
 )
 from features.home.workspace import render_home_workspace
+from features.cart.workspace import render_cart_workspace
 from features.portfolio.metrics import calculate_allocation
 from features.equities.scanner import render_market_scanner
 from features.derivatives.workspace import render_derivatives_workspace
@@ -245,6 +246,7 @@ st.session_state.setdefault("login_steps", [])
 st.session_state.setdefault("dynamic_broker_states", {})
 st.session_state.setdefault("user_preferences", {})
 st.session_state.setdefault("chat_history", [])
+st.session_state.setdefault("stock_cart", [])
 st.session_state.setdefault("max_allocation_pct", 100.0)
 st.session_state.setdefault("realized_daily_loss_pct", 0.0)
 st.session_state.setdefault("broker_profile_name", "")
@@ -410,6 +412,10 @@ def _render_sidebar_settings() -> None:
 
 def _render_header_tabs():
     current_navigation = st.session_state.get("app_navigation")
+    cart_count = len(st.session_state.get("stock_cart", []))
+    tab_options = (*APP_TABS[:-1], f"{APP_TABS[-1]} ({cart_count})")
+    if isinstance(current_navigation, str) and current_navigation.startswith(APP_TABS[-1] + " ("):
+        current_navigation = APP_TABS[-1]
     legacy_target = (
         LegacyAppNavigation.target_for(current_navigation)
         if isinstance(current_navigation, str)
@@ -436,10 +442,10 @@ def _render_header_tabs():
 
     if selected_index is None:
         selected_index = 0
-    st.session_state["app_navigation"] = APP_TABS[selected_index]
+    st.session_state["app_navigation"] = tab_options[selected_index]
     with st.container(key="app_navigation_tabs"):
         tabs = st.tabs(
-            APP_TABS,
+            tab_options,
             key="app_navigation",
             on_change="rerun",
             width="stretch",
@@ -702,6 +708,7 @@ def _authenticate_angel_one() -> None:
         st.session_state.token = token
         st.session_state.broker_state = adapter
         st.session_state.broker_name = "Angel One"
+        st.session_state.stock_context_cache = {}
         st.session_state.last_sync = None
         st.session_state.last_sync_attempt = None
         st.session_state.broker_data_errors = {}
@@ -764,6 +771,7 @@ def _complete_broker_login(
     st.session_state.token = token
     st.session_state.broker_state = adapter
     st.session_state.broker_name = broker_name
+    st.session_state.stock_context_cache = {}
     st.session_state.broker_profile_name = ""
     st.session_state.profile_fetch_attempted = False
     st.session_state.buy_lock_until = None
@@ -1246,10 +1254,13 @@ def _show_login() -> None:
             with tabs[APP_TAB_LABELS[0]]:
                 _render_broker_connection()
                 _render_portfolio_ai_review()
-        for asset in APP_TAB_LABELS[1:]:
+        for asset in APP_TAB_LABELS[1:-1]:
             if tabs[asset].open:
                 with tabs[asset]:
                     _render_asset_workspace(asset, broker_connected=False)
+        if tabs[AppTab.CART.value].open:
+            with tabs[AppTab.CART.value]:
+                render_cart_workspace()
         render_footer()
 
 
@@ -2632,7 +2643,7 @@ def _show_workspace() -> None:
                     run_portfolio_analysis=_request_portfolio_overview,
                     render_portfolio_review=_render_portfolio_ai_review,
                 )
-        for asset in APP_TAB_LABELS[1:]:
+        for asset in APP_TAB_LABELS[1:-1]:
             if tabs[asset].open:
                 with tabs[asset]:
                     _render_workspace_account_context(
@@ -2640,6 +2651,9 @@ def _show_workspace() -> None:
                         profile_name,
                     )
                     _render_asset_workspace(asset, broker_connected=True)
+        if tabs[AppTab.CART.value].open:
+            with tabs[AppTab.CART.value]:
+                render_cart_workspace()
         render_footer()
 
 
@@ -3195,6 +3209,7 @@ def _render_portfolio_ai_review() -> None:
 
 def _logout() -> None:
     st.session_state.return_to_home = True
+    st.session_state.stock_context_cache = {}
     active_analysis_job = st.session_state.pop("analysis_job", None)
     if active_analysis_job:
         active_analysis_job["future"].cancel()

@@ -643,6 +643,7 @@ render_user_settings("registry-test-user")
                 ":material/swap_horiz: Trades",
                 ":material/query_stats: F&O",
                 ":material/savings: Mutual Funds",
+                ":material/shopping_cart: Cart (0)",
             ],
         )
         self.assertFalse(

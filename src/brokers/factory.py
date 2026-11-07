@@ -290,6 +290,7 @@ class UpstoxAdapter(BrokerInterface):
             rows.append(
                 {
                     "Ticker": ticker,
+                    "Instrument_Key": _normalize_instrument_key(instrument_key) if instrument_key else "",
                     "Qty": quantity,
                     "Avg_Price": _number(
                         _field(position, "average_price"), "average price"
@@ -297,7 +298,9 @@ class UpstoxAdapter(BrokerInterface):
                     "LTP": _number(_field(position, "last_price"), "last price"),
                 }
             )
-        return _portfolio_frame(rows)
+        frame = _portfolio_frame(rows)
+        frame["Instrument_Key"] = [row["Instrument_Key"] for row in rows]
+        return frame
 
     def fetch_holdings(self, token: str) -> pd.DataFrame:
         try:
@@ -330,6 +333,7 @@ class UpstoxAdapter(BrokerInterface):
             rows.append(
                 {
                     "Ticker": ticker,
+                    "Instrument_Key": _normalize_instrument_key(instrument_key) if instrument_key else "",
                     "Qty": quantity,
                     "Avg_Price": _number(
                         _field(holding, "average_price"), "average purchase price"
@@ -338,6 +342,7 @@ class UpstoxAdapter(BrokerInterface):
                 }
             )
         frame = _portfolio_frame(rows)
+        frame["Instrument_Key"] = [row["Instrument_Key"] for row in rows]
         if instrument_tickers:
             try:
                 quote_response = MarketQuoteV3Api(self._api_client(token)).get_ltp(

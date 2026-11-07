@@ -4,16 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timezone
 from html import escape
 import re
+from uuid import uuid4
 
 import pandas as pd
 import requests
 import streamlit as st
 
 from brokers.factory import TICKER_MAP
+from core.config import configured_value
 from core.logging import log_failure
+from features.analysis.stock_context import (
+    CONTEXT_TTL, append_context_to_row, holding_identity, refresh_holding_contexts,
+)
+from services.stock_context_models import InvestmentHorizon
 from .scan_table import show_scan_table
 from .market_data import (
     MarketDataError,
@@ -106,6 +113,89 @@ def _equity_labels(master: pd.DataFrame) -> dict[str, str]:
             f"{ticker} · {row.Company} ({row.Exchange})"
         )
     return labels
+
+
+def _valid_isin(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    isin = value.strip().upper()
+    if not re.fullmatch(r"IN[A-Z0-9]{9}[0-9]", isin):
+        return False
+    digits = "".join(str(int(char, 36)) if char.isalpha() else char for char in isin)
+    total = sum(
+        sum(divmod(int(char) * (2 if index % 2 else 1), 10))
+        for index, char in enumerate(reversed(digits))
+    )
+    return total % 10 == 0
+
+
+def _scanner_identities(
+    rows: list[dict[str, object]], master: pd.DataFrame, scope: str
+) -> dict[str, tuple[str, str | None, InvestmentHorizon]]:
+    """Use only matching exchange-master records for broker instrument keys."""
+    layout = "trading" if scope.casefold() == "trading" else "home_equity"
+    horizon = (InvestmentHorizon.SHORT_TERM_TRADING if layout == "trading"
+               else InvestmentHorizon.LONG_TERM_EQUITY)
+    listings: dict[str, set[tuple[str, str]]] = {}
+    for _, listing in master.iterrows():
+        symbol = listing.get("Symbol")
+        exchange = listing.get("Exchange")
+        isin = listing.get("ISIN")
+        if not isinstance(symbol, str) or not isinstance(exchange, str) or not _valid_isin(isin):
+            continue
+        symbol, exchange = symbol.strip().upper(), exchange.strip().upper()
+        if exchange not in ("NSE", "BSE"):
+            continue
+        ticker = listing.get("Ticker")
+        if not isinstance(ticker, str) or not ticker.strip():
+            ticker = symbol.removesuffix(".BO") if exchange == "BSE" else symbol
+        ticker = ticker.strip().upper()
+        if (exchange == "NSE" and ticker.endswith(".BO")) or (
+            exchange == "BSE" and ticker.endswith(".NS")
+        ):
+            continue
+        try:
+            ticker = normalize_symbol(ticker)
+            expected = ticker.removesuffix(".BO") + ".BO" if exchange == "BSE" else ticker
+            if symbol != expected or (exchange == "NSE" and ticker.endswith(".BO")):
+                continue
+        except ValueError:
+            continue
+        listings.setdefault(symbol, set()).add((exchange, str(isin).strip().upper()))
+
+    identities = {}
+    for row in rows:
+        try:
+            symbol = normalize_symbol(str(row["Ticker"]))
+        except (KeyError, ValueError):
+            continue
+        verified = listings.get(symbol, set())
+        key = None
+        if len(verified) == 1:
+            exchange, isin = next(iter(verified))
+            key = f"{exchange}_EQ|{isin}"
+        if key:
+            identity = holding_identity(pd.Series({"Ticker": symbol, "Instrument_Key": key}),
+                                        layout, "")
+        else:
+            identity = (symbol if symbol.endswith(".BO") else symbol + ".NS", None, horizon)
+        if identity:
+            identities[symbol] = identity
+    return identities
+
+
+def _append_scan_context(
+    payload: list[dict[str, object]], config: dict[str, object],
+    contexts: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    base = deepcopy(config)
+    for row in payload:
+        row_config = deepcopy(base)
+        row["extraGroups"] = []
+        row["extraSections"] = []
+        append_context_to_row(row, row_config, contexts.get(str(row["ticker"])))
+        config = row_config
+    return config
 
 
 def _render_stock_result(
@@ -555,6 +645,12 @@ def build_scan_table_payload(
         "signals": [s for s in _SIGNAL_RANK if s in present],
         "groups": [[title, [list(item) for item in items]] for title, items in _INDICATOR_GROUPS],
         "rawCols": [label for _, label, _ in _TOOLTIP_FORMATS],
+        "rawTypes": ["text" if key == "As_of" else "number" for key, _, _ in _TOOLTIP_FORMATS],
+        "rawIndicatorKeys": {label: key for key, label, _ in _TOOLTIP_FORMATS},
+        "rawInfo": {label: _INDICATOR_INFO[key][0] for key, label, _ in _TOOLTIP_FORMATS
+                    if key in _INDICATOR_INFO} | {
+                        "As of": "Date and time of the market-data snapshot."
+                    },
         "info": {key: list(value) for key, value in _INDICATOR_INFO.items()},
         "checkInfo": _CHECK_INFO_KEY,
     }
@@ -756,7 +852,8 @@ def _ai_recommendation_candidates(
     ]
 
 
-_TRANSIENT_KEYS = ("_scan_button", "_scan_nse_button", "_refresh_universe")
+_TRANSIENT_KEYS = ("_scan_button", "_scan_nse_button", "_refresh_universe",
+                   "_additional_filters_button", "_context_viewer_download")
 
 
 def _restore_scanner_state(prefix: str) -> None:
@@ -764,10 +861,13 @@ def _restore_scanner_state(prefix: str) -> None:
     saved = st.session_state.get("_scanner_saved", {}).get(prefix, {})
     run_seq = st.session_state.get("_run_seq", 0)
     seen = st.session_state.setdefault("_scanner_seen_seq", {})
-    returning = seen.get(prefix) != run_seq - 1
+    returning = (seen.get(prefix) != run_seq - 1 if "_run_seq" in st.session_state
+                 else prefix not in seen)
     seen[prefix] = run_seq
     for key, value in saved.items():
-        if returning or key not in st.session_state:
+        if isinstance(key, str) and not key.endswith(_TRANSIENT_KEYS) and (
+            returning or key not in st.session_state
+        ):
             st.session_state[key] = value
 
 
@@ -904,6 +1004,11 @@ def _render_scanner(
             ),
         )
     st.caption(SCAN_METHOD)
+    st.warning(
+        "Full stock context can require several provider requests per stock, in addition "
+        "to historical prices. Large universes may be slow or hit provider rate limits; "
+        "missing context is reported without removing scanned rows."
+    )
     current_filters = OPEN_FILTERS.copy()
     with st.container(horizontal=True, vertical_alignment="center"):
         scan_clicked = st.button(
@@ -933,7 +1038,22 @@ def _render_scanner(
     failures_key = f"market_{prefix}_scan_failures"
     filters_key = f"market_{prefix}_scan_filters"
     symbols_key = f"market_{prefix}_scan_symbols_used"
+    contexts_key = f"market_{prefix}_scan_contexts"
     if scan_requested:
+        identities = _scanner_identities(results, master, scope)
+        analytics_available = bool(str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip())
+        context_cache = st.session_state.setdefault("stock_context_cache", {})
+        if not isinstance(context_cache, dict):
+            context_cache = {}
+            st.session_state["stock_context_cache"] = context_cache
+        if identities:
+            with st.spinner(f"Updating local market context for {len(identities):,} stock(s)…"):
+                refresh_holding_contexts(context_cache, set(identities.values()),
+                                         analytics_available=analytics_available)
+        st.session_state[contexts_key] = {
+            symbol: (*identity, analytics_available)
+            for symbol, identity in identities.items()
+        }
         st.session_state[results_key] = results
         st.session_state[failures_key] = failures
         st.session_state[filters_key] = current_filters.copy()
@@ -992,8 +1112,44 @@ def _render_scanner(
             )
         if matches:
             payload, config = build_scan_table_payload(matches, labels)
+            context_keys = st.session_state.get(contexts_key, {})
+            context_cache = st.session_state.get("stock_context_cache", {})
+            contexts = {}
+            if isinstance(context_keys, dict) and isinstance(context_cache, dict):
+                now = datetime.now(timezone.utc)
+                for row in matches:
+                    symbol = str(row["Ticker"])
+                    identity = context_keys.get(symbol)
+                    if not isinstance(identity, tuple) or len(identity) != 4:
+                        continue
+                    entry = context_cache.get(identity)
+                    if (isinstance(entry, tuple) and len(entry) == 2
+                            and isinstance(entry[0], datetime) and entry[0].tzinfo is not None
+                            and now - entry[0] < CONTEXT_TTL and isinstance(entry[1], dict)):
+                        contexts[symbol] = entry[1]
+                    else:
+                        contexts[symbol] = {"error": (
+                            "Context expired or is unavailable; run the scan again to refresh it."
+                        )}
+            config = _append_scan_context(payload, config, contexts)
             config["showFilters"] = False
+            config["showColumnFilters"] = True
+            session_key = st.session_state.get("_scanner_table_session_key")
+            if not session_key:
+                session_key = uuid4().hex
+                st.session_state["_scanner_table_session_key"] = session_key
+            config["tableKey"] = f"scanner:{session_key}:{prefix}"
             show_scan_table(payload, config)
+            failed_contexts = sum(
+                not isinstance(contexts.get(str(row["Ticker"])), dict)
+                or not contexts[str(row["Ticker"])].get("context")
+                for row in matches
+            )
+            if failed_contexts:
+                st.warning(
+                    f"Local market context was unavailable for {failed_contexts:,} "
+                    "stock(s); scan signals are still shown. Open a row for details."
+                )
         else:
             st.info(empty_message)
         _render_scan_failures(st.session_state.get(failures_key))

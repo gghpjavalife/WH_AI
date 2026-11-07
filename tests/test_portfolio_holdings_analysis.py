@@ -260,24 +260,39 @@ class PortfolioHoldingsAnalysisTests(unittest.TestCase):
             [column[0] for column in equity_columns],
             [
                 "ticker",
+                "signal",
+                "pnl",
+                "returnPct",
                 "quantity",
                 "average",
                 "price",
                 "investment",
                 "holdingValue",
-                "pnl",
-                "returnPct",
                 "allocationPct",
-                "signal",
             ],
         )
         self.assertNotEqual(trading_columns, equity_columns)
+        self.assertEqual([column[0] for column in trading_columns[:4]],
+                         ["stock", "signal", "pnl", "returnPct"])
         self.assertIn("Gross exposure", [column[1] for column in trading_columns])
         self.assertIn("Open P&L", [column[1] for column in trading_columns])
         self.assertNotIn('"columns":', scanner_html)
         self.assertIn("Day change", scanner_html)
 
-    def test_holdings_render_the_shared_interactive_iframe(self):
+    def test_empty_news_and_missing_fundamentals_do_not_create_empty_panels(self):
+        row, _ = _build_holding_scan_row(
+            pd.Series({"Ticker": "ABC.BO", "LTP": 100}),
+            {"news": {"source": "Yahoo", "headlines": []},
+             "errors": {"fundamentals": "Yahoo fundamentals unavailable for BSE."}},
+        )
+        titles = [section["title"] for section in row["extraSections"]]
+        self.assertNotIn("Recent company headlines", titles)
+        self.assertNotIn("Fundamentals", titles)
+        availability = next(section for section in row["extraSections"]
+                            if section["title"] == "Data availability")
+        self.assertIn("Yahoo fundamentals unavailable for BSE.", availability["note"])
+
+    def test_holdings_render_the_shared_interactive_table(self):
         app = AppTest.from_string(
             """
 import pandas as pd
@@ -333,10 +348,13 @@ render_stock_holdings_table(
     theme="dark",
 )
 """
-        ).run()
+        )
 
+        with patch("features.equities.scan_table.show_scan_table") as table:
+            app.run()
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.get("iframe")), 1)
+        self.assertEqual(table.call_args.args[1]["tableKey"], "test_holdings")
+        self.assertTrue(callable(table.call_args.kwargs["on_refresh"]))
 
     @patch("features.analysis.fundamentals.requests.get")
     def test_company_fundamentals_are_normalized_and_coverage_is_reported(self, get):

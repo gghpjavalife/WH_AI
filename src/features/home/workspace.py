@@ -12,6 +12,7 @@ import streamlit as st
 
 from ..analysis.panel import render_analysis_brief
 from ..analysis.holdings import render_stock_holdings_table
+from ..analysis.stock_context import holding_identity
 from ..equities.workspace import build_equity_holdings_display
 from ..portfolio.metrics import calculate_allocation
 from ..shared.performance import style_returns
@@ -247,12 +248,22 @@ def _render_home_holdings(
                     if total_investments > 0
                     else 0.0
                 )
-                render_stock_holdings_table(
-                    trading_display,
-                    key="home_trading_positions_table",
-                    theme=theme,
-                    layout="trading",
+                broker = str(st.session_state.get("broker_name") or "")
+                stock_mask = pd.Series(
+                    [holding_identity(row, "trading", broker) is not None
+                     for _, row in trading_display.iterrows()],
+                    index=trading_display.index,
                 )
+                if stock_mask.any():
+                    render_stock_holdings_table(
+                        trading_display.loc[stock_mask],
+                        key="home_trading_positions_table",
+                        theme=theme,
+                        layout="trading",
+                    )
+                if (~stock_mask).any():
+                    st.caption("Other positions are shown without stock-specific research.")
+                    st.dataframe(style_returns(trading_display.loc[~stock_mask], theme=theme), hide_index=True)
 
         with funds_tab:
             if mutual_funds.empty:

@@ -18,6 +18,8 @@ from features.equities.market_data import (
 )
 from .fundamentals import FundamentalsDataError, fetch_company_fundamentals
 from .news import CompanyNewsError, fetch_company_news
+from .stock_context import append_context_to_row, holding_identity, refresh_holding_contexts
+from core.config import configured_value
 
 _FUNDAMENTAL_RULES = (
     ("trailingPE", "Trailing P/E", lambda value: 1 if 0 < value <= 25 else -1 if value <= 0 or value > 40 else 0),
@@ -325,11 +327,6 @@ def _build_holding_scan_row(
                 ]
             ],
             "extraSections": [],
-            "summary": (
-                f"Quantity {holding.get('Qty', 0)} · Average cost "
-                f"₹{_number(holding.get('Avg_Price')):,.2f} · Portfolio share "
-                f"{_number(holding.get('Allocation_%')):.2f}%"
-            ),
         }
     )
     holding_values = {
@@ -354,6 +351,8 @@ def _build_holding_scan_row(
             for key, value in holding_values.items()
         }
     )
+    if pd.isna(holding.get("Allocation_%")):
+        item["ind"]["holding_allocation"] = ["Unavailable", "unknown"]
     fundamental_checks = {
         str(check.get("Fundamental")): str(check.get("Assessment", "Neutral")).lower()
         for check in research.get("fundamental_checks", [])
@@ -385,13 +384,9 @@ def _build_holding_scan_row(
                     ),
                 }
             )
-    elif research.get("errors", {}).get("fundamentals"):
-        item["extraSections"].append(
-            {
-                "title": "Fundamentals",
-                "note": str(research["errors"]["fundamentals"]),
-            }
-        )
+    availability = {}
+    if not isinstance(fundamentals, dict) and research.get("errors", {}).get("fundamentals"):
+        availability["fundamentals"] = f"Fundamentals: {research['errors']['fundamentals']}"
 
     news = research.get("news")
     if isinstance(news, dict):
@@ -399,13 +394,14 @@ def _build_holding_scan_row(
         for article in news.get("headlines", []):
             if not isinstance(article, dict):
                 continue
-            sentiment = article.get("sentiment", 0)
+            sentiment = article.get("sentiment")
             headlines.append(
                 {
                     "title": str(article.get("title", "")),
                     "url": str(article.get("url", "")),
                     "publisher": str(article.get("publisher", "")),
                     "published": str(article.get("published", "")),
+                    "sentiment": sentiment if sentiment in (-1, 0, 1) else None,
                     "sentimentLabel": {
                         1: "Positive terms",
                         0: "Neutral / mixed",
@@ -413,27 +409,24 @@ def _build_holding_scan_row(
                     }.get(sentiment, "Neutral / mixed"),
                 }
             )
-        item["extraSections"].append(
-            {
-                "title": "Recent company headlines",
-                "note": (
-                    f"Source: {news.get('source', 'Public headlines')}. "
-                    + (
+        if headlines:
+            item["extraSections"].append(
+                {
+                    "title": "Recent company headlines",
+                    "note": (
+                        f"Source: {news.get('source', 'Public headlines')}. "
                         "Headline sentiment is a keyword-only context signal."
-                        if headlines
-                        else "No recent headlines were returned."
-                    )
-                ),
-                "items": headlines,
-            }
-        )
+                    ),
+                    "items": headlines,
+                }
+            )
     elif research.get("errors", {}).get("news"):
-        item["extraSections"].append(
-            {
-                "title": "Recent company headlines",
-                "note": str(research["errors"]["news"]),
-            }
-        )
+        availability["news"] = f"News: {research['errors']['news']}"
+    if availability:
+        item["extraSections"].append({
+            "title": "Data availability", "note": " ".join(availability.values()),
+            "availability": availability,
+        })
 
     if research.get("errors", {}).get("technical"):
         item["extraSections"].insert(
@@ -477,30 +470,30 @@ def _build_holding_scan_row(
 def _holding_table_columns(layout: str) -> list[list[object]]:
     equity_columns: list[list[object]] = [
         ["ticker", "Ticker", 0],
+        ["signal", "Signal", 0],
+        ["pnl", "P&L", 1, "currency-change"],
+        ["returnPct", "Returns %", 1, "percent"],
         ["quantity", "Qty", 1, "number"],
-        ["average", "Avg_Price", 1, "currency"],
+        ["average", "Avg price", 1, "currency"],
         ["price", "LTP", 1, "currency"],
         ["investment", "Investment", 1, "currency"],
-        ["holdingValue", "Market_Value", 1, "currency"],
-        ["pnl", "P&L", 1, "currency-change"],
-        ["returnPct", "Returns_%", 1, "percent"],
-        ["allocationPct", "Allocation_%", 1, "percent"],
-        ["signal", "Signal", 0],
+        ["holdingValue", "Market value", 1, "currency"],
+        ["allocationPct", "Allocation %", 1, "percent"],
     ]
     trading_columns: list[list[object]] = [
         ["stock", "Stock", 0],
+        ["signal", "Signal", 0],
+        ["pnl", "Open P&L", 1, "currency-change"],
+        ["returnPct", "Return", 1, "percent"],
         ["price", "Price", 1, "currency"],
         ["chg", "Day change", 1, "percent"],
         ["m1", "1 month", 1, "percent"],
         ["rsi", "RSI 14", 1, "number"],
         ["vol", "Volume", 1, "multiplier"],
-        ["signal", "Signal", 0],
         ["strength", "Strength", 0],
         ["quantity", "Open quantity", 1, "number"],
         ["average", "Average price", 1, "currency"],
         ["holdingValue", "Gross exposure", 1, "currency"],
-        ["pnl", "Open P&L", 1, "currency-change"],
-        ["returnPct", "Return", 1, "percent"],
     ]
     layouts = {
         "home_equity": equity_columns,
@@ -508,6 +501,19 @@ def _holding_table_columns(layout: str) -> list[list[object]]:
         "trading": trading_columns,
     }
     return layouts.get(layout, equity_columns)
+
+
+def _refresh_holdings_research(tickers: set[str]) -> None:
+    st.session_state["stock_context_cache"] = {}
+    cache = st.session_state.get("stock_research_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state["stock_research_cache"] = cache
+    for ticker in tickers:
+        cache.pop(f"selected_stock_research_{ticker}", None)
+        fetch_daily_history.clear(ticker)
+        fetch_company_fundamentals.clear(ticker)
+        fetch_company_news.clear(ticker)
 
 
 def render_stock_holdings_table(
@@ -524,20 +530,22 @@ def render_stock_holdings_table(
         st.session_state.stock_research_cache = cache
     from features.equities.scan_table import show_scan_table
 
-    if st.button("Refresh holdings research", key=f"refresh_{key}"):
-        for ticker in {
-            _ticker_value(value)
-            for value in display.get("Ticker", pd.Series(dtype=str))
-            if _ticker_value(value)
-        }:
-            cache.pop(f"selected_stock_research_{ticker}", None)
-            fetch_daily_history.clear(ticker)
-            fetch_company_fundamentals.clear(ticker)
-            fetch_company_news.clear(ticker)
-        st.rerun()
-
     payload = []
     config: dict[str, object] = {}
+    context_cache = st.session_state.setdefault("stock_context_cache", {})
+    if not isinstance(context_cache, dict):
+        context_cache = {}
+        st.session_state["stock_context_cache"] = context_cache
+    connected = bool(st.session_state.get("token") and st.session_state.get("broker_state"))
+    broker = str(st.session_state.get("broker_name") or "")
+    analytics_available = bool(str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip()) if connected else False
+    identities = {
+        identity for _, holding in display.iterrows()
+        if connected and (identity := holding_identity(holding, layout, broker)) is not None
+    }
+    if identities:
+        with st.spinner(f"Updating local market context for {len(identities)} stock(s)…"):
+            refresh_holding_contexts(context_cache, identities, analytics_available=analytics_available)
     missing = {
         _ticker_value(holding.get("Ticker"))
         for _, holding in display.iterrows()
@@ -571,6 +579,11 @@ def render_stock_holdings_table(
         if not isinstance(research, dict):
             continue
         row, row_config = _build_holding_scan_row(holding, research)
+        identity = holding_identity(holding, layout, broker) if connected else None
+        if identity:
+            row["currency"] = "INR"
+        entry = context_cache.get((*identity, analytics_available)) if identity else None
+        append_context_to_row(row, row_config, entry[1] if entry else None)
         payload.append(row)
         config = row_config
     if not payload:
@@ -578,5 +591,10 @@ def render_stock_holdings_table(
         return
     config["columns"] = _holding_table_columns(layout)
     config["tableKey"] = key
-    config["showColumnFilters"] = False
-    show_scan_table(payload, config)
+    config["showColumnFilters"] = True
+    tickers = {
+        _ticker_value(value)
+        for value in display.get("Ticker", pd.Series(dtype=str))
+        if _ticker_value(value)
+    }
+    show_scan_table(payload, config, on_refresh=lambda: _refresh_holdings_research(tickers))
