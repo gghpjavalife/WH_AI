@@ -61,7 +61,11 @@ class ScannerStockContextTests(unittest.TestCase):
         explicit, _ = build_scan_table_payload(
             [{"Ticker": "CUSTOM", "Recommendation": "HOLD", "currency": "usd"}], {}
         )
-        self.assertEqual(listed[0]["label"], "PGIL")
+        self.assertEqual(listed[0]["displayTicker"], "PGIL.NS")
+        self.assertEqual(
+            listed[0]["label"],
+            "PGIL · Pearl Global Industries Limited (NSE)",
+        )
         self.assertEqual(listed[0]["currency"], "INR")
         self.assertIsNone(unknown[0]["currency"])
         self.assertEqual(explicit[0]["currency"], "USD")

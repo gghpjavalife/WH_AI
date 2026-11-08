@@ -449,7 +449,7 @@ function render(){
   `<th data-k="${esc(k)}" class="${n?'num':''} ${k==='pass'?'nosort':''}">${esc(l)}<span class="arrow">${st.key===k?(st.dir>0?'&#9650;':'&#9660;'):''}</span></th>`).join('')+
   fields.map(f=>`<th data-k="raw:${f.index}" class="raw-head ${f.type==='number'?'num':''}" title="${esc(f.label)}">${esc(f.header)}<span class="arrow">${st.key==='raw:'+f.index?(st.dir>0?'&#9650;':'&#9660;'):''}</span><button type="button" class="remove-field" data-remove-field="${f.index}" aria-label="Remove ${esc(f.label)} column" title="Remove ${esc(f.label)} column">&times;</button></th>`).join('');
  const cell=(key,type,r)=>{
-  if(key==='stock')return `<td class="name">${esc(r.label)}</td>`;
+  if(key==='stock')return `<td class="name">${esc(r.displayTicker||r.ticker)}</td>`;
   if(key==='signal')return `<td><span class="signal-value ${PILL[r.signal]||'H'}">${esc(r.signal)}</span></td>`;
   if(key==='strength')return `<td><div class="meter"><i><b style="width:${r.total?Math.round(r.pos/r.total*100):0}%"></b></i><span>${r.pos}/${r.total}</span></div></td>`;
   if(key==='pass')return `<td class="${r.pass?'pos':'neg'}">${r.pass?'&#10003;':'&#10007;'}</td>`;
@@ -778,6 +778,7 @@ def _add_rows_to_cart(
         if identity in existing:
             item = existing[identity]
             item["signal"] = signal
+            item["ticker"] = str(row.get("cartTicker") or ticker)
             item["name"] = str(row.get("label") or ticker)
             item["stock_detail"] = snapshot
             if holding_quantity is not None:
@@ -789,7 +790,7 @@ def _add_rows_to_cart(
             quantity = -quantity
         cart.append({
             "id": identity,
-            "ticker": ticker,
+            "ticker": str(row.get("cartTicker") or ticker),
             "name": str(row.get("label") or ticker),
             "signal": signal,
             "quantity": quantity,

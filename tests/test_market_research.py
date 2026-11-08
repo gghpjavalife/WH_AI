@@ -1331,7 +1331,7 @@ _render_ai_provider_configurations("delete-test-user")
         payload, config = _scan_table_payload([row], {"ABC.BO": "ABC \u00b7 Alpha"})
         html = render_scan_table(payload, config)
 
-        self.assertEqual(payload[0]["label"], "ABC.BO")
+        self.assertEqual(payload[0]["displayTicker"], "ABC.BO")
         self.assertEqual(payload[0]["ind"]["SMA_20"], ["\u20b9100.00", "pos"])
         self.assertEqual(payload[0]["ind"]["ADX_14"][0], "31.2")
         self.assertEqual(

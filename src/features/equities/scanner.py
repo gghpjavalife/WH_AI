@@ -610,6 +610,17 @@ def build_scan_table_payload(
     for row in rows:
         symbol = str(row["Ticker"])
         source_label = labels.get(symbol, symbol)
+        display_ticker = symbol
+        cart_label = source_label
+        listing = re.fullmatch(r"\s*(.*?)\s*·\s*(.*?)\s*\((NSE|BSE)\)\s*", source_label, re.IGNORECASE)
+        if listing:
+            base_ticker, company, exchange = listing.groups()
+            suffix = ".NS" if exchange.upper() == "NSE" else ".BO"
+            base_ticker = base_ticker.strip().upper().removesuffix(".NS").removesuffix(".BO")
+            display_ticker = base_ticker
+            if not display_ticker.upper().endswith(suffix):
+                display_ticker += suffix
+            cart_label = f"{base_ticker} · {company.strip()} ({exchange.upper()})"
         currency = row.get("currency")
         if not isinstance(currency, str) or not currency.strip():
             if symbol.upper().endswith((".NS", ".BO")) or re.search(
@@ -641,7 +652,9 @@ def build_scan_table_payload(
         payload.append(
             {
                 "ticker": symbol,
-                "label": symbol,
+                "cartTicker": display_ticker,
+                "label": cart_label,
+                "displayTicker": display_ticker,
                 "currency": currency.strip().upper() if isinstance(currency, str) else None,
                 "price": _num(row, "Price"),
                 "chg": _num(row, "Daily_change_%"),

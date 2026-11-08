@@ -2,6 +2,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from features.analysis import holdings
@@ -18,6 +19,30 @@ render_stock_holdings_table(pd.DataFrame([{
 
 
 class HoldingsBackgroundTests(unittest.TestCase):
+    def test_holding_cart_label_uses_listed_company_master(self):
+        app = AppTest.from_string("""
+import pandas as pd
+from features.analysis.holdings import render_stock_holdings_table
+render_stock_holdings_table(pd.DataFrame([{
+    "Ticker": "SUZLON", "Company": "SUZLON", "Qty": 2, "Avg_Price": 30,
+    "LTP": 39, "Market_Value": 78, "P&L": 18, "Returns_%": 30,
+    "Allocation_%": 100,
+}]), key="holdings_test", theme="dark")
+""")
+        master = pd.DataFrame([{
+            "Symbol": "SUZLON", "Company": "Suzlon Energy Limited", "Exchange": "NSE",
+        }])
+        with patch("features.equities.scanner._load_indian_equity_master", return_value=master), \
+                patch.object(holdings, "_analyze_selected_stock", return_value={
+                    "signal": "Hold", "reason": "Test", "errors": {},
+                }), \
+                patch("features.equities.scan_table.show_scan_table") as table:
+            app.run(timeout=5)
+        self.assertFalse(app.exception)
+        row = table.call_args.args[0][0]
+        self.assertEqual(row["ticker"], "SUZLON.NS")
+        self.assertEqual(row["label"], "SUZLON · Suzlon Energy Limited (NSE)")
+
     def test_slow_research_does_not_block_reruns_or_duplicate_work(self):
         started = threading.Event()
         release = threading.Event()

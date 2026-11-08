@@ -59,8 +59,12 @@ class CartWorkspaceTests(unittest.TestCase):
         self.assertTrue(_valid_quantity({"holding_quantity": 0}, -11))
 
     def test_names_and_currency_estimate(self):
-        self.assertEqual(_display_name({"ticker": "BSE", "name": "BSE · BSE"}), "BSE")
-        self.assertEqual(_display_name({"ticker": "ABC", "name": "ABC · Company"}), "ABC")
+        self.assertEqual(_display_name({"ticker": "BSE", "name": "BSE · BSE"}), "BSE · BSE")
+        self.assertEqual(_display_name({"ticker": "ABC", "name": "Company"}), "ABC · Company")
+        self.assertEqual(
+            _display_name({"ticker": "COFORGE.NS", "name": "COFORGE · Coforge Limited (NSE)"}),
+            "COFORGE · Coforge Limited (NSE)",
+        )
         self.assertEqual(_display_name({"name": "ABC · Company"}), "ABC · Company")
         item = {"ticker": "ABC.NS", "quantity": -3,
                 "stock_detail": {"row": {"price": 50}, "config": {}}}

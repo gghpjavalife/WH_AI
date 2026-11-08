@@ -155,7 +155,14 @@ def _row_event(item_id: str, key: str) -> None:
 
 
 def _display_name(item: dict[str, Any]) -> str:
-    return str(item.get("ticker") or item.get("name") or "")
+    ticker = str(item.get("ticker") or "")
+    name = str(item.get("name") or "")
+    base_ticker = ticker.removesuffix(".NS").removesuffix(".BO")
+    if not name or name.casefold().startswith(base_ticker.casefold() + " · "):
+        return name or ticker
+    if name.casefold().startswith(ticker.casefold()):
+        return name or ticker
+    return f"{ticker} · {name}"
 
 
 def render_cart_workspace() -> None:

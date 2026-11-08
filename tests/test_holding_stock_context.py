@@ -10,7 +10,9 @@ from features.analysis.stock_context import (
     CONTEXT_TTL, _CONTEXT_INFO, _OVERVIEW_INFO, append_context_to_row,
     context_filter_fields, holding_identity, load_holding_context, refresh_holding_contexts,
 )
-from features.analysis.holdings import _build_holding_scan_row
+from features.analysis.holdings import (
+    _build_holding_scan_row, _listed_company_names,
+)
 from features.equities.scanner import build_scan_table_payload
 from services.stock_context_models import (
     InvestmentHorizon, LocalGatekeeperResponse, NewsHeadline, StockSignalContext, TechnicalIndicators,
@@ -20,6 +22,42 @@ from streamlit.testing.v1 import AppTest
 
 
 class HoldingStockContextTests(unittest.TestCase):
+    def test_company_lookup_replaces_ticker_fallbacks_with_exchange_master_names(self):
+        master = pd.DataFrame([
+            {"Symbol": "SUZLON", "Company": "Suzlon Energy Limited", "Exchange": "NSE"},
+            {"Symbol": "POLYCAB", "Company": "Polycab India Limited", "Exchange": "NSE"},
+            {"Symbol": "ICICIBANK.BO", "Ticker": "ICICIBANK",
+             "Company": "ICICI Bank Limited", "Exchange": "BSE"},
+        ])
+        companies = _listed_company_names(master)
+        suzlon, _ = _build_holding_scan_row(pd.Series({
+            "Ticker": "SUZLON", "Company": "SUZLON", "LTP": 39,
+        }), {}, company_name=companies[("SUZLON", "NSE")])
+        polycab, _ = _build_holding_scan_row(pd.Series({
+            "Ticker": "POLYCAB", "Company": "POLYCAB", "LTP": 7839,
+        }), {}, company_name=companies[("POLYCAB", "NSE")])
+        self.assertEqual(suzlon["ticker"], "SUZLON.NS")
+        self.assertEqual(suzlon["label"], "SUZLON · Suzlon Energy Limited (NSE)")
+        self.assertEqual(polycab["label"], "POLYCAB · Polycab India Limited (NSE)")
+        self.assertEqual(companies[("ICICIBANK", "BSE")], "ICICI Bank Limited")
+
+    def test_equity_holding_rows_use_exchange_qualified_tickers_and_cart_labels(self):
+        nse, _ = _build_holding_scan_row(pd.Series({
+            "Ticker": "COFORGE", "Company": "Coforge Limited",
+            "Instrument_Key": "NSE_EQ|INE591G01025", "LTP": 100,
+        }), {})
+        self.assertEqual(nse["ticker"], "COFORGE.NS")
+        self.assertEqual(nse["displayTicker"], "COFORGE.NS")
+        self.assertEqual(nse["label"], "COFORGE · Coforge Limited (NSE)")
+
+        bse, _ = _build_holding_scan_row(pd.Series({
+            "Ticker": "BSE", "Company": "BSE Limited",
+            "Instrument_Key": "BSE_EQ|INE118H01025", "LTP": 100,
+        }), {})
+        self.assertEqual(bse["ticker"], "BSE.BO")
+        self.assertEqual(bse["displayTicker"], "BSE.BO")
+        self.assertEqual(bse["label"], "BSE · BSE Limited (BSE)")
+
     def test_context_descriptions_cover_schema_and_raw_columns_even_when_unavailable(self):
         row, config = _build_holding_scan_row(pd.Series({"Ticker": "ABC", "LTP": 100}), {})
         row["contextInfo"] = {"existing": "Existing help."}

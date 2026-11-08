@@ -104,6 +104,21 @@ def _text(value: Any, fallback: str = "") -> str:
     return text if text else fallback
 
 
+def _listed_company_names(master: pd.DataFrame) -> dict[tuple[str, str], str]:
+    companies = {}
+    for listing in master.itertuples(index=False):
+        symbol = str(getattr(listing, "Symbol", "")).strip().upper()
+        exchange = str(getattr(listing, "Exchange", "")).strip().upper()
+        company = str(getattr(listing, "Company", "")).strip()
+        if not symbol or not company or exchange not in {"NSE", "BSE"}:
+            continue
+        companies[(symbol.removesuffix(".BO"), exchange)] = company
+        ticker = str(getattr(listing, "Ticker", "")).strip().upper()
+        if ticker:
+            companies[(ticker, exchange)] = company
+    return companies
+
+
 def build_portfolio_holding_rows(
     equities: pd.DataFrame,
     trading_positions: pd.DataFrame,
@@ -278,11 +293,20 @@ def _analyze_selected_stock(ticker: str) -> dict[str, Any]:
 def _build_holding_scan_row(
     holding: pd.Series,
     research: dict[str, Any],
+    *,
+    company_name: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     from features.equities.scanner import build_scan_table_payload
 
     ticker = _ticker_value(holding.get("Ticker"))
-    company = _text(holding.get("Company"), ticker)
+    company = _text(company_name, _text(holding.get("Company"), ticker))
+    instrument_key = _text(holding.get("Instrument_Key")).upper()
+    exchange = (
+        "BSE" if instrument_key.startswith("BSE_EQ|") or ticker.endswith(".BO")
+        else "NSE"
+    )
+    suffix = ".BO" if exchange == "BSE" else ".NS"
+    qualified_ticker = ticker if ticker.endswith(suffix) else ticker.removesuffix(".NS").removesuffix(".BO") + suffix
     technical = research.get("technical")
     indicators = (
         technical.get("raw_indicators", {}) if isinstance(technical, dict) else {}
@@ -330,7 +354,7 @@ def _build_holding_scan_row(
     }
     scanner_row.update(
         {
-            "Ticker": ticker,
+            "Ticker": qualified_ticker,
             "Price": _number(holding.get("LTP")),
             "Recommendation": str(research.get("signal", "Not rated")).upper(),
             "Signal_score": _number(research.get("score")),
@@ -348,12 +372,19 @@ def _build_holding_scan_row(
             ],
         }
     )
-    payload, config = build_scan_table_payload([scanner_row], {ticker: f"{ticker} · {company}"})
+    payload, config = build_scan_table_payload(
+        [scanner_row],
+        {
+            qualified_ticker:
+                f"{qualified_ticker.removesuffix('.NS').removesuffix('.BO')} · "
+                f"{company} ({exchange})"
+        },
+    )
     item = payload[0]
     market_value = holding.get("Market_Value", holding.get("Gross_Exposure"))
     item.update(
         {
-            "ticker": ticker,
+            "ticker": qualified_ticker,
             "quantity": _number(holding.get("Qty")),
             "average": _number(holding.get("Avg_Price")),
             "investment": _number(holding.get("Investment")),
@@ -578,6 +609,7 @@ def render_stock_holdings_table(
         cache = {}
         st.session_state.stock_research_cache = cache
     from features.equities.scan_table import show_scan_table
+    from features.equities.scanner import _load_indian_equity_master
 
     payload = []
     config: dict[str, object] = {}
@@ -590,6 +622,7 @@ def render_stock_holdings_table(
     connected = bool(st.session_state.get("token") and st.session_state.get("broker_state"))
     broker = str(st.session_state.get("broker_name") or "")
     analytics_available = bool(str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip()) if connected else False
+    company_names = _listed_company_names(_load_indian_equity_master())
     identities = {
         identity for _, holding in display.iterrows()
         if connected and (identity := holding_identity(holding, layout, broker)) is not None
@@ -637,7 +670,15 @@ def render_stock_holdings_table(
                 "reason": "Research is loading.",
                 "errors": {},
             }
-        row, row_config = _build_holding_scan_row(holding, research)
+        raw_ticker = _ticker_value(holding.get("Ticker"))
+        raw_key = _text(holding.get("Instrument_Key")).upper()
+        exchange = "BSE" if raw_key.startswith("BSE_EQ|") or raw_ticker.endswith(".BO") else "NSE"
+        company_name = company_names.get(
+            (raw_ticker.removesuffix(".NS").removesuffix(".BO"), exchange)
+        )
+        row, row_config = _build_holding_scan_row(
+            holding, research, company_name=company_name
+        )
         identity = holding_identity(holding, layout, broker) if connected else None
         if identity:
             row["currency"] = "INR"

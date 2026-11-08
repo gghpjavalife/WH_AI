@@ -539,9 +539,13 @@ class TableMountTests(unittest.TestCase):
         with patch("features.equities.scan_table.st.session_state", state), \
              patch("features.equities.scan_table.st.toast"), \
              patch("features.equities.scan_table._COMPONENT") as component:
-            show_scan_table([row("ABC.NS", [])], config)
+            show_scan_table([{
+                **row("SBC", []), "cartTicker": "SBC.NS",
+                "label": "SBC · Example Industries (NSE)",
+            }], config)
             component.call_args.kwargs["on_add_to_cart_change"]()
-        self.assertEqual(state["stock_cart"][0]["ticker"], "ABC.NS")
+        self.assertEqual(state["stock_cart"][0]["ticker"], "SBC.NS")
+        self.assertEqual(state["stock_cart"][0]["name"], "SBC · Example Industries (NSE)")
         self.assertEqual(state["stock_cart"][0]["stock_detail"]["config"], config)
 
     def test_cart_snapshot_is_detached_and_refreshed_on_readd(self):
