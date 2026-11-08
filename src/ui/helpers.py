@@ -31,6 +31,38 @@ def broker_connect_button_css() -> str:
     )
 
 
+def signed_in_label_html(profile_name: str) -> str:
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:.35rem;'
+        'white-space:nowrap;color:rgba(250,250,250,.6);font-size:.875rem">'
+        '<svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" '
+        'fill="currentColor"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 '
+        '2c-4.42 0-8 2.24-8 5v1h16v-1c0-2.76-3.58-5-8-5Z"/></svg>'
+        "<span>Signed in as</span>"
+        f"<strong>{escape(profile_name)}</strong>"
+        "</span>"
+    )
+
+
+def workspace_subtabs_css(container_key: str) -> str:
+    scope = f".st-key-{container_key} [data-testid=\"stTabs\"]"
+    return (
+        "<style>"
+        f"{scope} [role=\"tablist\"]{{gap:.55rem;border:0;margin-bottom:.6rem}}"
+        f"{scope} [role=\"tab\"]{{flex:1 1 0;justify-content:center;"
+        "border:1px solid rgba(201,162,39,.32);border-radius:.7rem;"
+        "background:rgba(255,255,255,.025);padding:.6rem .5rem;"
+        "transition:background .18s ease,border-color .18s ease}}"
+        f"{scope} [role=\"tab\"]:hover{{background:rgba(255,255,255,.07);"
+        "border-color:rgba(230,184,0,.7)}}"
+        f"{scope} [role=\"tab\"][aria-selected=\"true\"]{{"
+        "background:linear-gradient(135deg,rgba(230,184,0,.16),"
+        "rgba(201,162,39,.06));border-color:#C9A227;color:#F2C94C}}"
+        f"{scope} [data-baseweb=\"tab-highlight\"]{{display:none}}"
+        "</style>"
+    )
+
+
 def app_animation_css() -> str:
     return """<style>
 @keyframes guru-rise-in {
@@ -223,6 +255,51 @@ def gold_theme_css() -> str:
 .gghp-brand { padding: .2rem 0 !important; border: 0 !important; margin-bottom: 0; background: transparent !important; }
 .gghp-badge { background: linear-gradient(135deg, #E6B800, #B8860B) !important; color: #1B1400 !important; }
 .gghp-name { background-image: none !important; color: #F2C94C !important; -webkit-text-fill-color: #F2C94C !important; }
+@media (max-width: 900px) {
+  [data-testid="stMainBlockContainer"] {
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
+  }
+  [data-testid="stTabs"] [role="tablist"] {
+    justify-content: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    touch-action: pan-x;
+  }
+  [data-testid="stTabs"] [role="tab"] {
+    flex: 0 0 auto !important;
+    white-space: nowrap;
+  }
+}
+@media (max-width: 640px) {
+  [data-testid="stMainBlockContainer"] {
+    padding-top: 3.5rem;
+    padding-left: .75rem;
+    padding-right: .75rem;
+    padding-bottom: 1.5rem;
+  }
+  [data-testid="stHorizontalBlock"] {
+    flex-wrap: wrap;
+    gap: .75rem;
+  }
+  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+    flex: 1 1 100% !important;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  [data-testid="stDataFrame"],
+  [data-testid="stTable"],
+  [data-testid="stPlotlyChart"] {
+    max-width: 100%;
+  }
+  [data-testid="stDialog"] > div {
+    width: calc(100vw - 1rem) !important;
+    max-width: calc(100vw - 1rem) !important;
+    max-height: calc(100dvh - 1rem);
+    overflow-y: auto;
+  }
+}
 @media (prefers-reduced-motion: no-preference) {
   .gghp-badge { animation-name: gghp-gold-pulse !important; }
   @keyframes gghp-gold-pulse {

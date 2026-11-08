@@ -32,6 +32,7 @@ def diagnostic_summary(operation: str, error: BaseException) -> str:
     source = _cause_with_status(error)
     details = [type(error).__name__]
     status = getattr(source, "status", None)
+    code = getattr(source, "code", None)
     response = getattr(source, "response", None)
     if status is None and response is not None:
         status = getattr(response, "status_code", None)
@@ -41,6 +42,12 @@ def diagnostic_summary(operation: str, error: BaseException) -> str:
             details.append(HTTPStatus(status).phrase)
         except ValueError:
             pass
+    elif isinstance(code, int):
+        details.append(f"HTTP {code}")
+        if isinstance(status, str) and status:
+            details.append(_SAFE_LABEL.sub("_", status.strip())[:40])
+    elif isinstance(status, str) and status:
+        details.append(_SAFE_LABEL.sub("_", status.strip())[:40])
 
     headers = getattr(source, "headers", None)
     if not isinstance(headers, Mapping) and response is not None:
@@ -79,4 +86,3 @@ def log_success(operation: str, *, broker: str, item_count: int) -> None:
         _SAFE_LABEL.sub("_", broker)[:40],
         item_count,
     )
-

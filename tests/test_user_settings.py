@@ -8,7 +8,12 @@ from unittest.mock import patch
 import services.database as secure_database
 import services.user_settings as user_settings
 from core.config import settings
-from ui.user_settings import _validate_contact, _validate_email, _validate_phone
+from ui.user_settings import (
+    _validate_callback_url,
+    _validate_contact,
+    _validate_email,
+    _validate_phone,
+)
 
 
 class UserSettingsTests(unittest.TestCase):
@@ -156,6 +161,18 @@ class UserSettingsTests(unittest.TestCase):
                 {"email": "person@example.com", "phone": "9876543210"}
             )
         )
+
+    def test_callback_url_validation_accepts_local_and_public_http_addresses(self):
+        self.assertIsNone(_validate_callback_url(""))
+        self.assertIsNone(_validate_callback_url("http://localhost:8501/"))
+        self.assertIsNone(_validate_callback_url("https://wealth.example.com/app"))
+        for invalid_url in (
+            "wealth.example.com",
+            "ftp://wealth.example.com",
+            "http:///missing-host",
+        ):
+            with self.subTest(url=invalid_url):
+                self.assertIsNotNone(_validate_callback_url(invalid_url))
 
     def test_invalid_owner_and_non_json_preferences_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "user identifier"):

@@ -29,7 +29,8 @@ HELP_TOPICS: tuple[tuple[str, tuple[str, ...], str], ...] = (
             "encrypted-storage consent; otherwise enter them again in a future "
             "session. OAuth callback URLs must match the values registered "
             "with the selected broker. Tokens and portfolio data stay in the active app session; "
-            "use **Switch account** in the header to disconnect."
+            "use **Switch account** in the account bar inside any workspace tab "
+            "to disconnect."
         ),
     ),
     (

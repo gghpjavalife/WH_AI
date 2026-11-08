@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-from brokers.factory import GenericDynamicAdapter
 from core.config import configured_value, settings
 
 
@@ -184,82 +182,15 @@ def _tenant_key(user_identifier: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _ensure_dynamic_broker_table() -> None:
-    execute_turso_query(
-        """
-        CREATE TABLE IF NOT EXISTS dynamic_broker_registry (
-            owner_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            configuration_json TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (owner_id, name)
+def clear_legacy_dynamic_brokers(user_identifier: str) -> None:
+    """Remove obsolete cloud broker definitions for the current tenant only."""
+    owner_key = _tenant_key(user_identifier)
+    rows = execute_turso_query(
+        "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+        ("table", "dynamic_broker_registry"),
+    )
+    if rows:
+        execute_turso_query(
+            "DELETE FROM dynamic_broker_registry WHERE owner_id = ?",
+            (owner_key,),
         )
-        """
-    )
-
-
-def list_dynamic_brokers(user_identifier: str) -> list[str]:
-    """List only the current tenant's custom broker definitions."""
-    _ensure_dynamic_broker_table()
-    rows = execute_turso_query(
-        "SELECT name FROM dynamic_broker_registry WHERE owner_id = ? ORDER BY name",
-        (_tenant_key(user_identifier),),
-    )
-    return [str(row["name"]) for row in rows if row.get("name")]
-
-
-def register_dynamic_broker(
-    user_identifier: str,
-    name: str,
-    configuration: dict[str, Any],
-) -> None:
-    """Validate and store a tenant-scoped, read-only broker endpoint definition."""
-    normalized_name = name.strip()
-    if not normalized_name or len(normalized_name) > 80:
-        raise ValueError("Broker name must contain 1–80 characters.")
-    validated = GenericDynamicAdapter(
-        {**configuration, "name": normalized_name}
-    )
-    safe_configuration = {
-        "name": validated.name,
-        "api_base": validated.api_base,
-        "endpoints": validated.endpoints,
-    }
-    _ensure_dynamic_broker_table()
-    execute_turso_query(
-        """
-        INSERT INTO dynamic_broker_registry (owner_id, name, configuration_json)
-        VALUES (?, ?, ?)
-        ON CONFLICT(owner_id, name) DO UPDATE SET
-            configuration_json = excluded.configuration_json
-        """,
-        (
-            _tenant_key(user_identifier),
-            normalized_name,
-            json.dumps(safe_configuration, separators=(",", ":"), sort_keys=True),
-        ),
-    )
-
-
-def load_dynamic_broker(
-    user_identifier: str, name: str
-) -> dict[str, Any] | None:
-    """Load one broker definition while enforcing tenant ownership."""
-    _ensure_dynamic_broker_table()
-    rows = execute_turso_query(
-        """
-        SELECT configuration_json FROM dynamic_broker_registry
-        WHERE owner_id = ? AND name = ?
-        """,
-        (_tenant_key(user_identifier), name.strip()),
-    )
-    if not rows:
-        return None
-    try:
-        configuration = json.loads(str(rows[0]["configuration_json"]))
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Stored dynamic broker definition is invalid.") from exc
-    if not isinstance(configuration, dict):
-        raise RuntimeError("Stored dynamic broker definition is invalid.")
-    GenericDynamicAdapter(configuration)
-    return configuration

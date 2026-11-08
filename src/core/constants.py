@@ -23,6 +23,7 @@ class AppTab(StrEnum):
     TRADES = "Trades"
     DERIVATIVES = "F&O"
     MUTUAL_FUNDS = "Mutual Funds"
+    CART = "Cart"
 
 
 class AppNavigation(StrEnum):
@@ -31,6 +32,7 @@ class AppNavigation(StrEnum):
     TRADES = ":material/swap_horiz: Trades"
     DERIVATIVES = ":material/query_stats: F&O"
     MUTUAL_FUNDS = ":material/savings: Mutual Funds"
+    CART = ":material/shopping_cart: Cart"
 
 
 class LegacyAppNavigation(Enum):

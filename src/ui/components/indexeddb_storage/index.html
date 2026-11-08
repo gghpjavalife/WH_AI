@@ -1,0 +1,288 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <script>
+      const DB_NAME = "wh-ai-local";
+      const DB_VERSION = 1;
+      const STORE = "records";
+      const DEVICE_STORE = "device_metadata";
+      let lastRequestId = null;
+
+      function post(type, data) {
+        const origin = document.referrer
+          ? new URL(document.referrer).origin
+          : "*";
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type, ...data },
+          origin
+        );
+      }
+
+      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(STORE)) {
+              database.createObjectStore(STORE, { keyPath: "record_key" });
+            }
+            if (!database.objectStoreNames.contains(DEVICE_STORE)) {
+              database.createObjectStore(DEVICE_STORE, { keyPath: "key" });
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      function transactionResult(database, storeName, mode, action) {
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(storeName, mode);
+          const store = transaction.objectStore(storeName);
+          let result;
+          try {
+            result = action(store);
+          } catch (error) {
+            reject(error);
+            return;
+          }
+          transaction.oncomplete = () => resolve(result);
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+      }
+
+      function requestValue(request) {
+        return new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function encryptionKey(database, create) {
+        const existing = await transactionResult(
+          database, DEVICE_STORE, "readonly",
+          store => requestValue(store.get("settings-encryption-key"))
+        );
+        if (existing && existing.value) return existing.value;
+        if (!create) return null;
+
+        const key = await crypto.subtle.generateKey(
+          { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+        );
+        await transactionResult(
+          database, DEVICE_STORE, "readwrite",
+          store => requestValue(store.put({ key: "settings-encryption-key", value: key }))
+        );
+        return key;
+      }
+
+      function bytesToBase64(bytes) {
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary);
+      }
+
+      function base64ToBytes(value) {
+        return Uint8Array.from(atob(value), character => character.charCodeAt(0));
+      }
+
+      async function encodeSensitive(database, value) {
+        if (value === null || value === undefined) return null;
+        const key = await encryptionKey(database, true);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const plaintext = new TextEncoder().encode(value);
+        const ciphertext = await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv }, key, plaintext
+        );
+        return JSON.stringify({
+          version: 1,
+          iv: bytesToBase64(iv),
+          ciphertext: bytesToBase64(new Uint8Array(ciphertext))
+        });
+      }
+
+      async function decodeSensitive(database, value) {
+        if (!value) return null;
+        const envelope = JSON.parse(value);
+        if (envelope.version !== 1) throw new Error("Unsupported local settings encryption.");
+        const key = await encryptionKey(database, false);
+        if (!key) throw new Error("The local settings encryption key is unavailable.");
+        const plaintext = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: base64ToBytes(envelope.iv) },
+          key,
+          base64ToBytes(envelope.ciphertext)
+        );
+        return new TextDecoder().decode(plaintext);
+      }
+
+      async function consumeOAuthState(database, recordKey) {
+        const consumed = await new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE, "readwrite");
+          const store = transaction.objectStore(STORE);
+          let record = null;
+          const request = store.get(recordKey);
+          request.onsuccess = () => {
+            record = request.result ? request.result.value : null;
+            if (record) store.delete(recordKey);
+          };
+          request.onerror = () => reject(request.error);
+          transaction.oncomplete = () => resolve(record);
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+        if (!consumed || Number(consumed.expires_at) <= Date.now() / 1000) {
+          return null;
+        }
+        return {
+          expires_at: Number(consumed.expires_at),
+          credential_context_json: consumed.encrypted_context
+            ? await decodeSensitive(database, consumed.encrypted_context)
+            : null
+        };
+      }
+
+      function deleteCollection(database, collection) {
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE, "readwrite");
+          const store = transaction.objectStore(STORE);
+          const prefix = `${collection}:`;
+          const request = store.openKeyCursor(IDBKeyRange.lowerBound(prefix));
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor || !cursor.key.startsWith(prefix)) return;
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error);
+          transaction.oncomplete = () => resolve(true);
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error || new Error("Collection deletion aborted."));
+        });
+      }
+
+      async function execute(command) {
+        const database = await openDatabase();
+        try {
+          if (command.action === "get_device_id") {
+            let record = await transactionResult(
+              database, DEVICE_STORE, "readonly",
+              store => requestValue(store.get("anonymous_device_id"))
+            );
+            if (!record) {
+              record = { key: "anonymous_device_id", value: crypto.randomUUID() };
+              try {
+                await transactionResult(
+                  database, DEVICE_STORE, "readwrite",
+                  store => requestValue(store.add(record))
+                );
+              } catch (error) {
+                if (!error || error.name !== "ConstraintError") throw error;
+                record = await transactionResult(
+                  database, DEVICE_STORE, "readonly",
+                  store => requestValue(store.get("anonymous_device_id"))
+                );
+                if (!record) throw error;
+              }
+            }
+            return record.value;
+          }
+
+          if (command.action === "delete_collection") {
+            if (typeof command.collection !== "string" ||
+                !command.collection || command.collection.includes(":")) {
+              throw new Error("A nonempty collection name without ':' is required.");
+            }
+            return await deleteCollection(database, command.collection);
+          }
+
+          const recordKey = `${command.collection}:${command.key}`;
+          if (command.action === "consume" && command.collection === "oauth_states") {
+            return await consumeOAuthState(database, recordKey);
+          }
+          if (command.action === "get") {
+            const record = await transactionResult(
+              database, STORE, "readonly",
+              store => requestValue(store.get(recordKey))
+            );
+            const value = record ? record.value : null;
+            if (command.collection === "user_settings" && value) {
+              value.owner_id = command.key;
+              value.sensitive_json = value.encrypted_sensitive
+                ? await decodeSensitive(database, value.encrypted_sensitive)
+                : null;
+              value.sensitive_consent = Boolean(value.sensitive_consent);
+              delete value.encrypted_sensitive;
+            } else if (command.collection === "oauth_states" && value) {
+              value.credential_context_json = value.encrypted_context
+                ? await decodeSensitive(database, value.encrypted_context)
+                : null;
+            }
+            return value;
+          }
+          if (command.action === "put") {
+            const value = { ...command.value };
+            if (command.collection === "user_settings") {
+              value.owner_id = command.key;
+              value.encrypted_sensitive = value.sensitive_consent
+                ? await encodeSensitive(database, value.sensitive_json)
+                : null;
+              value.updated_at = new Date().toISOString();
+              delete value.sensitive_json;
+            } else if (command.collection === "oauth_states") {
+              value.state_digest = command.key;
+              value.encrypted_context = value.credential_context_json
+                ? await encodeSensitive(database, value.credential_context_json)
+                : null;
+              delete value.credential_context_json;
+            }
+            await transactionResult(
+              database, STORE, "readwrite",
+              store => requestValue(store.put({ record_key: recordKey, value }))
+            );
+            return true;
+          }
+          if (command.action === "delete") {
+            await transactionResult(
+              database, STORE, "readwrite",
+              store => requestValue(store.delete(recordKey))
+            );
+            return true;
+          }
+          throw new Error("Unsupported local storage operation.");
+        } finally {
+          database.close();
+        }
+      }
+
+      window.addEventListener("message", event => {
+        if (!event.data || event.data.type !== "streamlit:render") return;
+        const command = event.data.args && event.data.args.request;
+        if (!command || command.request_id === lastRequestId) return;
+        lastRequestId = command.request_id;
+        execute(command).then(
+          value => post("streamlit:setComponentValue", {
+            dataType: "json",
+            value: { request_id: command.request_id, value }
+          }),
+          error => post("streamlit:setComponentValue", {
+            dataType: "json",
+            value: {
+              request_id: command.request_id,
+              error: error && error.message ? error.message : "Browser storage failed."
+            }
+          })
+        );
+      });
+
+      post("streamlit:componentReady", { apiVersion: 1 });
+      post("streamlit:setFrameHeight", { height: 1 });
+    </script>
+  </body>
+</html>

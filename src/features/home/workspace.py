@@ -10,7 +10,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from ..analysis.panel import render_analysis_brief
+from ..analysis.holdings import render_stock_holdings_table
+from ..analysis.stock_context import holding_identity
+from ..equities.workspace import build_equity_holdings_display
 from ..portfolio.metrics import calculate_allocation
+from ..shared.performance import style_returns
+from ui.helpers import workspace_subtabs_css
 
 ALLOCATION_DESCRIPTIONS = {
     "Equity": "Broker-reported long-term equity holdings",
@@ -168,22 +174,135 @@ def render_home_dashboard(
             icon=":material/trending_up:",
         )
 
-    with st.container(gap="small"):
-        st.subheader("Allocation")
-        if metrics["total_investments"] > 0:
-            theme_type = getattr(st.context.theme, "type", "dark")
-            chart = build_allocation_chart(metrics, theme_type)
-            st.plotly_chart(chart, width="stretch", key="portfolio_allocation")
-        else:
-            st.info("Connect and sync a broker to see allocation.")
-
-    st.caption(
-        "Hover any segment for value, share, position count, and P&L. Cash is "
-        "separate; mutual funds use the latest reported NAV. "
-        "Options and futures are not separately classified by the "
-        "connected broker yet."
-    )
     return metrics
+
+
+def _render_home_holdings(
+    equity_holdings: pd.DataFrame,
+    trading_positions: pd.DataFrame,
+    mutual_funds: pd.DataFrame,
+    metrics: dict[str, Any],
+) -> None:
+    total_investments = metrics["total_investments"]
+    allocations = metrics["allocation"]
+    fno_value = allocations["Options"] + allocations["Futures"]
+
+    def share(value: float) -> float:
+        return (
+            value / total_investments * 100
+            if total_investments > 0
+            else 0.0
+        )
+
+    tab_labels = [
+        f"Equities · {share(allocations['Equity']):.1f}%",
+        f"Trading · {share(allocations['Trading']):.1f}%",
+        f"Mutual Funds · {share(allocations['Mutual funds']):.1f}%",
+        f"F&O · {share(fno_value):.1f}%",
+    ]
+    theme = getattr(st.context.theme, "type", "light")
+
+    with st.container(key="home_holdings_tabs"):
+        st.html(workspace_subtabs_css("home_holdings_tabs"))
+        equity_tab, trading_tab, funds_tab, fno_tab = st.tabs(tab_labels)
+
+        with equity_tab:
+            if equity_holdings.empty:
+                st.info("No equity holdings were returned by the connected broker.")
+            else:
+                equity_display = build_equity_holdings_display(
+                    equity_holdings, total_investments
+                )
+                render_stock_holdings_table(
+                    equity_display,
+                    key="home_equity_holdings_table",
+                    theme=theme,
+                    layout="home_equity",
+                )
+
+        with trading_tab:
+            if trading_positions.empty:
+                st.info("The broker returned no open trading positions.")
+            else:
+                trading_display = trading_positions.copy()
+                trading_display["Gross_Exposure"] = (
+                    trading_display["Qty"].abs() * trading_display["LTP"]
+                )
+                trading_display["P&L"] = trading_display["Qty"] * (
+                    trading_display["LTP"] - trading_display["Avg_Price"]
+                )
+                investment = (
+                    trading_display["Qty"].abs() * trading_display["Avg_Price"]
+                )
+                trading_display["Returns_%"] = (
+                    trading_display["P&L"]
+                    .div(investment.where(investment.ne(0)))
+                    .fillna(0.0)
+                    * 100
+                )
+                trading_display["Allocation_%"] = (
+                    trading_display["Gross_Exposure"]
+                    .div(total_investments)
+                    .fillna(0.0)
+                    * 100
+                    if total_investments > 0
+                    else 0.0
+                )
+                broker = str(st.session_state.get("broker_name") or "")
+                stock_mask = pd.Series(
+                    [holding_identity(row, "trading", broker) is not None
+                     for _, row in trading_display.iterrows()],
+                    index=trading_display.index,
+                )
+                if stock_mask.any():
+                    render_stock_holdings_table(
+                        trading_display.loc[stock_mask],
+                        key="home_trading_positions_table",
+                        theme=theme,
+                        layout="trading",
+                    )
+                if (~stock_mask).any():
+                    st.caption("Other positions are shown without stock-specific research.")
+                    st.dataframe(style_returns(trading_display.loc[~stock_mask], theme=theme), hide_index=True)
+
+        with funds_tab:
+            if mutual_funds.empty:
+                st.info("No mutual-fund holdings were returned by the connected broker.")
+            else:
+                fund_display = mutual_funds.copy()
+                fund_display["Invested_Value"] = (
+                    fund_display["Units"] * fund_display["Avg_NAV"]
+                )
+                fund_display["Current_Value"] = (
+                    fund_display["Units"] * fund_display["Latest_NAV"]
+                )
+                fund_display["P&L"] = (
+                    fund_display["Current_Value"] - fund_display["Invested_Value"]
+                )
+                fund_display["Returns_%"] = fund_display.apply(
+                    lambda row: row["P&L"] / row["Invested_Value"] * 100
+                    if row["Invested_Value"]
+                    else 0.0,
+                    axis=1,
+                )
+                fund_display["Allocation_%"] = (
+                    fund_display["Current_Value"]
+                    .div(total_investments)
+                    .fillna(0.0)
+                    * 100
+                    if total_investments > 0
+                    else 0.0
+                )
+                fund_display["Signal"] = "Not rated"
+                st.dataframe(
+                    style_returns(fund_display, theme=theme), hide_index=True
+                )
+
+        with fno_tab:
+            st.info(
+                "Options and futures are not separately classified by the "
+                "connected broker yet."
+            )
 
 
 def render_home_workspace(
@@ -194,10 +313,17 @@ def render_home_workspace(
     *,
     live_prices: dict[str, float],
     live_prices_updated_at: datetime | None,
+    run_portfolio_analysis: Callable[[], None],
     render_portfolio_review: Callable[[], None],
 ) -> None:
-    render_home_dashboard(
+    metrics = render_home_dashboard(
         balance, equity_holdings, trading_positions, mutual_funds
+    )
+    _render_home_holdings(
+        equity_holdings,
+        trading_positions,
+        mutual_funds,
+        metrics,
     )
     if live_prices:
         with st.expander("Live NSE quotes used for AI recommendations"):
@@ -215,4 +341,17 @@ def render_home_workspace(
                 ]
             )
             st.dataframe(prices, hide_index=True)
+    render_analysis_brief(
+        st.session_state.get("portfolio_overview_analysis"),
+        title="AI Portfolio Analysis",
+        placeholder=True,
+        collapsible=True,
+        portfolio_overview=True,
+        run_analysis=run_portfolio_analysis,
+        last_analyzed_at=st.session_state.get("portfolio_overview_timestamp"),
+        analysis_metadata=st.session_state.get("portfolio_overview_metadata"),
+        analysis_error=st.session_state.get("analysis_errors", {}).get(
+            "portfolio_overview"
+        ),
+    )
     render_portfolio_review()

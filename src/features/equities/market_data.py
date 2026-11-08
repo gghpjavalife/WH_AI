@@ -819,6 +819,11 @@ def assess_stock(indicators: dict[str, float]) -> dict[str, object]:
         recommendation_reason = (
             f"{bullish} of {evaluated_checks} available indicator checks are positive."
         )
+    elif negative_share >= 0.70:
+        recommendation = "STRONG SELL"
+        recommendation_reason = (
+            f"{bearish} of {evaluated_checks} available indicator checks are negative."
+        )
     elif negative_share >= 0.55:
         recommendation = "SELL"
         recommendation_reason = (
@@ -1193,7 +1198,7 @@ def style_recommendations(frame: pd.DataFrame, *, theme: str = "light"):
         normalized = str(value).upper()
         if normalized in {"BUY", "STRONG BUY", "POSITIVE"}:
             return f"background-color: {positive}; color: {text}"
-        if normalized in {"SELL", "NEGATIVE"}:
+        if normalized in {"SELL", "STRONG SELL", "NEGATIVE"}:
             return f"background-color: {negative}; color: {text}"
         return f"background-color: {neutral}; color: {text}"
 
