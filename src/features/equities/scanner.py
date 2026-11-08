@@ -609,6 +609,15 @@ def build_scan_table_payload(
     payload = []
     for row in rows:
         symbol = str(row["Ticker"])
+        source_label = labels.get(symbol, symbol)
+        currency = row.get("currency")
+        if not isinstance(currency, str) or not currency.strip():
+            if symbol.upper().endswith((".NS", ".BO")) or re.search(
+                r"\((?:NSE|BSE)\)\s*$", source_label, re.IGNORECASE
+            ):
+                currency = "INR"
+            else:
+                currency = None
         checks = []
         structured = row.get("Indicator_checks")
         if structured is None:
@@ -632,7 +641,8 @@ def build_scan_table_payload(
         payload.append(
             {
                 "ticker": symbol,
-                "label": labels.get(symbol, symbol),
+                "label": symbol,
+                "currency": currency.strip().upper() if isinstance(currency, str) else None,
                 "price": _num(row, "Price"),
                 "chg": _num(row, "Daily_change_%"),
                 "rsi": _num(row, "RSI_14"),

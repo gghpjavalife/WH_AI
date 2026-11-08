@@ -1331,7 +1331,7 @@ _render_ai_provider_configurations("delete-test-user")
         payload, config = _scan_table_payload([row], {"ABC.BO": "ABC \u00b7 Alpha"})
         html = render_scan_table(payload, config)
 
-        self.assertEqual(payload[0]["label"], "ABC \u00b7 Alpha")
+        self.assertEqual(payload[0]["label"], "ABC.BO")
         self.assertEqual(payload[0]["ind"]["SMA_20"], ["\u20b9100.00", "pos"])
         self.assertEqual(payload[0]["ind"]["ADX_14"][0], "31.2")
         self.assertEqual(
@@ -1340,7 +1340,7 @@ _render_ai_provider_configurations("delete-test-user")
         self.assertEqual(config["signals"], ["STRONG BUY"])
         self.assertIn("Download CSV", html)
         self.assertIn("Records per page", html)
-        self.assertIn(json.dumps("ABC \u00b7 Alpha", ensure_ascii=False), html)
+        self.assertIn(json.dumps("ABC.BO", ensure_ascii=False), html)
 
 
     def test_trades_workspace_does_not_render_custom_scanner_filters(self):

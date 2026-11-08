@@ -50,6 +50,22 @@ def _universe_mock(load):
 
 
 class ScannerStockContextTests(unittest.TestCase):
+    def test_scan_payload_preserves_currency_and_uses_listed_exchange(self):
+        listed, _ = build_scan_table_payload(
+            [{"Ticker": "PGIL", "Recommendation": "HOLD"}],
+            {"PGIL": "PGIL · Pearl Global Industries Limited (NSE)"},
+        )
+        unknown, _ = build_scan_table_payload(
+            [{"Ticker": "CUSTOM", "Recommendation": "HOLD"}], {}
+        )
+        explicit, _ = build_scan_table_payload(
+            [{"Ticker": "CUSTOM", "Recommendation": "HOLD", "currency": "usd"}], {}
+        )
+        self.assertEqual(listed[0]["label"], "PGIL")
+        self.assertEqual(listed[0]["currency"], "INR")
+        self.assertIsNone(unknown[0]["currency"])
+        self.assertEqual(explicit[0]["currency"], "USD")
+
     def test_identity_verifies_master_mapping_and_uses_public_fallback(self):
         master = pd.concat([_master(), pd.DataFrame([
             {"Symbol": "BAD", "Ticker": "BAD", "ISIN": "INE002A01019", "Exchange": "NSE"},
