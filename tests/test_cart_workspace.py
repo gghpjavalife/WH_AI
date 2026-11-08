@@ -129,3 +129,7 @@ class CartWorkspaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('readonly aria-label="Percentage of holding"', ROW_HTML)
         self.assertIn(".row{display:flex", ROW_CSS)
+        self.assertIn("@media(max-width:760px)", ROW_CSS)
+        self.assertIn('grid-template-areas:"stock actions" "quantities quantities" "estimate estimate"', ROW_CSS)
+        self.assertIn("touch-action:manipulation", ROW_CSS)
+        self.assertIn('<div class="quantities">', ROW_HTML)

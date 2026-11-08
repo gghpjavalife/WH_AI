@@ -52,6 +52,31 @@ def _universe_mock(load):
 
 
 class ScannerBackgroundTests(unittest.TestCase):
+    def test_context_rate_limit_skips_remaining_batches_and_keeps_scan_results(self):
+        identities = {
+            f"S{i}": (f"S{i}.NS", None, "horizon") for i in range(70)
+        }
+        cache = {}
+        progress = scanner._ScanProgress()
+        calls = []
+
+        async def rate_limited(*args, **kwargs):
+            calls.append(1)
+            raise scanner.ProviderRateLimitError("provider throttled")
+
+        with patch.object(scanner, "_scan_universe", side_effect=rate_limited):
+            scanner._refresh_scan_contexts(
+                cache, identities, "", progress, threading.Event()
+            )
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(progress.get(), ("context", 70, 70))
+        self.assertEqual(len(cache), 70)
+        self.assertTrue(all(
+            "HTTP 429 (rate limit)" in entry[1]["error"]
+            for entry in cache.values()
+        ))
+
     def test_scan_and_context_survive_switching_and_collect_on_return(self):
         scan_started, scan_release = threading.Event(), threading.Event()
         context_started, context_release = threading.Event(), threading.Event()
@@ -187,7 +212,9 @@ class ScannerBackgroundTests(unittest.TestCase):
     def test_scanner_calls_universe_service_with_real_async_runner(self):
         from services import universe_scan
 
-        async def fetch(symbol, horizon, *, instrument_key, upstox_token, semaphore):
+        async def fetch(
+            symbol, horizon, *, instrument_key, upstox_token, semaphore, rate_limit_event,
+        ):
             self.assertEqual(upstox_token, "token-value")
             return Mock(model_dump=Mock(return_value={"profile": {"ticker": symbol}}))
 

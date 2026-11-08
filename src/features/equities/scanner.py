@@ -23,6 +23,7 @@ from features.analysis.stock_context import (
     CONTEXT_TTL, append_context_to_row, holding_identity,
 )
 from services.stock_context_models import InvestmentHorizon
+from services.stock_context import ProviderRateLimitError
 from .scan_table import show_scan_table
 from .market_data import (
     MarketDataError,
@@ -841,7 +842,23 @@ def _refresh_scan_contexts(cache, identities, upstox_token, progress, cancel):
             base = done
             def update(completed, _total):
                 progress.set("context", base + completed, total)
-            records = await _scan_universe(stocks, upstox_token, on_progress=update, cancel=cancel)
+            try:
+                records = await _scan_universe(
+                    stocks, upstox_token, on_progress=update, cancel=cancel
+                )
+            except ProviderRateLimitError:
+                now = datetime.now(timezone.utc)
+                skipped = missing[start:]
+                message = (
+                    "Context ingestion stopped after a market-data provider returned "
+                    "HTTP 429 (rate limit). Remaining stock contexts were skipped; "
+                    "scan signals are still available."
+                )
+                for identity in skipped:
+                    cache[(*identity, analytics_available)] = (now, {"error": message})
+                done += len(skipped)
+                progress.set("context", done, total)
+                return
             if len(records) != len(batch):
                 raise ValueError("Universe scan returned an incomplete batch.")
             if cancel.is_set():
@@ -1387,10 +1404,22 @@ def _render_scanner(
                 for row in matches
             )
             if failed_contexts:
-                st.warning(
-                    f"Local market context was unavailable for {failed_contexts:,} "
-                    "stock(s); scan signals are still shown. Open a row for details."
+                rate_limited = any(
+                    isinstance(context, dict)
+                    and "HTTP 429 (rate limit)" in str(context.get("error", ""))
+                    for context in contexts.values()
                 )
+                if rate_limited:
+                    st.warning(
+                        f"Context ingestion stopped by a provider rate limit. "
+                        f"Context is unavailable for {failed_contexts:,} stock(s); "
+                        "scan signals are still shown. Wait before retrying."
+                    )
+                else:
+                    st.warning(
+                        f"Local market context was unavailable for {failed_contexts:,} "
+                        "stock(s); scan signals are still shown. Open a row for details."
+                    )
             stale_contexts = sum(bool(context.get("_scanner_stale"))
                                  for context in contexts.values())
             if stale_contexts:

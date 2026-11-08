@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from services.stock_context_models import StockSignalContext
+from services.stock_context import ProviderRateLimitError
 from services.universe_scan import _scan_universe, async_execute_universe_scan
 
 
@@ -85,6 +86,25 @@ class UniverseScanTests(unittest.IsolatedAsyncioTestCase):
         with patch("services.universe_scan.async_fetch_and_build_market_context", fetch):
             with self.assertRaises(AssertionError):
                 await _scan_universe([{"symbol": "ERROR"}, {"symbol": "WAIT"}], "")
+        self.assertTrue(cancelled.is_set())
+
+    async def test_provider_rate_limit_aborts_and_cancels_other_tasks(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def fetch(symbol, *args, **kwargs):
+            if symbol == "LIMIT":
+                await started.wait()
+                raise ProviderRateLimitError("rate limited")
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
+
+        with patch("services.universe_scan.async_fetch_and_build_market_context", fetch):
+            with self.assertRaises(ProviderRateLimitError):
+                await _scan_universe([{"symbol": "LIMIT"}, {"symbol": "WAIT"}], "")
         self.assertTrue(cancelled.is_set())
 
     async def test_validation_happens_before_any_requests(self):

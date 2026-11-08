@@ -11,7 +11,7 @@ from threading import Event
 from typing import Any
 
 from core.logging import log_failure
-from services.stock_context import async_fetch_and_build_market_context
+from services.stock_context import ProviderRateLimitError, async_fetch_and_build_market_context
 from services.stock_context_models import InvestmentHorizon, local_gatekeeper
 
 
@@ -62,6 +62,7 @@ async def _scan_universe(
     if not isinstance(upstox_token, str):
         raise TypeError("upstox_token must be a string.")
     semaphore = asyncio.Semaphore(20)
+    rate_limit_event = asyncio.Event()
     started = time.monotonic()
     completed = 0
     total = len(stocks)
@@ -74,6 +75,7 @@ async def _scan_universe(
             context = await async_fetch_and_build_market_context(
                 stock.symbol, stock.horizon, instrument_key=stock.instrument_key,
                 upstox_token=upstox_token, semaphore=semaphore,
+                rate_limit_event=rate_limit_event,
             )
             gate = await asyncio.to_thread(local_gatekeeper, context)
             result = {
@@ -84,6 +86,9 @@ async def _scan_universe(
                 "local_gatekeeper": gate.model_dump(mode="json"),
                 "error": None,
             }
+        except ProviderRateLimitError:
+            rate_limit_event.set()
+            raise
         except (OSError, RuntimeError, TypeError, ValueError, KeyError, IndexError) as error:
             result = {
                 "symbol": stock.symbol, "status": "error", "early_exit": True,

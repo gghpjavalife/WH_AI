@@ -7,6 +7,8 @@ import json
 import math
 from collections.abc import Callable
 from copy import deepcopy
+from numbers import Integral, Real
+from typing import Any
 
 import streamlit as st
 
@@ -812,15 +814,35 @@ def render_cart_stock_details(item: dict[str, object]) -> None:
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     _DETAIL_COMPONENT(
         key=f"cart-stock-detail-{digest}",
-        data={"payload": [snapshot["row"]], "config": snapshot["config"]},
+        data=_json_safe({"payload": [snapshot["row"]], "config": snapshot["config"]}),
     )
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert component data to JSON-safe values, treating non-finite numbers as missing."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    scalar_value = getattr(value, "item", None)
+    if callable(scalar_value):
+        return _json_safe(scalar_value())
+    return value
 
 
 def render_scan_table(payload: list[dict[str, object]], config: dict[str, object]) -> str:
     """Return a standalone document for tests and non-Streamlit previews."""
     data = json.dumps(
-        {"payload": payload, "config": config, "canRefresh": False},
+        _json_safe({"payload": payload, "config": config, "canRefresh": False}),
         ensure_ascii=False,
+        allow_nan=False,
     ).replace("</", "<\\/")
     js = "const inputData=" + data + ";\nconst parentElement=document;\n" \
          "const setTriggerValue=()=>{};\n" + _TABLE_JS.replace(
@@ -837,10 +859,12 @@ def show_scan_table(
 ) -> None:
     """Mount the table; tableKey must uniquely identify each mounted instance."""
     key = str(config.get("tableKey", "equities-scan-table"))
+    safe_payload = _json_safe(payload)
+    safe_config = _json_safe(config)
 
     def add_to_cart() -> None:
         indexes = st.session_state[key].get("add_to_cart")
-        added, skipped = _add_rows_to_cart(payload, indexes, config)
+        added, skipped = _add_rows_to_cart(safe_payload, indexes, safe_config)
         if added:
             st.toast(f"Added {added} stock{'s' if added != 1 else ''} to Cart.")
         if skipped:
@@ -850,7 +874,11 @@ def show_scan_table(
 
     _COMPONENT(
         key=key,
-        data={"payload": payload, "config": config, "canRefresh": on_refresh is not None},
+        data={
+            "payload": safe_payload,
+            "config": safe_config,
+            "canRefresh": on_refresh is not None,
+        },
         on_refresh_change=on_refresh or (lambda: None),
         on_add_to_cart_change=add_to_cart,
     )

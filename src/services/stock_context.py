@@ -62,6 +62,17 @@ def _daily_history(raw: Any, symbol: str) -> pd.DataFrame:
             frame = frame.xs(symbol, level="symbol")
         except KeyError as exc:
             raise ValueError(f"Yahoo daily candles do not include {symbol}.") from exc
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        try:
+            dates = pd.to_datetime(frame.index, errors="raise", utc=True)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Yahoo daily candles contain invalid dates for {symbol}."
+            ) from exc
+        if not isinstance(dates, pd.DatetimeIndex):
+            raise ValueError(f"Yahoo daily candles contain invalid dates for {symbol}.")
+        frame = frame.copy()
+        frame.index = dates
     return frame
 
 
@@ -416,25 +427,42 @@ def _assemble_market_context(
     return StockSignalContext.model_validate(payload)
 
 
+class ProviderRateLimitError(RuntimeError):
+    """A provider rejected requests with HTTP 429; the current batch must stop."""
+
+
 def _retryable(error: Exception) -> bool:
     response = getattr(error, "response", None)
-    if getattr(response, "status_code", None) == 429:
-        return True
     return (isinstance(error, (TimeoutError, requests.Timeout))
             or "timeout" in type(error).__name__.lower()
             or "timed out" in str(error).lower())
 
 
-async def _bounded_call(semaphore: asyncio.Semaphore, operation: Callable[[], Any]) -> Any:
+async def _bounded_call(
+    semaphore: asyncio.Semaphore,
+    operation: Callable[[], Any],
+    *,
+    abort_if: asyncio.Event | None = None,
+) -> Any:
     # Shield the worker, not just to_thread: cancellation must not release its
     # permit while its uninterruptible network thread is still running.
     await semaphore.acquire()
+    if abort_if is not None and abort_if.is_set():
+        semaphore.release()
+        raise ProviderRateLimitError(
+            "A market-data provider returned HTTP 429; context ingestion stopped."
+        )
     cancelled = threading.Event()
 
     def run():
         with _PROCESS_NETWORK_LIMIT:
-            if not cancelled.is_set():
-                return operation()
+            if cancelled.is_set():
+                return None
+            if abort_if is not None and abort_if.is_set():
+                raise ProviderRateLimitError(
+                    "A market-data provider returned HTTP 429; context ingestion stopped."
+                )
+            return operation()
 
     try:
         task = asyncio.create_task(asyncio.to_thread(run))
@@ -453,26 +481,38 @@ async def _bounded_call(semaphore: asyncio.Semaphore, operation: Callable[[], An
         raise
 
 
-async def _fetch_with_retries(semaphore, operation, *, attempts=3):
+async def _fetch_with_retries(semaphore, operation, *, attempts=3, abort_if=None):
     for attempt in range(attempts):
         try:
-            return await _bounded_call(semaphore, operation)
+            return await _bounded_call(semaphore, operation, abort_if=abort_if)
         except Exception as exc:
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) == 429:
+                if abort_if is not None:
+                    abort_if.set()
+                raise ProviderRateLimitError(
+                    "A market-data provider returned HTTP 429; context ingestion stopped."
+                ) from exc
             if attempt + 1 == attempts or not _retryable(exc):
                 raise
             await asyncio.sleep(random.uniform(0.1, 0.3) * (2 ** attempt))
 
 
 async def async_bounded_network_call(
-    semaphore: asyncio.Semaphore, operation: Callable[[], Any],
+    semaphore: asyncio.Semaphore,
+    operation: Callable[[], Any],
+    *,
+    abort_if: asyncio.Event | None = None,
 ) -> Any:
     """Run one serial blocking provider operation under both request caps.
 
     Share a semaphore per runner/event loop; this helper shares the process cap
     with async context ingestion. The callable must not spawn parallel requests.
-    Retryable timeouts and 429s use up to three attempts with async jitter.
+    Retryable timeouts use up to three attempts with async jitter. HTTP 429
+    aborts context ingestion so a large scan does not continue against a
+    provider that is actively throttling requests.
     """
-    return await _fetch_with_retries(semaphore, operation)
+    return await _fetch_with_retries(semaphore, operation, abort_if=abort_if)
 
 
 async def async_fetch_and_build_market_context(
@@ -485,6 +525,7 @@ async def async_fetch_and_build_market_context(
     sector_symbol: str | None = None,
     supplemental: dict[str, Any] | None = None,
     intraday_stream: UpstoxMicrostructureStream | None = None,
+    rate_limit_event: asyncio.Event | None = None,
     yahoo_factory: Callable[..., Any] = Ticker,
     http_session: requests.Session | None = None,
 ) -> StockSignalContext:
@@ -529,8 +570,17 @@ async def async_fetch_and_build_market_context(
     if sector_symbol:
         jobs["sector history"] = lambda: yahoo(sector_symbol, "history", period="1y", interval="1d")
     yahoo_results = await asyncio.gather(*(
-        async_bounded_network_call(semaphore, operation) for operation in jobs.values()
+        async_bounded_network_call(semaphore, operation, abort_if=rate_limit_event)
+        for operation in jobs.values()
     ), return_exceptions=True)
+    rate_limit_error = next(
+        (result for result in yahoo_results if isinstance(result, ProviderRateLimitError)),
+        None,
+    )
+    if rate_limit_error is not None:
+        if rate_limit_event is not None:
+            rate_limit_event.set()
+        raise rate_limit_error
     warnings = []
     values = {}
     for name, result in zip(jobs, yahoo_results):
@@ -552,9 +602,18 @@ async def async_fetch_and_build_market_context(
         if upstox_token.strip():
             results = await asyncio.gather(*(
                 async_bounded_network_call(semaphore, lambda fetch=fetch: fetch(
-                    instrument_key, session=http_session, token=upstox_token))
+                    instrument_key, session=http_session, token=upstox_token),
+                    abort_if=rate_limit_event)
                 for fetch in calls
             ), return_exceptions=True)
+            rate_limit_error = next(
+                (result for result in results if isinstance(result, ProviderRateLimitError)),
+                None,
+            )
+            if rate_limit_error is not None:
+                if rate_limit_event is not None:
+                    rate_limit_event.set()
+                raise rate_limit_error
             upstox_results = dict(zip(calls, results))
         else:
             warnings.append("Upstox token was not supplied; authenticated data is unavailable.")

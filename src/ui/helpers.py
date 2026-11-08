@@ -255,6 +255,51 @@ def gold_theme_css() -> str:
 .gghp-brand { padding: .2rem 0 !important; border: 0 !important; margin-bottom: 0; background: transparent !important; }
 .gghp-badge { background: linear-gradient(135deg, #E6B800, #B8860B) !important; color: #1B1400 !important; }
 .gghp-name { background-image: none !important; color: #F2C94C !important; -webkit-text-fill-color: #F2C94C !important; }
+@media (max-width: 900px) {
+  [data-testid="stMainBlockContainer"] {
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
+  }
+  [data-testid="stTabs"] [role="tablist"] {
+    justify-content: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    touch-action: pan-x;
+  }
+  [data-testid="stTabs"] [role="tab"] {
+    flex: 0 0 auto !important;
+    white-space: nowrap;
+  }
+}
+@media (max-width: 640px) {
+  [data-testid="stMainBlockContainer"] {
+    padding-top: 3.5rem;
+    padding-left: .75rem;
+    padding-right: .75rem;
+    padding-bottom: 1.5rem;
+  }
+  [data-testid="stHorizontalBlock"] {
+    flex-wrap: wrap;
+    gap: .75rem;
+  }
+  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+    flex: 1 1 100% !important;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  [data-testid="stDataFrame"],
+  [data-testid="stTable"],
+  [data-testid="stPlotlyChart"] {
+    max-width: 100%;
+  }
+  [data-testid="stDialog"] > div {
+    width: calc(100vw - 1rem) !important;
+    max-width: calc(100vw - 1rem) !important;
+    max-height: calc(100dvh - 1rem);
+    overflow-y: auto;
+  }
+}
 @media (prefers-reduced-motion: no-preference) {
   .gghp-badge { animation-name: gghp-gold-pulse !important; }
   @keyframes gghp-gold-pulse {

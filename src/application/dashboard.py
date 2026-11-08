@@ -2076,7 +2076,26 @@ def _request_portfolio_overview() -> None:
     st.session_state.analysis_setup_dialog_scope = "portfolio_overview"
 
 
-@st.dialog("AI analysis setup")
+def _pending_analysis_setup_scope() -> str | None:
+    """Wait to show analysis setup until another settings dialog is dismissed."""
+    feedback = st.session_state.get("user_settings_feedback", {})
+    if (
+        st.session_state.get("user_settings_dialog_open")
+        or (
+            isinstance(feedback, dict)
+            and feedback.get("kind") == "success"
+        )
+    ):
+        return None
+    scope = st.session_state.get("analysis_setup_dialog_scope")
+    return str(scope) if scope else None
+
+
+def _close_analysis_setup_dialog() -> None:
+    st.session_state.pop("analysis_setup_dialog_scope", None)
+
+
+@st.dialog("AI analysis setup", on_dismiss=_close_analysis_setup_dialog)
 def _render_analysis_setup_dialog(scope: str) -> None:
     configured_providers = [
         item
@@ -3150,7 +3169,7 @@ def main() -> None:
         _show_login()
     else:
         _show_workspace()
-    analysis_setup_scope = st.session_state.get("analysis_setup_dialog_scope")
+    analysis_setup_scope = _pending_analysis_setup_scope()
     if analysis_setup_scope:
-        _render_analysis_setup_dialog(str(analysis_setup_scope))
+        _render_analysis_setup_dialog(analysis_setup_scope)
     process_browser_storage_bridge()

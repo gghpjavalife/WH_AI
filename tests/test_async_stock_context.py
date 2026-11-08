@@ -8,7 +8,8 @@ import requests
 
 import services.stock_context as stock_context
 from services.stock_context import (
-    _bounded_call, _fetch_with_retries, async_bounded_network_call, async_fetch_and_build_market_context,
+    ProviderRateLimitError, _bounded_call, _fetch_with_retries,
+    async_bounded_network_call, async_fetch_and_build_market_context,
 )
 from services.stock_context_models import InvestmentHorizon
 from services.stock_context_upstox import fetch_upstox_quote
@@ -168,18 +169,15 @@ class AsyncContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.source_data["field_provenance"]["technicals.current_volume"],
                          "yahoo_daily_history")
 
-    async def test_yahoo_string_rate_limit_is_retried(self):
+    async def test_yahoo_string_rate_limit_aborts_context_ingestion(self):
         class RateLimited(FakeTicker):
             calls = 0
             def get_modules(self, modules):
                 type(self).calls += 1
-                if type(self).calls == 1:
-                    return {self.symbol: "Too Many Requests (429)"}
-                return super().get_modules(modules)
-        with patch("services.stock_context.asyncio.sleep", new=MockAsync()):
-            context = await self.build(RateLimited)
-        self.assertEqual(RateLimited.calls, 2)
-        self.assertEqual(context.current_price, 100)
+                return {self.symbol: "Too Many Requests (429)"}
+        with self.assertRaises(ProviderRateLimitError):
+            await self.build(RateLimited)
+        self.assertEqual(RateLimited.calls, 1)
 
     async def test_yahoo_factory_forced_to_use_serial_session(self):
         options = []
@@ -303,11 +301,7 @@ class AsyncContextTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         def operation():
             calls.append(1)
-            if len(calls) == 1:
-                response = requests.Response()
-                response.status_code = 429
-                raise requests.HTTPError(response=response)
-            if len(calls) == 2:
+            if len(calls) < 3:
                 raise requests.Timeout()
             return "ok"
         sleeps = []
@@ -323,6 +317,17 @@ class AsyncContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 3)
         with self.assertRaises(ValueError):
             await _fetch_with_retries(semaphore, lambda: (_ for _ in ()).throw(ValueError()))
+
+    async def test_rate_limit_is_not_retried(self):
+        calls = []
+        def operation():
+            calls.append(1)
+            response = requests.Response()
+            response.status_code = 429
+            raise requests.HTTPError(response=response)
+        with self.assertRaises(ProviderRateLimitError):
+            await _fetch_with_retries(asyncio.Semaphore(1), operation)
+        self.assertEqual(calls, [1])
 
     async def test_shared_semaphore_bounds_all_workers(self):
         semaphore = asyncio.Semaphore(2)
@@ -373,6 +378,31 @@ class AsyncContextTests(unittest.IsolatedAsyncioTestCase):
                         limit.release()
                         break
                     await asyncio.sleep(.01)
+                operation.assert_not_called()
+            finally:
+                release.set()
+
+    async def test_rate_limit_abort_prevents_queued_provider_call(self):
+        started, release = threading.Event(), threading.Event()
+        operation = Mock()
+        limit = threading.BoundedSemaphore(1)
+        abort_if = asyncio.Event()
+        with patch("services.stock_context._PROCESS_NETWORK_LIMIT", limit):
+            def blocking():
+                started.set()
+                release.wait(5)
+            first = asyncio.create_task(_bounded_call(asyncio.Semaphore(2), blocking))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                queued = asyncio.create_task(
+                    _bounded_call(asyncio.Semaphore(2), operation, abort_if=abort_if)
+                )
+                await asyncio.sleep(.05)
+                abort_if.set()
+                release.set()
+                await first
+                with self.assertRaises(ProviderRateLimitError):
+                    await asyncio.wait_for(queued, 2)
                 operation.assert_not_called()
             finally:
                 release.set()

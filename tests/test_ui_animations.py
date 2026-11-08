@@ -1,7 +1,7 @@
 import unittest
 
 from features.home.workspace import build_allocation_chart
-from ui.helpers import app_animation_css, brand_lockup_html
+from ui.helpers import app_animation_css, brand_lockup_html, gold_theme_css
 
 
 class UIAnimationTests(unittest.TestCase):
@@ -14,6 +14,15 @@ class UIAnimationTests(unittest.TestCase):
         self.assertIn('[data-testid="stPlotlyChart"]', css)
         self.assertIn("@media (prefers-reduced-motion: reduce)", css)
         self.assertIn("animation: none !important", css)
+
+    def test_app_layout_adapts_to_tablet_and_phone_viewports(self):
+        css = gold_theme_css()
+
+        self.assertIn("@media (max-width: 900px)", css)
+        self.assertIn("@media (max-width: 640px)", css)
+        self.assertIn("overflow-x: auto", css)
+        self.assertIn("flex: 1 1 100% !important", css)
+        self.assertIn("max-height: calc(100dvh - 1rem)", css)
 
     def test_brand_has_a_reduced_motion_safe_live_equalizer_icon(self):
         html = brand_lockup_html("GGHP", "Governed Growth", "Portfolio companion")
