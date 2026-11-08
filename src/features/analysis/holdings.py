@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -18,8 +19,55 @@ from features.equities.market_data import (
 )
 from .fundamentals import FundamentalsDataError, fetch_company_fundamentals
 from .news import CompanyNewsError, fetch_company_news
-from .stock_context import append_context_to_row, holding_identity, refresh_holding_contexts
+from .stock_context import (
+    CONTEXT_TTL,
+    append_context_to_row,
+    holding_identity,
+    load_holding_context,
+)
 from core.config import configured_value
+from core.logging import log_failure
+
+_HOLDINGS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="holdings-research"
+)
+
+
+def _cancel_holding_jobs() -> None:
+    jobs = st.session_state.pop("holding_research_jobs", {})
+    for future in jobs.values():
+        future.cancel()
+
+
+def _collect_holding_jobs() -> None:
+    jobs = st.session_state.setdefault("holding_research_jobs", {})
+    context_cache = st.session_state.setdefault("stock_context_cache", {})
+    research_cache = st.session_state.setdefault("stock_research_cache", {})
+    for job_key, future in list(jobs.items()):
+        if not future.done():
+            continue
+        del jobs[job_key]
+        kind, key = job_key
+        try:
+            result = future.result()
+        except (requests.RequestException, ValueError, TypeError, RuntimeError,
+                OSError, KeyError, IndexError) as error:
+            message = log_failure(f"Holding {kind} for {key}", error)
+            result = {"error": message} if kind == "context" else {
+                "signal": "Not rated", "reason": "Research unavailable.",
+                "errors": {"research": message},
+            }
+        if kind == "context":
+            context_cache[key] = (datetime.now(timezone.utc), result)
+        else:
+            research_cache[f"selected_stock_research_{key}"] = result
+
+
+@st.fragment(run_every=2)
+def _watch_holding_jobs() -> None:
+    jobs = st.session_state.get("holding_research_jobs", {})
+    if jobs and any(future.done() for future in jobs.values()):
+        st.rerun(scope="app")
 
 _FUNDAMENTAL_RULES = (
     ("trailingPE", "Trailing P/E", lambda value: 1 if 0 < value <= 25 else -1 if value <= 0 or value > 40 else 0),
@@ -54,6 +102,21 @@ def _text(value: Any, fallback: str = "") -> str:
         return fallback
     text = str(value).strip()
     return text if text else fallback
+
+
+def _listed_company_names(master: pd.DataFrame) -> dict[tuple[str, str], str]:
+    companies = {}
+    for listing in master.itertuples(index=False):
+        symbol = str(getattr(listing, "Symbol", "")).strip().upper()
+        exchange = str(getattr(listing, "Exchange", "")).strip().upper()
+        company = str(getattr(listing, "Company", "")).strip()
+        if not symbol or not company or exchange not in {"NSE", "BSE"}:
+            continue
+        companies[(symbol.removesuffix(".BO"), exchange)] = company
+        ticker = str(getattr(listing, "Ticker", "")).strip().upper()
+        if ticker:
+            companies[(ticker, exchange)] = company
+    return companies
 
 
 def build_portfolio_holding_rows(
@@ -230,11 +293,20 @@ def _analyze_selected_stock(ticker: str) -> dict[str, Any]:
 def _build_holding_scan_row(
     holding: pd.Series,
     research: dict[str, Any],
+    *,
+    company_name: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     from features.equities.scanner import build_scan_table_payload
 
     ticker = _ticker_value(holding.get("Ticker"))
-    company = _text(holding.get("Company"), ticker)
+    company = _text(company_name, _text(holding.get("Company"), ticker))
+    instrument_key = _text(holding.get("Instrument_Key")).upper()
+    exchange = (
+        "BSE" if instrument_key.startswith("BSE_EQ|") or ticker.endswith(".BO")
+        else "NSE"
+    )
+    suffix = ".BO" if exchange == "BSE" else ".NS"
+    qualified_ticker = ticker if ticker.endswith(suffix) else ticker.removesuffix(".NS").removesuffix(".BO") + suffix
     technical = research.get("technical")
     indicators = (
         technical.get("raw_indicators", {}) if isinstance(technical, dict) else {}
@@ -282,7 +354,7 @@ def _build_holding_scan_row(
     }
     scanner_row.update(
         {
-            "Ticker": ticker,
+            "Ticker": qualified_ticker,
             "Price": _number(holding.get("LTP")),
             "Recommendation": str(research.get("signal", "Not rated")).upper(),
             "Signal_score": _number(research.get("score")),
@@ -300,12 +372,19 @@ def _build_holding_scan_row(
             ],
         }
     )
-    payload, config = build_scan_table_payload([scanner_row], {ticker: f"{ticker} · {company}"})
+    payload, config = build_scan_table_payload(
+        [scanner_row],
+        {
+            qualified_ticker:
+                f"{qualified_ticker.removesuffix('.NS').removesuffix('.BO')} · "
+                f"{company} ({exchange})"
+        },
+    )
     item = payload[0]
     market_value = holding.get("Market_Value", holding.get("Gross_Exposure"))
     item.update(
         {
-            "ticker": ticker,
+            "ticker": qualified_ticker,
             "quantity": _number(holding.get("Qty")),
             "average": _number(holding.get("Avg_Price")),
             "investment": _number(holding.get("Investment")),
@@ -504,6 +583,7 @@ def _holding_table_columns(layout: str) -> list[list[object]]:
 
 
 def _refresh_holdings_research(tickers: set[str]) -> None:
+    _cancel_holding_jobs()
     st.session_state["stock_context_cache"] = {}
     cache = st.session_state.get("stock_research_cache")
     if not isinstance(cache, dict):
@@ -529,6 +609,7 @@ def render_stock_holdings_table(
         cache = {}
         st.session_state.stock_research_cache = cache
     from features.equities.scan_table import show_scan_table
+    from features.equities.scanner import _load_indian_equity_master
 
     payload = []
     config: dict[str, object] = {}
@@ -536,16 +617,30 @@ def render_stock_holdings_table(
     if not isinstance(context_cache, dict):
         context_cache = {}
         st.session_state["stock_context_cache"] = context_cache
+    _collect_holding_jobs()
+    jobs = st.session_state.setdefault("holding_research_jobs", {})
     connected = bool(st.session_state.get("token") and st.session_state.get("broker_state"))
     broker = str(st.session_state.get("broker_name") or "")
     analytics_available = bool(str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip()) if connected else False
+    company_names = _listed_company_names(_load_indian_equity_master())
     identities = {
         identity for _, holding in display.iterrows()
         if connected and (identity := holding_identity(holding, layout, broker)) is not None
     }
-    if identities:
-        with st.spinner(f"Updating local market context for {len(identities)} stock(s)…"):
-            refresh_holding_contexts(context_cache, identities, analytics_available=analytics_available)
+    now = datetime.now(timezone.utc)
+    for identity in identities:
+        context_key = (*identity, analytics_available)
+        entry = context_cache.get(context_key)
+        if (isinstance(entry, tuple) and len(entry) == 2
+                and isinstance(entry[0], datetime) and entry[0].tzinfo is not None
+                and now - entry[0] < CONTEXT_TTL):
+            continue
+        context_cache.pop(context_key, None)
+        job_key = ("context", context_key)
+        if job_key not in jobs:
+            jobs[job_key] = _HOLDINGS_EXECUTOR.submit(
+                load_holding_context, identity, analytics_available=analytics_available
+            )
     missing = {
         _ticker_value(holding.get("Ticker"))
         for _, holding in display.iterrows()
@@ -557,28 +652,33 @@ def render_stock_holdings_table(
             dict,
         )
     }
-    if missing:
-        with st.spinner(f"Loading indicators, fundamentals, and news for {len(missing)} holding(s)…"):
-            with ThreadPoolExecutor(
-                max_workers=min(4, len(missing)),
-                thread_name_prefix="holdings-research",
-            ) as executor:
-                pending = {
-                    executor.submit(_analyze_selected_stock, ticker): ticker
-                    for ticker in missing
-                }
-                for future in as_completed(pending):
-                    ticker = pending[future]
-                    research_key = f"selected_stock_research_{ticker}"
-                    cache[research_key] = future.result()
+    for ticker in missing:
+        job_key = ("research", ticker)
+        if job_key not in jobs:
+            jobs[job_key] = _HOLDINGS_EXECUTOR.submit(_analyze_selected_stock, ticker)
+    if jobs:
+        st.caption("Stock research is loading in the background; you can switch tabs.")
+        _watch_holding_jobs()
     for _, holding in display.iterrows():
         ticker = _ticker_value(holding.get("Ticker"))
         if not ticker:
             continue
         research = cache.get(f"selected_stock_research_{ticker}")
         if not isinstance(research, dict):
-            continue
-        row, row_config = _build_holding_scan_row(holding, research)
+            research = {
+                "signal": "Not rated",
+                "reason": "Research is loading.",
+                "errors": {},
+            }
+        raw_ticker = _ticker_value(holding.get("Ticker"))
+        raw_key = _text(holding.get("Instrument_Key")).upper()
+        exchange = "BSE" if raw_key.startswith("BSE_EQ|") or raw_ticker.endswith(".BO") else "NSE"
+        company_name = company_names.get(
+            (raw_ticker.removesuffix(".NS").removesuffix(".BO"), exchange)
+        )
+        row, row_config = _build_holding_scan_row(
+            holding, research, company_name=company_name
+        )
         identity = holding_identity(holding, layout, broker) if connected else None
         if identity:
             row["currency"] = "INR"

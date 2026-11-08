@@ -9,6 +9,10 @@ import pandas as pd
 import requests
 from streamlit.testing.v1 import AppTest
 
+from application.dashboard import (
+    _close_analysis_setup_dialog,
+    _pending_analysis_setup_scope,
+)
 from features.equities.scanner import (
     RECOMMENDED_FILTERS,
     _ai_recommendation_candidates,
@@ -45,6 +49,31 @@ def _equity_master(*symbols: str) -> pd.DataFrame:
 
 
 class MarketResearchTests(unittest.TestCase):
+    def test_analysis_setup_waits_for_existing_settings_dialog(self):
+        state = {
+            "analysis_setup_dialog_scope": "portfolio_overview",
+            "user_settings_dialog_open": True,
+        }
+        with patch("application.dashboard.st.session_state", state):
+            self.assertIsNone(_pending_analysis_setup_scope())
+
+        state["user_settings_dialog_open"] = False
+        state["user_settings_feedback"] = {"kind": "success"}
+        with patch("application.dashboard.st.session_state", state):
+            self.assertIsNone(_pending_analysis_setup_scope())
+
+        state.pop("user_settings_feedback")
+        with patch("application.dashboard.st.session_state", state):
+            self.assertEqual(
+                _pending_analysis_setup_scope(), "portfolio_overview"
+            )
+
+    def test_dismissing_analysis_setup_clears_its_pending_scope(self):
+        state = {"analysis_setup_dialog_scope": "portfolio_overview"}
+        with patch("application.dashboard.st.session_state", state):
+            _close_analysis_setup_dialog()
+            self.assertIsNone(_pending_analysis_setup_scope())
+
     def test_analysis_status_indicators_distinguish_caution_from_strength(self):
         self.assertEqual(
             analysis_status_icon({"assessment": {"sentiment": "positive"}}),
@@ -1068,6 +1097,30 @@ class MarketResearchTests(unittest.TestCase):
             any(item.label == "API base URL" for item in app.text_input)
         )
 
+    def test_analysis_setup_waits_until_user_settings_dialog_is_closed(self):
+        app = AppTest.from_file(
+            str(Path(__file__).resolve().parents[1] / "app.py")
+        ).run(timeout=20)
+        app.session_state["analysis_setup_dialog_scope"] = "all"
+        app.session_state["user_settings_dialog_open"] = True
+        app.run(timeout=20)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.type == "dialog" for item in app))
+        self.assertTrue(
+            any(item.key == "settings_profile_name" for item in app.text_input)
+        )
+        self.assertFalse(
+            any(item.key == "analysis_setup_api_key_all_gemini" for item in app.text_input)
+        )
+
+        app.session_state["user_settings_dialog_open"] = False
+        app.run(timeout=20)
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any(item.key == "analysis_setup_api_key_all_gemini" for item in app.text_input)
+        )
+
     def test_analysis_setup_lists_saved_provider_configurations(self):
         app = AppTest.from_file(
             str(Path(__file__).resolve().parents[1] / "app.py")
@@ -1278,7 +1331,7 @@ _render_ai_provider_configurations("delete-test-user")
         payload, config = _scan_table_payload([row], {"ABC.BO": "ABC \u00b7 Alpha"})
         html = render_scan_table(payload, config)
 
-        self.assertEqual(payload[0]["label"], "ABC \u00b7 Alpha")
+        self.assertEqual(payload[0]["displayTicker"], "ABC.BO")
         self.assertEqual(payload[0]["ind"]["SMA_20"], ["\u20b9100.00", "pos"])
         self.assertEqual(payload[0]["ind"]["ADX_14"][0], "31.2")
         self.assertEqual(
@@ -1287,7 +1340,7 @@ _render_ai_provider_configurations("delete-test-user")
         self.assertEqual(config["signals"], ["STRONG BUY"])
         self.assertIn("Download CSV", html)
         self.assertIn("Records per page", html)
-        self.assertIn(json.dumps("ABC \u00b7 Alpha", ensure_ascii=False), html)
+        self.assertIn(json.dumps("ABC.BO", ensure_ascii=False), html)
 
 
     def test_trades_workspace_does_not_render_custom_scanner_filters(self):

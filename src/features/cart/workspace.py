@@ -85,7 +85,13 @@ def _quote_currency(item: dict[str, Any]) -> str | None:
     if isinstance(currency, str) and currency.strip():
         return currency.strip().upper()
     ticker = str(item.get("ticker") or "").upper()
-    return "INR" if ticker.endswith((".NS", ".BO")) else None
+    row_label = row.get("label") if isinstance(row, dict) else None
+    label = str(row_label or item.get("name") or "").rstrip().upper()
+    return (
+        "INR"
+        if ticker.endswith((".NS", ".BO")) or label.endswith(("(NSE)", "(BSE)"))
+        else None
+    )
 
 
 def _review_text(item: dict[str, Any]) -> str:
@@ -111,13 +117,21 @@ def _valid_quantity(item: dict[str, Any], quantity: object) -> bool:
 
 
 def _row_event(item_id: str, key: str) -> None:
-    event = st.session_state[key].get("event")
+    component_state = st.session_state.get(key)
+    if not isinstance(component_state, dict):
+        return
+    event = component_state.get("event")
     if not isinstance(event, dict):
         st.warning("Unable to apply this cart action.")
         return
-    item = next((entry for entry in st.session_state["stock_cart"] if entry["id"] == item_id), None)
+    cart = st.session_state.get("stock_cart")
+    if not isinstance(cart, list):
+        return
+    item = next(
+        (entry for entry in cart if isinstance(entry, dict) and entry.get("id") == item_id),
+        None,
+    )
     if item is None:
-        st.warning("This stock is no longer in the cart.")
         return
     action = event.get("action")
     if action == "quantity":
@@ -141,9 +155,14 @@ def _row_event(item_id: str, key: str) -> None:
 
 
 def _display_name(item: dict[str, Any]) -> str:
-    name = str(item.get("name") or item.get("ticker") or "")
-    parts = name.split(" · ", 1)
-    return parts[0] if len(parts) == 2 and parts[0].strip().casefold() == parts[1].strip().casefold() else name
+    ticker = str(item.get("ticker") or "")
+    name = str(item.get("name") or "")
+    base_ticker = ticker.removesuffix(".NS").removesuffix(".BO")
+    if not name or name.casefold().startswith(base_ticker.casefold() + " · "):
+        return name or ticker
+    if name.casefold().startswith(ticker.casefold()):
+        return name or ticker
+    return f"{ticker} · {name}"
 
 
 def render_cart_workspace() -> None:

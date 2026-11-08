@@ -37,9 +37,24 @@ keys; unclassified positions and derivatives are not treated as stocks.
 Other brokers' equity holdings use the existing Yahoo ticker convention and
 do not have Upstox-specific data unless an instrument key is available.
 Contexts are held in the user's session for at most 15 minutes and refreshed
-on the next view or the holdings refresh button. Provider failures are shown
+on the next view or the holdings refresh button. Holdings research runs in a
+bounded background pool; the table remains usable with a "Not rated" signal
+until its research completes. Provider failures are shown
 without treating missing inputs as safe. This local assessment does not call
 an LLM and does not gate the existing separate portfolio AI workflow.
+Market scans and their context enrichment run in the background with bounded
+parallel requests and separate progress indicators. You can switch workspaces
+while they run. Large universes can still take time and may hit provider rate
+limits; context snapshots retain their original timestamps and may be stale.
+
+The in-memory service API `services.universe_scan.async_execute_universe_scan`
+accepts a list of objects with `symbol`, optional `instrument_key`, and optional
+`horizon`, plus an Upstox analytics token. It returns one JSON string per input
+in the original order, including failures and blocked contexts. Each record
+contains `status`, `early_exit`, `context`, `local_gatekeeper`, and `error`.
+No LLM is invoked. Intraday scans require a live D30 stream and are not accepted
+by this snapshot runner.
+
 The stock tables start unfiltered: use their column controls for primary
 filters (opened on demand) and use **Add filters** to search for and add
 indicator or context columns. Added columns can be sorted and filtered like
@@ -311,6 +326,14 @@ callback state in IndexedDB. Confidential settings and OAuth callback context
 are encrypted locally with browser Web Crypto. The browser bridge executes
 IndexedDB operations in the browser; it does not persist those records to the
 Streamlit server filesystem or to a cloud database.
+
+Portfolio data, broker sessions, and AI analysis results are kept in the current
+session rather than saved for restoration. Existing locally saved AI analyses
+are removed when that browser/device runs the app. If Turso is configured,
+legacy cloud broker registry entries are removed for the current signed-in user;
+custom broker profiles in User settings are retained. Cleanup does not erase
+backups or other devices and cannot run for a cloud account that is unavailable.
+OAuth callback state remains short-lived so broker sign-in can complete.
 
 Settings use a device-local repository abstraction. Streamlit selects the
 IndexedDB provider; non-Streamlit runtimes select the SQLCipher provider, which

@@ -28,7 +28,48 @@ def _master():
     ])
 
 
+def _finish_scan(app, prefix):
+    job = app.session_state["_market_scan_jobs"].get(prefix)
+    if job is not None:
+        job["future"].result(timeout=10)
+        app.run(timeout=20)
+
+
+def _universe_mock(load):
+    async def scan(stocks, token, *, on_progress, cancel):
+        records = []
+        for stock in stocks:
+            identity = (stock["symbol"], stock["instrument_key"], stock["horizon"])
+            result = load(identity, analytics_available=bool(token))
+            records.append({"symbol": identity[0], "status": "ok" if result.get("context") else "error",
+                            "context": result.get("context"), "local_gatekeeper": result.get("gate"),
+                            "error": result.get("error")})
+            on_progress(len(records), len(stocks))
+        return records
+    return scan
+
+
 class ScannerStockContextTests(unittest.TestCase):
+    def test_scan_payload_preserves_currency_and_uses_listed_exchange(self):
+        listed, _ = build_scan_table_payload(
+            [{"Ticker": "PGIL", "Recommendation": "HOLD"}],
+            {"PGIL": "PGIL · Pearl Global Industries Limited (NSE)"},
+        )
+        unknown, _ = build_scan_table_payload(
+            [{"Ticker": "CUSTOM", "Recommendation": "HOLD"}], {}
+        )
+        explicit, _ = build_scan_table_payload(
+            [{"Ticker": "CUSTOM", "Recommendation": "HOLD", "currency": "usd"}], {}
+        )
+        self.assertEqual(listed[0]["displayTicker"], "PGIL.NS")
+        self.assertEqual(
+            listed[0]["label"],
+            "PGIL · Pearl Global Industries Limited (NSE)",
+        )
+        self.assertEqual(listed[0]["currency"], "INR")
+        self.assertIsNone(unknown[0]["currency"])
+        self.assertEqual(explicit[0]["currency"], "USD")
+
     def test_identity_verifies_master_mapping_and_uses_public_fallback(self):
         master = pd.concat([_master(), pd.DataFrame([
             {"Symbol": "BAD", "Ticker": "BAD", "ISIN": "INE002A01019", "Exchange": "NSE"},
@@ -82,19 +123,17 @@ _render_scanner(scope="Trading", suggested_symbols=["RELIANCE", "ABC.BO"])
         rows = [_row("RELIANCE"), _row("ABC.BO")]
         calls = []
 
-        def refresh(cache, identities, *, analytics_available):
-            calls.append((identities, analytics_available))
-            for identity in identities:
-                data = ({"context": {"horizon": identity[2].value,
-                                     "intraday": {"lower_circuit_limit": 90}},
-                         "gate": {"is_eligible_for_llm": True}}
-                        if identity[0] == "RELIANCE.NS" else {"error": "Provider unavailable"})
-                cache[(*identity, analytics_available)] = (datetime.now(timezone.utc), data)
+        def refresh(identity, *, analytics_available):
+            calls.append((identity, analytics_available))
+            return ({"context": {"horizon": identity[2].value,
+                                 "intraday": {"lower_circuit_limit": 90}},
+                     "gate": {"is_eligible_for_llm": True}}
+                    if identity[0] == "RELIANCE.NS" else {"error": "Provider unavailable"})
 
         with patch("features.equities.scanner._load_indian_equity_master", return_value=_master()), \
              patch("features.equities.scanner._scan_stocks", return_value=(rows, {})), \
              patch("features.equities.scanner.configured_value", return_value=""), \
-             patch("features.equities.scanner.refresh_holding_contexts", side_effect=refresh), \
+             patch("features.equities.scanner._scan_universe", side_effect=_universe_mock(refresh)), \
              patch("features.equities.scanner.show_scan_table") as table:
             app.run(timeout=20)
             self.assertFalse(app.exception)
@@ -102,28 +141,30 @@ _render_scanner(scope="Trading", suggested_symbols=["RELIANCE", "ABC.BO"])
             self.assertEqual(sum("several provider requests per stock" in w.value
                                  and "rate limits" in w.value for w in app.warning), 2)
             app.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(app, "equities")
             self.assertFalse(app.exception)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertFalse(calls[0][1])
             self.assertTrue(any("unavailable for 1" in w.value for w in app.warning))
             payload, config = table.call_args.args
             self.assertEqual(len(payload), 2)
             self.assertTrue(config["showColumnFilters"])
             self.assertEqual(payload[1]["extraSections"][0]["note"], "Provider unavailable")
-            self.assertEqual({identity[0] for identity in calls[0][0]}, {"RELIANCE.NS", "ABC.BO"})
+            self.assertEqual({identity[0][0] for identity in calls}, {"RELIANCE.NS", "ABC.BO"})
             app.run(timeout=20)
-            self.assertEqual(len(calls), 1)
-            app.button(key="market_trading_scan_button").click().run(timeout=20)
-            self.assertFalse(app.exception)
             self.assertEqual(len(calls), 2)
-            self.assertNotEqual(calls[0][0], calls[1][0])
+            app.button(key="market_trading_scan_button").click().run(timeout=20)
+            _finish_scan(app, "trading")
+            self.assertFalse(app.exception)
+            self.assertEqual(len(calls), 4)
+            self.assertNotEqual(calls[0][0][2], calls[2][0][2])
             self.assertEqual(len(app.session_state["stock_context_cache"]), 4)
             self.assertEqual(len(app.session_state["market_equities_scan_contexts"]), 2)
             self.assertEqual(len(app.session_state["market_trading_scan_contexts"]), 2)
             table.reset_mock()
             app.run(timeout=20)
             self.assertFalse(app.exception)
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 4)
             equity_config, trading_config = [call.args[1] for call in table.call_args_list]
             self.assertNotEqual(equity_config["tableKey"], trading_config["tableKey"])
             self.assertEqual(len(app.session_state["market_equities_scan_results"]), 2)
@@ -138,17 +179,20 @@ _render_scanner(scope="Equities", suggested_symbols=["RELIANCE"])
         with patch("features.equities.scanner._load_indian_equity_master", return_value=_master()), \
              patch("features.equities.scanner._scan_stocks", return_value=([_row("RELIANCE")], {})), \
              patch("features.equities.scanner.configured_value", return_value="analytics-token"), \
-             patch("features.analysis.stock_context.load_holding_context",
-                   return_value={"error": "Provider unavailable"}) as load, \
+             patch("features.equities.scanner._scan_universe",
+                   side_effect=_universe_mock(lambda identity, **kwargs: {"error": "Provider unavailable"})) as load, \
              patch("features.equities.scanner.show_scan_table"):
             first.run(timeout=20)
             first.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(first, "equities")
             first.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(first, "equities")
             self.assertEqual(load.call_count, 1)
-            self.assertTrue(load.call_args.kwargs["analytics_available"])
-            self.assertEqual(load.call_args.args[0][1], "NSE_EQ|INE002A01018")
+            self.assertEqual(load.call_args.args[1], "analytics-token")
+            self.assertEqual(load.call_args.args[0][0]["instrument_key"], "NSE_EQ|INE002A01018")
             second.run(timeout=20)
             second.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(second, "equities")
             self.assertEqual(load.call_count, 2)
             self.assertFalse(first.exception)
             self.assertFalse(second.exception)
@@ -167,14 +211,17 @@ _render_scanner(scope="Trading", suggested_symbols=["RELIANCE"])
         with patch("features.equities.scanner._load_indian_equity_master", return_value=_master()), \
              patch("features.equities.scanner._scan_stocks", return_value=([_row("RELIANCE")], {})), \
              patch("features.equities.scanner.configured_value", return_value="token"), \
-             patch("features.analysis.stock_context.load_holding_context", return_value=result) as load, \
+             patch("features.equities.scanner._scan_universe",
+                   side_effect=_universe_mock(lambda identity, **kwargs: result)) as load, \
              patch("features.equities.scanner.show_scan_table") as table:
             app.run(timeout=20)
             app.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(app, "equities")
             self.assertFalse(app.exception)
             self.assertEqual(len(app.get("json")), 0)
             self.assertNotIn("source_data", str(table.call_args.args[0]))
             app.button(key="market_trading_scan_button").click().run(timeout=20)
+            _finish_scan(app, "trading")
             self.assertEqual(load.call_count, 2)
             app.run(timeout=20)
             self.assertFalse(app.exception)
@@ -186,12 +233,13 @@ _render_scanner(scope="Trading", suggested_symbols=["RELIANCE"])
             cache = app.session_state["stock_context_cache"]
             self.assertEqual(cache[equity_key][1]["context"]["source_data"]["rows"], [123, 456])
             cache[equity_key] = (datetime.now(timezone.utc) - CONTEXT_TTL - timedelta(seconds=1), result)
+            app.session_state["market_equities_scan_context_snapshot"][equity_key] = cache[equity_key]
             table.reset_mock()
             app.run(timeout=20)
             self.assertFalse(app.exception)
             self.assertEqual(len(app.get("json")), 0)
             self.assertEqual(load.call_count, 2)
-            self.assertIn("expired", table.call_args_list[0].args[0][0]["extraSections"][0]["note"])
+            self.assertIn("stale", table.call_args_list[0].args[0][0]["extraSections"][0]["note"])
             self.assertEqual(len(app.session_state["market_equities_scan_results"]), 1)
 
     def test_returning_to_scanner_ignores_saved_download_button_state(self):
@@ -225,6 +273,50 @@ if show:
             self.assertNotIn(f"market_{prefix}_scanner_context_viewer_download",
                              app.session_state["_scanner_saved"][prefix])
         self.assertEqual(len(app.get("json")), 0)
+
+    def test_long_scan_retains_stale_context_and_gate_prefers_newer_cache(self):
+        app = AppTest.from_string("""
+from features.equities.scanner import _render_scanner
+_render_scanner(scope="Equities", suggested_symbols=["RELIANCE", "ABC.BO"])
+""")
+        rows = [_row("RELIANCE"), _row("ABC.BO")]
+
+        def load(identity, *, analytics_available):
+            return {"context": {"profile": {"ticker": identity[0]},
+                                "intraday": {"lower_circuit_limit": 90}},
+                    "gate": {"is_eligible_for_llm": True}}
+
+        with patch("features.equities.scanner._load_indian_equity_master", return_value=_master()), \
+             patch("features.equities.scanner._scan_stocks", return_value=(rows, {})), \
+             patch("features.equities.scanner.configured_value", return_value=""), \
+             patch("features.equities.scanner._scan_universe", side_effect=_universe_mock(load)), \
+             patch("features.equities.scanner.show_scan_table") as table:
+            app.run(timeout=20)
+            app.button(key="market_equities_scan_button").click().run(timeout=20)
+            _finish_scan(app, "equities")
+            keys = app.session_state["market_equities_scan_contexts"]
+            snapshot = app.session_state["market_equities_scan_context_snapshot"]
+            cache = app.session_state["stock_context_cache"]
+            old = datetime.now(timezone.utc) - CONTEXT_TTL - timedelta(minutes=5)
+            for key in keys.values():
+                snapshot[key] = (old, snapshot[key][1])
+                cache[key] = snapshot[key]
+            newer = {"context": {"profile": {"ticker": "ABC.BO"},
+                                  "intraday": {"lower_circuit_limit": 95}},
+                     "gate": {"is_eligible_for_llm": False}}
+            cache[keys["ABC.BO"]] = (datetime.now(timezone.utc), newer)
+            table.reset_mock()
+            app.run(timeout=20)
+            payload, config = table.call_args.args
+            lower = config["rawCols"].index("Intraday · lower circuit limit")
+            gate = config["rawCols"].index("Gate · eligibility")
+            self.assertEqual(payload[0]["raw"][lower], 90)
+            self.assertEqual(payload[0]["raw"][gate], "Eligible (stale)")
+            self.assertIn("gate are stale", payload[0]["extraSections"][0]["note"])
+            self.assertEqual(payload[1]["raw"][lower], 95)
+            self.assertEqual(payload[1]["raw"][gate], "Blocked")
+            self.assertTrue(any("stale for 1" in warning.value for warning in app.warning))
+            self.assertFalse(any("unavailable for" in warning.value for warning in app.warning))
 
 
 if __name__ == "__main__":

@@ -194,37 +194,19 @@ class CloudServiceTests(unittest.TestCase):
                 )
         self.assertFalse(adapter.supports_live_orders)
 
-    def test_dynamic_broker_registry_scopes_records_to_hashed_tenant(self):
-        mock_query = Mock(return_value=[])
-        configuration = {
-            "api_base": "https://api.broker.example",
-            "endpoints": {
-                "balance": "/balance",
-                "positions": "/positions",
-                "holdings": "/holdings",
-            },
-        }
-        with (
-            patch.object(
-                broker_factory,
-                "settings",
-                replace(
-                    settings,
-                    dynamic_broker_allowed_hosts=("api.broker.example",),
-                ),
-            ),
-            patch("services.cloud.execute_turso_query", mock_query),
-        ):
-            cloud_services.register_dynamic_broker(
-                "person@example.com", "Example broker", configuration
-            )
-
+    def test_legacy_broker_cleanup_is_scoped_to_hashed_tenant(self):
+        mock_query = Mock(side_effect=[[{"name": "dynamic_broker_registry"}], []])
+        with patch("services.cloud.execute_turso_query", mock_query):
+            cloud_services.clear_legacy_dynamic_brokers("person@example.com")
         statement, arguments = mock_query.call_args_list[-1].args
-        self.assertIn("ON CONFLICT(owner_id, name)", statement)
+        self.assertIn("DELETE FROM dynamic_broker_registry WHERE owner_id = ?", statement)
         self.assertNotIn("person@example.com", arguments)
         self.assertEqual(len(arguments[0]), 64)
-        self.assertEqual(arguments[1], "Example broker")
-        self.assertNotIn("access_token", arguments[2])
+
+    def test_legacy_broker_cleanup_does_not_create_a_missing_table(self):
+        with patch("services.cloud.execute_turso_query", return_value=[]) as query:
+            cloud_services.clear_legacy_dynamic_brokers("person@example.com")
+        query.assert_called_once()
 
     def test_app_help_answers_compound_questions_locally_without_provider_keys(self):
         answer = answer_app_help_question(

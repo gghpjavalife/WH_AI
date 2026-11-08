@@ -322,6 +322,24 @@ class SQLiteStorageProvider:
         finally:
             connection.close()
 
+    def delete_collection(self, collection: str) -> None:
+        if not isinstance(collection, str) or not collection or ":" in collection:
+            raise ValueError("A nonempty collection name without ':' is required.")
+        connection = self._open_database()
+        try:
+            with connection:
+                if collection == "user_settings":
+                    connection.execute("DELETE FROM user_settings")
+                elif collection == "oauth_states":
+                    connection.execute("DELETE FROM oauth_states")
+                else:
+                    connection.execute(
+                        "DELETE FROM storage_records WHERE collection = ?",
+                        (collection,),
+                    )
+        finally:
+            connection.close()
+
     def consume(self, collection: str, key: str) -> dict[str, Any] | None:
         if collection != "oauth_states":
             value = self.get(collection, key)

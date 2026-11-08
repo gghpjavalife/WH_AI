@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,7 +11,7 @@ from features.analysis.holdings import (
     build_portfolio_holding_rows,
     combine_stock_signal,
 )
-from features.equities.scan_table import render_scan_table
+from features.equities.scan_table import render_scan_table, show_scan_table
 from services.ai import ask_llm_agent
 from streamlit.testing.v1 import AppTest
 
@@ -278,6 +279,32 @@ class PortfolioHoldingsAnalysisTests(unittest.TestCase):
         self.assertIn("Open P&L", [column[1] for column in trading_columns])
         self.assertNotIn('"columns":', scanner_html)
         self.assertIn("Day change", scanner_html)
+
+    @patch("features.equities.scan_table._COMPONENT")
+    def test_scan_table_serializes_non_finite_numbers_as_missing(self, component):
+        payload = [
+            {
+                "ticker": "ABC",
+                "chg": float("nan"),
+                "rsi": float("inf"),
+                "raw": [float("-inf")],
+            }
+        ]
+        config = {"tableKey": "test-table", "metadata": {"value": float("nan")}}
+
+        show_scan_table(payload, config)
+
+        component_data = component.call_args.kwargs["data"]
+        json.dumps(component_data, allow_nan=False)
+        self.assertIsNone(component_data["payload"][0]["chg"])
+        self.assertIsNone(component_data["payload"][0]["rsi"])
+        self.assertIsNone(component_data["payload"][0]["raw"][0])
+        self.assertIsNone(component_data["config"]["metadata"]["value"])
+
+        html = render_scan_table(payload, config)
+        self.assertIn('"chg": null', html)
+        self.assertNotIn("NaN", html)
+        self.assertNotIn("Infinity", html)
 
     def test_empty_news_and_missing_fundamentals_do_not_create_empty_panels(self):
         row, _ = _build_holding_scan_row(

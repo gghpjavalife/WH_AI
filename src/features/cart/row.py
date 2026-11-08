@@ -5,13 +5,15 @@ import streamlit as st
 ROW_HTML = """
 <div class="row">
  <div class="stock"><span id="name"></span><span id="signal"></span></div>
- <div class="stepper" id="qtyBox">
-  <input id="qty" type="number" step="1" aria-label="Quantity">
-  <span class="arrows"><button id="qtyUp" aria-label="Increase quantity">▴</button><button id="qtyDown" aria-label="Decrease quantity">▾</button></span>
- </div>
- <div class="stepper percentage" id="pctBox">
-  <input id="pct" readonly aria-label="Percentage of holding">
-  <span class="arrows"><button id="pctUp" aria-label="Increase sell quantity">▴</button><button id="pctDown" aria-label="Decrease sell quantity">▾</button></span>
+ <div class="quantities">
+  <div class="stepper" id="qtyBox">
+   <input id="qty" type="number" step="1" aria-label="Quantity">
+   <span class="arrows"><button id="qtyUp" aria-label="Increase quantity">▴</button><button id="qtyDown" aria-label="Decrease quantity">▾</button></span>
+  </div>
+  <div class="stepper percentage" id="pctBox">
+   <input id="pct" readonly aria-label="Percentage of holding">
+   <span class="arrows"><button id="pctUp" aria-label="Increase sell quantity">▴</button><button id="pctDown" aria-label="Decrease sell quantity">▾</button></span>
+  </div>
  </div>
  <span id="estimate" class="estimate"></span>
  <div class="actions">
@@ -24,29 +26,47 @@ ROW_HTML = """
 
 ROW_CSS = """
 :host{font-family:var(--st-font,sans-serif);color:var(--st-text-color);}
-*{box-sizing:border-box}.row{display:flex;align-items:center;gap:.55rem;overflow-x:auto;
- padding:.55rem .7rem;border:1px solid var(--st-border-color,#ad9137);border-radius:9px;white-space:nowrap}
-.stock{position:relative;min-width:155px;max-width:230px;padding-top:.45rem}
+*{box-sizing:border-box}.row{display:flex;align-items:center;gap:.65rem;min-width:0;width:100%;
+ padding:.55rem .7rem;border:1px solid var(--st-border-color,#ad9137);border-radius:9px}
+.stock{position:relative;flex:1 1 10rem;min-width:0;max-width:230px;padding-top:.45rem}
 #name{font-weight:700;overflow:hidden;text-overflow:ellipsis;display:block}
 #signal{position:absolute;top:-.25rem;right:0;font-size:.62rem;font-weight:700;
  padding:.08rem .3rem;border-radius:4px;background:var(--st-secondary-background-color,#1d2938)}
 #signal.buy{color:#22a85a}#signal.sell{color:#ef5555}
-.stepper{display:flex;align-items:stretch;width:95px;height:36px;border:1px solid #888;border-radius:7px;overflow:hidden;flex-shrink:0}
+.quantities{display:flex;align-items:center;gap:.4rem;flex:none}
+.stepper{display:flex;align-items:stretch;width:95px;height:40px;border:1px solid #888;border-radius:7px;overflow:hidden;flex-shrink:0}
 .stepper.buy{border-color:#22a85a;background:rgba(34,168,90,.10)}
 .stepper.sell{border-color:#ef5555;background:rgba(239,85,85,.10)}
 .stepper input{width:100%;min-width:0;background:transparent;color:inherit;border:0;padding:0 .4rem;font:inherit;outline:none}
 .stepper input::-webkit-inner-spin-button,.stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .stepper input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .arrows{display:flex;flex-direction:column;border-left:1px solid #8885}
-.arrows button{width:22px;flex:1;background:transparent;color:inherit;border:0;cursor:pointer;line-height:1}
+.arrows button{width:28px;min-height:19px;flex:1;background:transparent;color:inherit;border:0;cursor:pointer;line-height:1}
 .arrows button:hover:not(:disabled){background:#8883}.arrows button:disabled{opacity:.3;cursor:not-allowed}
-.percentage{width:100px}.percentage[hidden]{display:none}
-.estimate{font-size:.82rem;flex:1;min-width:max-content}
-.actions{display:flex;gap:.3rem}.action{width:34px;height:34px;border-radius:7px;background:transparent;cursor:pointer;font-size:1rem}
+.percentage{width:100px}.percentage[hidden],[hidden]{display:none!important}
+.estimate{font-size:.82rem;flex:1 1 10rem;min-width:0;overflow-wrap:anywhere}
+.actions{display:flex;gap:.35rem;flex:none}.action{width:40px;height:40px;border-radius:7px;background:transparent;cursor:pointer;font-size:1rem;touch-action:manipulation}
 .action:disabled{opacity:.35;cursor:not-allowed}.view{color:#53aaff;border:1px solid #53aaff}
 .review{color:#2dc979;border:1px solid #2dc979}.remove{color:#f06d6d;border:1px solid #f06d6d}
 .action svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;vertical-align:middle}
 .action:hover:not(:disabled){background:#8883}.error{color:#f06d6d;font-size:.8rem;margin:.25rem}
+@media(max-width:760px){
+ .row{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"stock actions" "quantities quantities" "estimate estimate";gap:.55rem .7rem;padding:.65rem}
+ .stock{grid-area:stock;max-width:none;min-height:2rem}
+ .quantities{grid-area:quantities;width:100%;flex-wrap:wrap}
+ .stepper{width:min(9rem,100%);height:44px}
+ .percentage{width:min(7rem,100%)}
+ .estimate{grid-area:estimate;width:100%;font-size:.86rem;line-height:1.4}
+ .actions{grid-area:actions;gap:.35rem}
+ .action{width:42px;height:42px}
+ .arrows button{min-height:21px}
+}
+@media(max-width:380px){
+ .row{gap:.5rem;padding:.55rem}
+ .actions{gap:.2rem}
+ .action{width:38px;height:40px}
+ .stepper{width:min(8rem,100%)}
+}
 """
 
 ROW_JS = """

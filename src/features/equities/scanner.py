@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
 import re
+from threading import BoundedSemaphore, Event, Lock
 from uuid import uuid4
 
 import pandas as pd
@@ -18,9 +20,10 @@ from brokers.factory import TICKER_MAP
 from core.config import configured_value
 from core.logging import log_failure
 from features.analysis.stock_context import (
-    CONTEXT_TTL, append_context_to_row, holding_identity, refresh_holding_contexts,
+    CONTEXT_TTL, append_context_to_row, holding_identity,
 )
 from services.stock_context_models import InvestmentHorizon
+from services.stock_context import ProviderRateLimitError
 from .scan_table import show_scan_table
 from .market_data import (
     MarketDataError,
@@ -194,6 +197,15 @@ def _append_scan_context(
         row["extraGroups"] = []
         row["extraSections"] = []
         append_context_to_row(row, row_config, contexts.get(str(row["ticker"])))
+        context = contexts.get(str(row["ticker"]))
+        if context and context.get("_scanner_stale"):
+            gate_index = row_config["rawCols"].index("Gate · eligibility")
+            if row["raw"][gate_index]:
+                row["raw"][gate_index] += " (stale)"
+            row["extraSections"].insert(0, {
+                "title": "Stale market context and gate",
+                "note": "This context and its local gate are stale; refresh the scan before relying on them.",
+            })
         config = row_config
     return config
 
@@ -597,6 +609,26 @@ def build_scan_table_payload(
     payload = []
     for row in rows:
         symbol = str(row["Ticker"])
+        source_label = labels.get(symbol, symbol)
+        display_ticker = symbol
+        cart_label = source_label
+        listing = re.fullmatch(r"\s*(.*?)\s*·\s*(.*?)\s*\((NSE|BSE)\)\s*", source_label, re.IGNORECASE)
+        if listing:
+            base_ticker, company, exchange = listing.groups()
+            suffix = ".NS" if exchange.upper() == "NSE" else ".BO"
+            base_ticker = base_ticker.strip().upper().removesuffix(".NS").removesuffix(".BO")
+            display_ticker = base_ticker
+            if not display_ticker.upper().endswith(suffix):
+                display_ticker += suffix
+            cart_label = f"{base_ticker} · {company.strip()} ({exchange.upper()})"
+        currency = row.get("currency")
+        if not isinstance(currency, str) or not currency.strip():
+            if symbol.upper().endswith((".NS", ".BO")) or re.search(
+                r"\((?:NSE|BSE)\)\s*$", source_label, re.IGNORECASE
+            ):
+                currency = "INR"
+            else:
+                currency = None
         checks = []
         structured = row.get("Indicator_checks")
         if structured is None:
@@ -620,7 +652,10 @@ def build_scan_table_payload(
         payload.append(
             {
                 "ticker": symbol,
-                "label": labels.get(symbol, symbol),
+                "cartTicker": display_ticker,
+                "label": cart_label,
+                "displayTicker": display_ticker,
+                "currency": currency.strip().upper() if isinstance(currency, str) else None,
                 "price": _num(row, "Price"),
                 "chg": _num(row, "Daily_change_%"),
                 "rsi": _num(row, "RSI_14"),
@@ -710,27 +745,271 @@ def _render_scan_failures(failures: object) -> None:
                 st.caption(", ".join(group[:200]) + (" \u2026" if len(group) > 200 else ""))
 
 
-SCAN_MAX_WORKERS = 32
+SCAN_MAX_WORKERS = 8
+SCAN_CONTEXT_BATCH_SIZE = 64
+_SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="scanner-job")
+_SCAN_SLOTS = BoundedSemaphore(4)
+_SCAN_REQUEST_SLOTS = BoundedSemaphore(16)
+
+
+async def _scan_universe(*args, **kwargs):
+    from services.universe_scan import _scan_universe as scan
+    return await scan(*args, **kwargs)
+
+
+def _scan_job_finished(future, cancel) -> None:
+    try:
+        if future.cancelled():
+            if not cancel.is_set():
+                log_failure("Market scan", CancelledError())
+        else:
+            error = future.exception()
+            if error is not None and not cancel.is_set():
+                log_failure("Market scan", error)
+    finally:
+        _SCAN_SLOTS.release()
+
+
+class _ScanProgress:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._value = ("queued", 0, 0)
+
+    def set(self, stage: str, done: int = 0, total: int = 0) -> None:
+        with self._lock:
+            self._value = (stage, done, total)
+
+    def get(self) -> tuple[str, int, int]:
+        with self._lock:
+            return self._value
+
+
+def cancel_scanner_jobs() -> None:
+    """Discard this session's jobs and cooperatively stop their pending work."""
+    jobs = st.session_state.pop("_market_scan_jobs", {})
+    for job in jobs.values():
+        job["cancel"].set()
+        job["future"].cancel()
+
+
+def _bounded_futures(items, worker, max_workers, cancel, thread_name):
+    remaining = iter(items)
+    pending = {}
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name)
+    try:
+        def guarded_worker(item):
+            while not cancel.is_set():
+                if _SCAN_REQUEST_SLOTS.acquire(timeout=0.1):
+                    try:
+                        if cancel.is_set():
+                            raise CancelledError()
+                        return worker(item)
+                    finally:
+                        _SCAN_REQUEST_SLOTS.release()
+            raise CancelledError()
+
+        def submit_next():
+            if cancel.is_set():
+                return
+            item = next(remaining, None)
+            if item is not None:
+                pending[executor.submit(guarded_worker, item)] = item
+
+        for _ in range(max_workers):
+            submit_next()
+        while pending:
+            if cancel.is_set():
+                raise CancelledError()
+            completed, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for future in completed:
+                if cancel.is_set():
+                    raise CancelledError()
+                item = pending.pop(future)
+                yield item, future
+                submit_next()
+        if cancel.is_set():
+            raise CancelledError()
+    finally:
+        executor.shutdown(wait=not cancel.is_set(), cancel_futures=True)
+
+
+def _refresh_scan_contexts(cache, identities, upstox_token, progress, cancel):
+    """Fetch distinct missing identities in bounded async batches."""
+    analytics_available = bool(upstox_token)
+    unique = list(dict.fromkeys(identities.values()))
+    total = len(unique)
+    now = datetime.now(timezone.utc)
+    missing = []
+    done = 0
+    for identity in unique:
+        key = (*identity, analytics_available)
+        entry = cache.get(key)
+        if (isinstance(entry, tuple) and len(entry) == 2
+                and isinstance(entry[0], datetime) and entry[0].tzinfo is not None
+                and now - entry[0] < CONTEXT_TTL and isinstance(entry[1], dict)):
+            done += 1
+        else:
+            missing.append(identity)
+    progress.set("context", done, total)
+    if not missing:
+        return
+
+    async def fetch_batches():
+        nonlocal done
+        for start in range(0, len(missing), SCAN_CONTEXT_BATCH_SIZE):
+            if cancel.is_set():
+                raise asyncio.CancelledError()
+            batch = missing[start:start + SCAN_CONTEXT_BATCH_SIZE]
+            stocks = [{"symbol": symbol, "instrument_key": key, "horizon": horizon}
+                      for symbol, key, horizon in batch]
+            base = done
+            def update(completed, _total):
+                progress.set("context", base + completed, total)
+            try:
+                records = await _scan_universe(
+                    stocks, upstox_token, on_progress=update, cancel=cancel
+                )
+            except ProviderRateLimitError:
+                now = datetime.now(timezone.utc)
+                skipped = missing[start:]
+                message = (
+                    "Context ingestion stopped after a market-data provider returned "
+                    "HTTP 429 (rate limit). Remaining stock contexts were skipped; "
+                    "scan signals are still available."
+                )
+                for identity in skipped:
+                    cache[(*identity, analytics_available)] = (now, {"error": message})
+                done += len(skipped)
+                progress.set("context", done, total)
+                return
+            if len(records) != len(batch):
+                raise ValueError("Universe scan returned an incomplete batch.")
+            if cancel.is_set():
+                raise asyncio.CancelledError()
+            for identity, record in zip(batch, records):
+                if not isinstance(record, dict) or record.get("symbol") != identity[0]:
+                    raise ValueError("Universe scan returned invalid or unordered results.")
+                now = datetime.now(timezone.utc)
+                if record.get("status") == "ok" and isinstance(record.get("context"), dict):
+                    result = {
+                        "context": record["context"],
+                        "gate": record.get("local_gatekeeper"),
+                        "updated_at": now.isoformat(),
+                        "notice": (None if identity[1] and analytics_available else
+                                   "A usable Upstox instrument key and analytics token are required for "
+                                   "quote, circuit and corporate-action data."),
+                    }
+                else:
+                    result = {"error": record.get("error") or "Stock context ingestion unavailable."}
+                cache[(*identity, analytics_available)] = (now, result)
+            done += len(batch)
+            progress.set("context", done, total)
+
+    try:
+        asyncio.run(fetch_batches())
+    except asyncio.CancelledError:
+        raise CancelledError() from None
+
+
+def _run_scan_job(symbols, filters, master, scope, upstox_token, cache, progress, cancel=None):
+    """Run on a worker; all inputs and the context cache are detached from session state."""
+    cancel = cancel or Event()
+    if cancel.is_set():
+        raise CancelledError()
+    progress.set("scan", 0, len(symbols))
+    results, failures = _scan_stocks(
+        symbols, filters, lambda done, total: progress.set("scan", done, total), cancel
+    )
+    if cancel.is_set():
+        raise CancelledError()
+    identities = _scanner_identities(results, master, scope)
+    _refresh_scan_contexts(cache, identities, upstox_token, progress, cancel)
+    if cancel.is_set():
+        raise CancelledError()
+    contexts = {symbol: (*identity, bool(upstox_token))
+                for symbol, identity in identities.items()}
+    return results, failures, contexts, {key: cache[key] for key in contexts.values() if key in cache}
+
+
+def _collect_scan_job(prefix: str, scope: str) -> bool:
+    jobs = st.session_state.get("_market_scan_jobs", {})
+    job = jobs.get(prefix)
+    if not job or not job["future"].done():
+        return False
+    del jobs[prefix]
+    error_key = f"market_{prefix}_scan_error"
+    future = job["future"]
+    cancelled = job.get("cancel")
+    requested = cancelled is not None and cancelled.is_set()
+    if requested:
+        return True
+    error = CancelledError() if future.cancelled() else future.exception()
+    if error is not None:
+        st.session_state[error_key] = log_failure("Market scan", error)
+        return True
+    results, failures, contexts, entries = future.result()
+    cache = st.session_state.get("stock_context_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state["stock_context_cache"] = cache
+    now = datetime.now(timezone.utc)
+    for key, entry in list(cache.items()):
+        if (not isinstance(entry, tuple) or len(entry) != 2
+                or not isinstance(entry[0], datetime) or entry[0].tzinfo is None
+                or now - entry[0] >= CONTEXT_TTL):
+            cache.pop(key, None)
+    for key, entry in entries.items():
+        current = cache.get(key)
+        if (not isinstance(current, tuple) or len(current) != 2
+                or not isinstance(current[0], datetime) or current[0].tzinfo is None
+                or entry[0] >= current[0]):
+            cache[key] = entry
+    st.session_state[f"market_{prefix}_scan_contexts"] = contexts
+    st.session_state[f"market_{prefix}_scan_context_snapshot"] = entries
+    st.session_state[f"market_{prefix}_scan_results"] = results
+    st.session_state[f"market_{prefix}_scan_failures"] = failures
+    st.session_state[f"market_{prefix}_scan_filters"] = job["filters"]
+    st.session_state[f"market_{prefix}_scan_symbols_used"] = job["symbols"]
+    st.session_state.pop(error_key, None)
+    if scope == "Equities":
+        st.session_state.market_ai_candidates = _ai_recommendation_candidates(results)
+        st.session_state.market_ai_candidates_updated_at = datetime.now()
+    return True
+
+
+@st.fragment(run_every=1)
+def _scan_job_status(prefix: str, scope: str) -> None:
+    if _collect_scan_job(prefix, scope):
+        st.rerun()
+    job = st.session_state.get("_market_scan_jobs", {}).get(prefix)
+    if not job:
+        return
+    stage, done, total = job["progress"].get()
+    if stage == "queued":
+        st.info("Scan queued; waiting for an available worker.")
+    elif stage == "scan":
+        st.progress(done / total if total else 0.0,
+                    text=f"Reviewed {done:,} of {total:,} stocks…")
+    else:
+        st.progress(done / total if total else 0.0,
+                    text=f"Updating local market context: {done:,} of {total:,} stock(s)…")
 
 
 def _scan_stocks(
     symbols: list[str],
     filters: dict[str, float | bool],
     on_progress: Callable[[int, int], None] | None = None,
+    cancel: Event | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, str]]:
     results: list[dict[str, object]] = []
     failures: dict[str, str] = {}
-    with ThreadPoolExecutor(
-        max_workers=max(1, min(SCAN_MAX_WORKERS, len(symbols))), thread_name_prefix="market-scan"
-    ) as executor:
-        pending = {
-            executor.submit(fetch_daily_history, symbol): symbol
-            for symbol in symbols
-        }
-        for done, future in enumerate(as_completed(pending), start=1):
-            symbol = pending[future]
-            if on_progress and (done % 25 == 0 or done == len(pending)):
-                on_progress(done, len(pending))
+    cancel = cancel or Event()
+    if symbols:
+        futures = _bounded_futures(symbols, fetch_daily_history,
+                                   min(SCAN_MAX_WORKERS, len(symbols)), cancel, "market-scan")
+        for done, (symbol, future) in enumerate(futures, start=1):
+            if on_progress and (done % 25 == 0 or done == len(symbols)):
+                on_progress(done, len(symbols))
             try:
                 history = future.result()
                 indicators = calculate_indicators(history)
@@ -739,6 +1018,8 @@ def _scan_stocks(
                 requests.RequestException,
                 ValueError,
             ) as error:
+                if cancel.is_set():
+                    raise CancelledError() from None
                 reason = _failure_reason(error)
                 if reason == _FAILURE_TEMPORARY:
                     log_failure(f"Public market scan for {symbol}", error)
@@ -891,6 +1172,8 @@ def _render_scanner(
     )
     prefix = scope.lower().replace(" ", "_")
     _restore_scanner_state(prefix)
+    _collect_scan_job(prefix, scope)
+    jobs = st.session_state.setdefault("_market_scan_jobs", {})
     with st.container(horizontal=True, vertical_alignment="center"):
         refresh_symbols = st.button(
             "Refresh stock list",
@@ -1016,53 +1299,43 @@ def _render_scanner(
             key=f"market_{prefix}_scan_button",
             type="primary",
             icon=":material/troubleshoot:",
-            disabled=not bool(symbols),
+            disabled=not bool(symbols) or prefix in jobs,
             help="Fetch delayed public daily candles and evaluate the selected stocks.",
         )
-
-    scan_requested = scan_clicked
-    results: list[dict[str, object]] = []
-    failures: dict[str, str] = {}
-    if scan_requested:
-        progress = st.progress(0.0, text=f"Reviewing {len(symbols):,} stock(s)…")
-
-        def _update(done: int, total: int) -> None:
-            progress.progress(
-                done / total, text=f"Reviewed {done:,} of {total:,} stocks…"
-            )
-
-        results, failures = _scan_stocks(symbols, current_filters, _update)
-        progress.empty()
 
     results_key = f"market_{prefix}_scan_results"
     failures_key = f"market_{prefix}_scan_failures"
     filters_key = f"market_{prefix}_scan_filters"
     symbols_key = f"market_{prefix}_scan_symbols_used"
     contexts_key = f"market_{prefix}_scan_contexts"
-    if scan_requested:
-        identities = _scanner_identities(results, master, scope)
-        analytics_available = bool(str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip())
-        context_cache = st.session_state.setdefault("stock_context_cache", {})
-        if not isinstance(context_cache, dict):
-            context_cache = {}
-            st.session_state["stock_context_cache"] = context_cache
-        if identities:
-            with st.spinner(f"Updating local market context for {len(identities):,} stock(s)…"):
-                refresh_holding_contexts(context_cache, set(identities.values()),
-                                         analytics_available=analytics_available)
-        st.session_state[contexts_key] = {
-            symbol: (*identity, analytics_available)
-            for symbol, identity in identities.items()
-        }
-        st.session_state[results_key] = results
-        st.session_state[failures_key] = failures
-        st.session_state[filters_key] = current_filters.copy()
-        st.session_state[symbols_key] = symbols.copy()
-        if scope == "Equities":
-            st.session_state.market_ai_candidates = _ai_recommendation_candidates(
-                results
-            )
-            st.session_state.market_ai_candidates_updated_at = datetime.now()
+    error_key = f"market_{prefix}_scan_error"
+    if scan_clicked and prefix not in jobs:
+        if not _SCAN_SLOTS.acquire(blocking=False):
+            st.session_state[error_key] = "Scanner is busy. Please try again shortly."
+        else:
+            try:
+                upstox_token = str(configured_value("UPSTOX_ANALYTICS_TOKEN", "") or "").strip()
+                cache = st.session_state.get("stock_context_cache", {})
+                cache = cache.copy() if isinstance(cache, dict) else {}
+                progress = _ScanProgress()
+                cancel = Event()
+                job_symbols = list(symbols)
+                job_filters = current_filters.copy()
+                future = _SCAN_EXECUTOR.submit(
+                    _run_scan_job, job_symbols, job_filters, master.copy(deep=True),
+                    scope, upstox_token, cache, progress, cancel,
+                )
+                future.add_done_callback(lambda future: _scan_job_finished(future, cancel))
+                jobs[prefix] = {"future": future, "progress": progress, "cancel": cancel,
+                                "symbols": job_symbols, "filters": job_filters}
+                st.session_state.pop(error_key, None)
+            except (RuntimeError, ValueError, TypeError, OSError) as error:
+                _SCAN_SLOTS.release()
+                st.session_state[error_key] = log_failure("Starting market scan", error)
+    if st.session_state.get(error_key):
+        st.error(st.session_state[error_key])
+    if prefix in jobs:
+        _scan_job_status(prefix, scope)
 
     previous_results = st.session_state.get(results_key, [])
     previous_filters = st.session_state.get(filters_key)
@@ -1114,6 +1387,7 @@ def _render_scanner(
             payload, config = build_scan_table_payload(matches, labels)
             context_keys = st.session_state.get(contexts_key, {})
             context_cache = st.session_state.get("stock_context_cache", {})
+            snapshot = st.session_state.get(f"market_{prefix}_scan_context_snapshot", {})
             contexts = {}
             if isinstance(context_keys, dict) and isinstance(context_cache, dict):
                 now = datetime.now(timezone.utc)
@@ -1122,14 +1396,21 @@ def _render_scanner(
                     identity = context_keys.get(symbol)
                     if not isinstance(identity, tuple) or len(identity) != 4:
                         continue
-                    entry = context_cache.get(identity)
-                    if (isinstance(entry, tuple) and len(entry) == 2
-                            and isinstance(entry[0], datetime) and entry[0].tzinfo is not None
-                            and now - entry[0] < CONTEXT_TTL and isinstance(entry[1], dict)):
-                        contexts[symbol] = entry[1]
+                    candidates = [context_cache.get(identity)]
+                    if isinstance(snapshot, dict):
+                        candidates.append(snapshot.get(identity))
+                    valid = [entry for entry in candidates
+                             if isinstance(entry, tuple) and len(entry) == 2
+                             and isinstance(entry[0], datetime) and entry[0].tzinfo is not None
+                             and isinstance(entry[1], dict)]
+                    if valid:
+                        entry = max(valid, key=lambda value: value[0])
+                        contexts[symbol] = dict(entry[1])
+                        if now - entry[0] >= CONTEXT_TTL:
+                            contexts[symbol]["_scanner_stale"] = True
                     else:
                         contexts[symbol] = {"error": (
-                            "Context expired or is unavailable; run the scan again to refresh it."
+                            "Context is unavailable; run the scan again to refresh it."
                         )}
             config = _append_scan_context(payload, config, contexts)
             config["showFilters"] = False
@@ -1146,9 +1427,28 @@ def _render_scanner(
                 for row in matches
             )
             if failed_contexts:
+                rate_limited = any(
+                    isinstance(context, dict)
+                    and "HTTP 429 (rate limit)" in str(context.get("error", ""))
+                    for context in contexts.values()
+                )
+                if rate_limited:
+                    st.warning(
+                        f"Context ingestion stopped by a provider rate limit. "
+                        f"Context is unavailable for {failed_contexts:,} stock(s); "
+                        "scan signals are still shown. Wait before retrying."
+                    )
+                else:
+                    st.warning(
+                        f"Local market context was unavailable for {failed_contexts:,} "
+                        "stock(s); scan signals are still shown. Open a row for details."
+                    )
+            stale_contexts = sum(bool(context.get("_scanner_stale"))
+                                 for context in contexts.values())
+            if stale_contexts:
                 st.warning(
-                    f"Local market context was unavailable for {failed_contexts:,} "
-                    "stock(s); scan signals are still shown. Open a row for details."
+                    f"Local market context and gate are stale for {stale_contexts:,} "
+                    "stock(s); the retained snapshots are shown. Run a new scan to refresh them."
                 )
         else:
             st.info(empty_message)

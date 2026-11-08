@@ -2,14 +2,19 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import date, datetime, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
-from services.stock_context import _quote_matches_stream_session, fetch_and_build_market_context, main
+from services.stock_context import (
+    _daily_history,
+    _quote_matches_stream_session,
+    fetch_and_build_market_context,
+    main,
+)
 from services.stock_context_models import InvestmentHorizon, local_gatekeeper, run_triggered_analysis
 from services.stock_context_stream import UpstoxMicrostructureStream
 
@@ -71,6 +76,37 @@ class ContextIntegrationTests(unittest.TestCase):
         for value in (None, True, "bad", "2026-01-05T09:30:00",
                       "2026-01-04T09:30:00+05:30"):
             self.assertFalse(_quote_matches_stream_session({"timestamp": value}, tick))
+
+    @patch("services.stock_context_financials.calculate_financial_metrics")
+    def test_mixed_date_and_datetime_yahoo_indexes_are_normalized(self, financial):
+        financial.return_value = {
+            "piotroski_f_score": 5, "altman_z_score": 3,
+            "revenue_growth_yoy": None, "earnings_growth_yoy": None,
+            "earnings_quality_score": None,
+        }
+
+        class MixedDateTicker(FakeTicker):
+            def history(self, **kwargs):
+                frame = super().history(**kwargs)
+                frame.index = pd.Index(
+                    [
+                        timestamp.date()
+                        if index % 2
+                        else timestamp.to_pydatetime().replace(tzinfo=timezone.utc)
+                        for index, timestamp in enumerate(frame.index)
+                    ],
+                    dtype=object,
+                )
+                return frame
+
+        raw = MixedDateTicker("TEST").history()
+        history = _daily_history(raw, "TEST")
+        self.assertIsInstance(history.index, pd.DatetimeIndex)
+        context = fetch_and_build_market_context(
+            "TEST", InvestmentHorizon.LONG_TERM_EQUITY,
+            yahoo_factory=MixedDateTicker,
+        )
+        self.assertIsNotNone(context.technicals.sma_200)
 
     @patch("services.stock_context_financials.calculate_financial_metrics")
     def test_short_history_allows_llm_with_skipped_divergence_warning(self, financial):

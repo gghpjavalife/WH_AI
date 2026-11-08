@@ -15,6 +15,20 @@ def _app():
 
 
 class CartWorkspaceTests(unittest.TestCase):
+    def test_stale_component_callback_is_ignored(self):
+        with patch("features.cart.workspace.st.session_state", {
+            "stock_cart": [],
+        }), patch("features.cart.workspace.st.warning") as warning:
+            _row_event("removed-stock", "removed-widget")
+            warning.assert_not_called()
+
+        with patch("features.cart.workspace.st.session_state", {
+            "removed-widget": {"event": {"action": "remove"}},
+            "stock_cart": [],
+        }), patch("features.cart.workspace.st.warning") as warning:
+            _row_event("removed-stock", "removed-widget")
+            warning.assert_not_called()
+
     def test_quantity_validation_and_cart_actions(self):
         state = {"stock_cart": [
             {"id": "a", "ticker": "AAA", "quantity": -2, "holding_quantity": 2.5}
@@ -45,18 +59,30 @@ class CartWorkspaceTests(unittest.TestCase):
         self.assertTrue(_valid_quantity({"holding_quantity": 0}, -11))
 
     def test_names_and_currency_estimate(self):
-        self.assertEqual(_display_name({"name": "BSE · BSE"}), "BSE")
+        self.assertEqual(_display_name({"ticker": "BSE", "name": "BSE · BSE"}), "BSE · BSE")
+        self.assertEqual(_display_name({"ticker": "ABC", "name": "Company"}), "ABC · Company")
+        self.assertEqual(
+            _display_name({"ticker": "COFORGE.NS", "name": "COFORGE · Coforge Limited (NSE)"}),
+            "COFORGE · Coforge Limited (NSE)",
+        )
         self.assertEqual(_display_name({"name": "ABC · Company"}), "ABC · Company")
         item = {"ticker": "ABC.NS", "quantity": -3,
                 "stock_detail": {"row": {"price": 50}, "config": {}}}
         self.assertEqual(_estimate_text(item), "Estimated: 3 × LTP ₹50.00 = ₹150.00")
         item["ticker"] = "ABC"
         self.assertEqual(_estimate_text(item), "Estimated: 3 × LTP 50.00 = 150.00 (currency unknown)")
+        item["name"] = "ABC · Example Ltd (NSE)"
+        self.assertEqual(_estimate_text(item), "Estimated: 3 × LTP ₹50.00 = ₹150.00")
+        item["name"] = ""
+        item["stock_detail"]["row"]["currency"] = "INR"
+        self.assertEqual(_estimate_text(item), "Estimated: 3 × LTP ₹50.00 = ₹150.00")
 
     def test_cart_totals_and_details_remain_accessible(self):
         app = _app()
         app.session_state["stock_cart"] = [
-            {"id": "a", "ticker": "AAA.NS", "signal": "BUY", "quantity": 3,
+            {"id": "a", "ticker": "PGIL",
+             "name": "PGIL · Pearl Global Industries Limited (NSE)",
+             "signal": "BUY", "quantity": 3,
              "stock_detail": {"row": {"price": 125.5}, "config": {}}},
             {"id": "b", "ticker": "BBB.BO", "signal": "SELL", "quantity": -2,
              "holding_quantity": 10, "stock_detail": {"row": {"price": 50}, "config": {}}},
@@ -129,3 +155,7 @@ class CartWorkspaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('readonly aria-label="Percentage of holding"', ROW_HTML)
         self.assertIn(".row{display:flex", ROW_CSS)
+        self.assertIn("@media(max-width:760px)", ROW_CSS)
+        self.assertIn('grid-template-areas:"stock actions" "quantities quantities" "estimate estimate"', ROW_CSS)
+        self.assertIn("touch-action:manipulation", ROW_CSS)
+        self.assertIn('<div class="quantities">', ROW_HTML)
