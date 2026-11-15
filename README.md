@@ -47,6 +47,209 @@ parallel requests and separate progress indicators. You can switch workspaces
 while they run. Large universes can still take time and may hit provider rate
 limits; context snapshots retain their original timestamps and may be stale.
 
+## Stage 0 market-data hydration
+
+At session start, the browser checks a 12-hour Stage 0 cache before the server
+contacts any upstream provider. The epoch and five macro anchors
+(`^INDIAVIX`, `^NSEI`, `INR=X`, `BZ=F`, and `GC=F`) occupy only two small
+`localStorage` entries; the Upstox NSE/BSE equity master is stored in the
+separate `GGHP_LocalStore` IndexedDB database. A stale or empty browser cache
+uses the shared server snapshot when available, then a background refresh
+downloads Upstox's compressed
+[instrument master](https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz)
+and a five-day Yahoo Finance macro batch. Scanners prefer this cached master;
+while it is unavailable, only broker-mapped symbols are offered rather than
+issuing uncoordinated exchange-list requests.
+
+The app is Streamlit rather than an HTTP API service, so bootstrap is an
+in-process background operation coordinated across sessions and server
+processes by a SQLite lease; it does not add a `/api/stage0/bootstrap` route.
+The SQLite database also persists the fundamentals queue and per-symbol
+snapshots. Fundamentals run in batches of 15, with 2.5–4.5 seconds of jitter
+between successful batches, and resume after restarts. A provider HTTP 429
+returns the batch to `PENDING` and pauses the worker for 60 seconds. Set
+`STAGE0_CACHE_PATH` to a persistent local-volume path if the deployment does
+not preserve files across restarts. Browser and server caches are local to
+their respective browser or app deployment; the app does not upload browser
+cache data to another user's storage. Completed fundamentals are eligible for
+refresh after seven days.
+
+Stage 0 reduces repeated bootstrap traffic; public providers can still throttle
+requests, so it cannot guarantee zero HTTP 429 responses. The instrument master
+is a current-universe snapshot, not historical delisting/suspension coverage;
+it also does not supply point-in-time filing timestamps. Yahoo fundamentals
+may be incomplete, and missing values stay unknown rather than being treated as
+zero. Historical candles and point-in-time corporate filings remain outside
+this stage.
+
+## Stage 1 live market pulse
+
+`services.stage1_live_pulse.fetch_live_market_pulse` accepts Stage 0 Upstox
+instrument keys and an authenticated Upstox access token. It sends at most 500
+keys per request to Upstox's v2 full-quote endpoint, with a maximum of three
+concurrent batches, staggered starts, and bounded handling for 429 and server
+errors. Quotes include OHLCV, average price/VWAP, top-level bid/ask prices and
+sizes, circuit limits, and a circuit-lock flag.
+
+`get_stage1_pulse_cached` uses the Stage 0 SQLite path by default, with a
+subset-specific snapshot and SQLite refresh lease to avoid duplicate calls
+during Streamlit reruns or concurrent sessions. It also uses
+`st.session_state` when called inside a Streamlit session; callers outside
+Streamlit can pass a mutable mapping explicitly or rely on SQLite alone.
+Snapshots have a 180-second default TTL during market hours and at least a
+one-hour TTL when closed; a failed closed-market refresh can return the prior
+snapshot with `source = "STALE_CACHE"`. Provide the liquid instrument-key
+subset to fetch: Stage 0 does not itself rank or identify 2,500 liquid stocks.
+Batching reduces calls substantially, but Upstox can still throttle requests
+and does not guarantee that 429 responses never occur.
+
+## Stage 2 local features and Jev gatekeeper
+
+`services.stage2_feature_gatekeeper` provides a deterministic, network-free
+liquid-universe selector, 22 daily technical indicators, and a first-phase
+gatekeeper. `run_stage2_batch` takes the Stage 0 universe, Stage 1 quote mapping,
+daily OHLCV history keyed by instrument key, and optional cached fundamentals
+and 20-day turnover metrics. It only uses these supplied snapshots; it does not
+fetch or query external services. Pass the quote dictionary from the Stage 1
+result's `quotes` field as `live_quotes`. If a live quote timestamp falls on
+the final history candle's date, that candle is replaced rather than double-counted.
+Insufficient history rejects the candidate; unavailable fundamental risk
+metrics remain unknown and are not treated as zero.
+Pass `session_state=st.session_state` to publish the decisions by instrument
+key for the scanner's explicit Stage 4 action.
+
+The selector filters to NSE/BSE equity instruments, ranks by observed average
+turnover when supplied, and prefers NSE when turnover is unavailable. Stage 0
+currently does not cache daily history, turnover rankings, Altman Z scores, or
+promoter pledges, so those must be provided by a future local-cache stage;
+without turnover observations the selector cannot attest that a symbol is
+liquid or active. The technicals therefore require caller-provided history, and
+the gatekeeper's fundamental checks run only when those values are present.
+Runtime depends on candidate count, history length and machine; Stage 2 does
+not promise a sub-500 ms run for a 2,500-symbol universe.
+
+### Equity scanner pipeline
+
+The Equity market scanner is the only UI surface that runs Stages 0–4. It
+keeps the universe picker, individual-stock picker, five explicit stage
+buttons, and results table visible before or after data is available. Each
+stage button includes its completion count, status, and hover help. The
+Technical screen button has an inline Jev-rules edit control.
+Buttons are green when ready, red on failure, blue when a refresh/prerequisite
+is needed, and uncolored before the stage is loaded.
+
+Stage 0 refreshes the Stage 0 universe only when stale and incrementally syncs
+daily candles for the selected subset when an Upstox token is available. The
+action uses the cached Stage 0 NSE/BSE equity master, ranks/deduplicates it
+with the Stage 2 liquid-universe selector, and caps the request at 2,500
+listings. Selecting a universe starts Stages 0, 1, and 2 in sequence; Stage 0
+runs in a background job and checkpoints each completed symbol. Stage 3
+automatically enriches all stocks that pass Stage 2, with ten stocks fetched
+concurrently and live progress; concurrency is fixed at ten to protect provider
+rate limits. Only Stage 2-passed stocks are shown
+in the table. Expanding a stock row shows its information in category panels:
+company/listing, live quote, all 22 technical indicators with explanations,
+Jev rules and decision, fundamentals, options, analyst outlook, news, market
+context, and any generated AI thesis. Details stay inside the expanded stock
+row rather than appearing as a separate page section.
+The first four stage controls are progress indicators; the Stage 4 AI thesis is
+the only manual stage action and generates a thesis for every Stage 2-passed
+stock with available Stage 3 context, sequentially in the background. Each
+compact prompt includes the full Stage 2-passed candidate list for comparison.
+Generated confidence scores appear immediately after ticker and assessed rows
+sort highest-confidence first. Automatic work is keyed to the selected universe
+and is not restarted on ordinary Streamlit reruns.
+
+Hovering each pipeline button describes its inputs, data fetched, local
+processing, and cache/trigger behavior. The Technical screen edit control
+starts with the current Jev thresholds (price ₹20, spread 0.75%, daily volume
+50,000, ADX 18, choppiness 61.8, Piotroski 4, Altman Z 1.81, and promoter
+pledge 25%). Each rejection rule can be enabled or disabled independently;
+each toggle and threshold applies immediately without an update button.
+Minimum history remains a required data-quality threshold of at least 50 bars.
+The table's Strength column reports positive checks against the 22 calculated
+indicator slots; unavailable values are not represented as zero.
+
+The scanner defaults to all listed NSE/BSE equities. Stage counts use the
+input set for each stage: the selected universe for Stage 0, the capped
+instrument list for Stages 1–2, and Stage 2 passes for Stages 3–4. A Stage 2
+feature shortfall means local daily candles are missing or insufficient;
+refreshing live quotes cannot replace that history. Stage 3 coverage is shown
+as two feeds (derivatives and news/consensus) per passing stock. `NOT_FNO`
+means the listing has no active listed options and is expected for non-F&O
+stocks; other missing-feed statuses identify provider gaps or throttling rather
+than Stage 2 failures.
+
+Daily OHLCV rows and per-symbol sync metadata share the Stage 0 SQLite path.
+Symbols below 260 cached bars receive a 380-calendar-day backfill; symbols
+with at least 260 bars fetch from three days before their last checkpoint to
+cover boundary corrections. Up to five requests can be in flight, with at
+least 90 ms between request starts, bounded exponential retry for 429/5xx, and
+`Retry-After` support. `load_cached_history_frames` returns only local,
+ascending OHLCV DataFrames for `run_stage2_batch`; Stage 2 itself remains
+network-free.
+
+The latest completed date uses the Indian 15:30 market close and skips
+weekends; Upstox's response determines which dates actually have candles.
+There is no exchange-holiday calendar in this service, so holidays and
+special sessions can yield fewer than 260 bars. Recently listed stocks may
+also have less history than the backfill window. Provider retention,
+entitlements, network failures, and rate limits can still prevent a full
+backfill; successful symbols remain checkpointed and failed symbols can be
+retried explicitly.
+
+## Stage 3 filtered-stock enrichment
+
+Stage 3 automatically enriches every stock that passed Stage 2 after the
+technical screen finishes. It uses ten concurrent stocks for independent
+provider work, while Upstox options calls are globally paced at no more than
+two requests per second within this process. HTTP 429 and 5xx responses receive
+bounded retries; `Retry-After` is honored for waits of up to ten seconds, and
+longer server-directed waits are surfaced with the endpoint and retry time.
+Rate-limited cache entries expire after the provider's retry interval (minimum
+30 seconds) rather than the normal 15-minute TTL. Stage 3 reports completed and
+recent-symbol progress and reuses the per-listing SQLite cache.
+Upstox option contracts/chain and Yahoo Finance profile, analyst consensus,
+and recent headlines are loaded independently. The nearest non-expired option
+expiry is selected, and chain metrics include OI/volume PCR, max pain, ATM IV,
+and available ATM Greeks. A listing without an active chain is marked
+`NOT_FNO`; this expected non-F&O status is explained in coverage details but
+does not by itself mark the entire enrichment stage as needing refresh. Rate
+limits and other provider failures stay explicit and require attention.
+
+The SQLite snapshot uses a 15-minute default TTL and per-result lease, and its
+key includes a one-way fingerprint of the Upstox token so tokens are never
+stored and different connected accounts do not share an entitlement-specific
+snapshot. A missing Upstox token still permits Yahoo enrichment, with
+derivatives reported unavailable. Stage 3 provides best-effort fields, not
+100% data coverage: Yahoo/Upstox can omit or throttle data, and options
+availability depends on provider entitlements and contract coverage.
+
+## Stage 4 governed AI thesis
+
+`services.stage4_ai_thesis` builds a compact Pydantic input only after the
+Jev firewall confirms a valid Stage 1 quote, an unlocked instrument, and a
+passing Stage 2 decision. A stale-but-valid quote is allowed for manual analysis,
+with its age disclosed as a caveat. The service records macro, quote, and enrichment ages,
+keeps unavailable sections explicit, and sanitizes Gemini's structured output
+for confidence bounds and directional entry/stop/target geometry. Gemini uses
+the `google-genai` SDK with `gemini-3.8-flash` by default; configure
+`GEMINI_API_KEY` in the project-root `.env` or environment.
+
+The scanner's Stage 4 button runs only after a Stage 2-passed result-table row
+has been selected and its Stage 3 enrichment is ready. No model call occurs
+automatically. The action reuses the Stage 1 quote and Stage 2 decision
+snapshots from the current selected-universe pipeline state. A valid but stale
+quote does not block the manual action; its age is disclosed to the model and
+included in the returned data-gap warnings. Missing/invalid quotes, circuit
+locks, or a failed Stage 2 decision still block the call.
+The Stage 4 SQLite cache keys the full governed context, model, and a one-way
+API-key fingerprint; its default 15-minute TTL and database lease prevent
+duplicate charges from reruns or concurrent clicks. API keys are never stored.
+Explicitly requesting a refresh is the only supported way to bypass a valid
+cached thesis. AI output is informational and is not an order or personalized
+investment recommendation.
+
 The in-memory service API `services.universe_scan.async_execute_universe_scan`
 accepts a list of objects with `symbol`, optional `instrument_key`, and optional
 `horizon`, plus an Upstox analytics token. It returns one JSON string per input

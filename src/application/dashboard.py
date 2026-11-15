@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from math import isfinite
@@ -70,12 +71,20 @@ from services.analysis_jobs import (
     submit_analysis_task,
     submit_portfolio_analysis,
 )
+from services.stage0_bootstrap import (
+    enqueue_fundamentals,
+    read_stage0_cache,
+    request_stage0_refresh,
+    stage0_cache_is_fresh,
+    start_fundamentals_worker,
+)
 from services.user_settings import load_user_settings
 from services.database import DatabaseError, DatabaseSecurityError
 from storage import StorageRequestPending, get_storage_provider
 from storage.indexeddb_provider import (
     has_pending_browser_write,
     process_browser_storage_bridge,
+    stage0_storage_component,
 )
 from security.oauth import consume_oauth_state_context, create_oauth_state
 from core.config import settings
@@ -256,6 +265,7 @@ def _initialize_session() -> None:
         "pending_broker_adapter": None, "pending_login_url": None,
         "pending_redirect_url": None, "pending_oauth_fingerprint": None,
         "pending_oauth_expires_at": None,
+        "_stage0_bootstrap": {"browser_checked": False},
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -314,6 +324,141 @@ def _tenant_identifier() -> str:
         if email or subject:
             return email or subject
     return "local-user"
+
+
+def _stage0_use_snapshot(snapshot: dict[str, Any]) -> None:
+    state = st.session_state.setdefault("_stage0_bootstrap", {})
+    snapshot_epoch = int(snapshot["server_epoch"])
+    if snapshot_epoch > int(state.get("server_epoch") or 0):
+        state["full_rerun_needed"] = True
+    state["server_epoch"] = snapshot_epoch
+    state["universe"] = snapshot["universe"]
+    state["macro"] = snapshot["macro"]
+    state["status"] = "ready"
+    if not state.get("fundamentals_queued"):
+        enqueue_fundamentals(snapshot["universe"])
+        start_fundamentals_worker()
+        state["fundamentals_queued"] = True
+
+
+def _stage0_request(action: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
+    from uuid import uuid4
+
+    return {
+        "request_id": uuid4().hex,
+        "action": action,
+        "value": value,
+    }
+
+
+@st.fragment(run_every="5s")
+def _render_stage0_bootstrap() -> None:
+    """Hydrate browser-local data first, then poll nonblocking server refreshes."""
+    state = st.session_state.setdefault("_stage0_bootstrap", {})
+    request = state.get("browser_request")
+    if request is None and not state.get("browser_checked"):
+        request = _stage0_request("stage0_hydrate")
+        state["browser_request"] = request
+
+    response = stage0_storage_component(
+        request=request,
+        key="wh_ai_stage0_storage_bridge",
+    )
+    if (
+        isinstance(response, dict)
+        and request
+        and response.get("request_id") == request.get("request_id")
+    ):
+        state["browser_request"] = None
+        if request["action"] == "stage0_hydrate":
+            state["browser_checked"] = True
+            if response.get("fresh") and isinstance(response.get("universe"), list):
+                epoch = int(response.get("server_epoch") or 0)
+                snapshot = {
+                    "server_epoch": epoch,
+                    "updated_at": epoch,
+                    "universe": response["universe"],
+                    "macro": response.get("macro") or {},
+                }
+                _stage0_use_snapshot(snapshot)
+                state["full_rerun_needed"] = True
+            else:
+                if response.get("error"):
+                    state["browser_error"] = str(response["error"])
+                cached = read_stage0_cache()
+                if cached:
+                    _stage0_use_snapshot(cached)
+                    state["browser_request"] = _stage0_request(
+                        "stage0_store",
+                        {
+                            "server_epoch": cached["server_epoch"],
+                            "macro": cached["macro"],
+                            "universe": cached["universe"],
+                        },
+                    )
+                if not cached or not stage0_cache_is_fresh(cached):
+                    _schedule_stage0_refresh(state)
+                    state["status"] = "refreshing"
+        elif request["action"] == "stage0_store":
+            if response.get("error"):
+                state["browser_error"] = str(response["error"])
+            elif response.get("value") is not True:
+                state["browser_error"] = "Browser storage did not confirm the Stage 0 cache write."
+
+    cached = (
+        read_stage0_cache()
+        if state.get("status") == "refreshing"
+        else None
+    )
+    if cached:
+        current_epoch = int(state.get("server_epoch") or 0)
+        if cached["server_epoch"] > current_epoch:
+            _stage0_use_snapshot(cached)
+            state["browser_request"] = _stage0_request(
+                "stage0_store",
+                {
+                    "server_epoch": cached["server_epoch"],
+                    "macro": cached["macro"],
+                    "universe": cached["universe"],
+                },
+            )
+        if not stage0_cache_is_fresh(cached):
+            _schedule_stage0_refresh(state)
+
+    if state.get("status") == "refreshing":
+        future = state.get("refresh_future")
+        if future is not None and future.done():
+            error = future.exception()
+            if error is not None:
+                state["status"] = "error"
+                state["refresh_error"] = str(error)
+    if state.get("status") == "error" and time.time() >= float(
+        state.get("refresh_after", 0)
+    ):
+        _schedule_stage0_refresh(state)
+    if state.get("browser_error"):
+        st.warning(f"Stage 0 browser cache could not be updated: {state['browser_error']}")
+    if state.get("refresh_error"):
+        st.warning(f"Stage 0 data refresh failed: {state['refresh_error']}")
+    ready_epoch = int(state.get("server_epoch") or 0)
+    if (
+        state.get("full_rerun_needed")
+        and not state.get("browser_request")
+        and ready_epoch > 0
+    ):
+        state["full_rerun_needed"] = False
+        state["full_rerun_epoch"] = ready_epoch
+        st.rerun()
+
+
+def _schedule_stage0_refresh(state: dict[str, Any]) -> None:
+    now = time.time()
+    if now < float(state.get("refresh_after", 0)):
+        return
+    future = request_stage0_refresh()
+    state["refresh_future"] = future
+    state["refresh_after"] = now + 60
+    state["status"] = "refreshing"
 
 
 def _load_user_settings_for_user() -> None:
@@ -3173,3 +3318,6 @@ def main() -> None:
     if analysis_setup_scope:
         _render_analysis_setup_dialog(analysis_setup_scope)
     process_browser_storage_bridge()
+    stage0_state = st.session_state.get("_stage0_bootstrap", {})
+    if stage0_state.get("status") != "ready" or stage0_state.get("browser_request"):
+        _render_stage0_bootstrap()

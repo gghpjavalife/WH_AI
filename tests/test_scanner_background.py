@@ -52,6 +52,35 @@ def _universe_mock(load):
 
 
 class ScannerBackgroundTests(unittest.TestCase):
+    def test_manual_history_sync_resolves_selected_watchlist_to_liquid_keys(self):
+        universe = [
+            {
+                "symbol": "ABC",
+                "instrument_key": "NSE_EQ|ABC",
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+                "isin": "INABC",
+            },
+            {
+                "symbol": "ABC.BO",
+                "instrument_key": "BSE_EQ|ABC",
+                "segment": "BSE_EQ",
+                "instrument_type": "EQ",
+                "isin": "INABC",
+            },
+            {
+                "symbol": "OTHER",
+                "instrument_key": "NSE_EQ|OTHER",
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+                "isin": "INOTHER",
+            },
+        ]
+
+        keys = scanner._selected_history_instrument_keys(["ABC.NS"], universe)
+
+        self.assertEqual(keys, ["NSE_EQ|ABC"])
+
     def test_context_rate_limit_skips_remaining_batches_and_keeps_scan_results(self):
         identities = {
             f"S{i}": (f"S{i}.NS", None, "horizon") for i in range(70)

@@ -18,6 +18,20 @@ _storage_component = components.declare_component(
     "wh_ai_indexeddb_storage",
     path=str(_COMPONENT_PATH),
 )
+_stage0_component = components.declare_component(
+    "wh_ai_stage0_storage",
+    path=str(_COMPONENT_PATH),
+)
+
+
+def stage0_storage_component(*, request: dict[str, Any], key: str) -> Any:
+    """Run the Stage 0 browser-localStorage/IndexedDB bridge."""
+    return _stage0_component(
+        request=request,
+        default=None,
+        key=key,
+        height=1,
+    )
 
 
 def _state() -> Any:

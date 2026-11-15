@@ -8,7 +8,9 @@ from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecut
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
+import json
 import re
+import sqlite3
 from threading import BoundedSemaphore, Event, Lock
 from uuid import uuid4
 
@@ -24,6 +26,23 @@ from features.analysis.stock_context import (
 )
 from services.stock_context_models import InvestmentHorizon
 from services.stock_context import ProviderRateLimitError
+from services.stage0_bootstrap import (
+    get_fundamental_snapshot,
+    read_stage0_cache,
+    request_stage0_refresh,
+    universe_frame,
+)
+from services.stage4_ai_thesis import (
+    JevFirewallError,
+    build_governed_ai_payload,
+    generate_governed_ai_thesis_cached,
+)
+from services.stage3_lazy_enrichment import get_stage3_enrichment_cached
+from services.stage0_history_sync import (
+    HistorySyncError,
+    sync_daily_history_sync,
+)
+from services.stage2_feature_gatekeeper import select_liquid_universe
 from .scan_table import show_scan_table
 from .market_data import (
     MarketDataError,
@@ -79,6 +98,36 @@ DEFAULT_SCAN_SYMBOLS = [
 
 
 def _load_indian_equity_master(*, refresh: bool = False) -> pd.DataFrame:
+    if refresh:
+        future = request_stage0_refresh(force=True)
+        stage0_session = st.session_state.get("_stage0_bootstrap")
+        if isinstance(stage0_session, dict):
+            stage0_session["status"] = "refreshing"
+            stage0_session["refresh_future"] = future
+            stage0_session["refresh_after"] = (
+                datetime.now(timezone.utc).timestamp() + 60
+            )
+    stage0_state = st.session_state.get("_stage0_bootstrap")
+    session_universe = (
+        stage0_state.get("universe")
+        if isinstance(stage0_state, dict)
+        else None
+    )
+    staged_master = universe_frame(session_universe) if session_universe else universe_frame()
+    if not staged_master.empty:
+        return staged_master
+    if isinstance(stage0_state, dict):
+        return pd.DataFrame(
+            [
+                {
+                    "Symbol": symbol,
+                    "Company": symbol,
+                    "ISIN": "",
+                    "Exchange": "Broker map",
+                }
+                for symbol in sorted(TICKER_MAP)
+            ]
+        )
     if refresh:
         fetch_indian_equity_master.clear()
         fetch_nse_equity_master.clear()
@@ -649,12 +698,20 @@ def build_scan_table_payload(
             for key, _, template in _TOOLTIP_FORMATS
             if key in row
         }
+        pipeline_details = row.get("Pipeline_details")
+        pipeline_details = (
+            pipeline_details if isinstance(pipeline_details, dict) else {}
+        )
+        additional_indicators = pipeline_details.get("indicators")
+        if isinstance(additional_indicators, dict):
+            indicators.update(additional_indicators)
         payload.append(
             {
                 "ticker": symbol,
                 "cartTicker": display_ticker,
                 "label": cart_label,
                 "displayTicker": display_ticker,
+                "ai_confidence": _num(row, "AI_confidence"),
                 "currency": currency.strip().upper() if isinstance(currency, str) else None,
                 "price": _num(row, "Price"),
                 "chg": _num(row, "Daily_change_%"),
@@ -670,6 +727,11 @@ def build_scan_table_payload(
                 "reason": str(row.get("Reason", "")),
                 "checks": checks,
                 "ind": indicators,
+                "extraGroups": pipeline_details.get("groups", []),
+                "extraSections": pipeline_details.get("sections", []),
+                "contextInfo": pipeline_details.get("context_info", {}),
+                "groupRatings": pipeline_details.get("group_ratings", {}),
+                "replaceGroups": pipeline_details.get("replace_groups", False),
                 "raw": [
                     "" if row.get(key) is None else row.get(key) for key in raw_keys
                 ],
@@ -748,6 +810,9 @@ def _render_scan_failures(failures: object) -> None:
 SCAN_MAX_WORKERS = 8
 SCAN_CONTEXT_BATCH_SIZE = 64
 _SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="scanner-job")
+_HISTORY_SYNC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="daily-history-sync"
+)
 _SCAN_SLOTS = BoundedSemaphore(4)
 _SCAN_REQUEST_SLOTS = BoundedSemaphore(16)
 
@@ -1134,7 +1199,8 @@ def _ai_recommendation_candidates(
 
 
 _TRANSIENT_KEYS = ("_scan_button", "_scan_nse_button", "_refresh_universe",
-                   "_additional_filters_button", "_context_viewer_download")
+                   "_additional_filters_button", "_context_viewer_download",
+                   "_sync_history")
 
 
 def _restore_scanner_state(prefix: str) -> None:
@@ -1161,6 +1227,31 @@ def _save_scanner_state(prefix: str) -> None:
         and key.startswith(start)
         and not key.endswith(_TRANSIENT_KEYS)
     }
+
+
+def _selected_history_instrument_keys(
+    symbols: list[str], stage0_universe: list[dict[str, object]]
+) -> list[str]:
+    selected_bases = {
+        str(symbol).strip().upper().removesuffix(".NS").removesuffix(".BO")
+        for symbol in symbols
+        if isinstance(symbol, str) and symbol.strip()
+    }
+    candidates = []
+    for instrument in stage0_universe:
+        if not isinstance(instrument, dict):
+            continue
+        symbol = str(
+            instrument.get("symbol") or instrument.get("trading_symbol") or ""
+        ).strip().upper()
+        base_symbol = symbol.removesuffix(".NS").removesuffix(".BO")
+        if base_symbol in selected_bases:
+            candidates.append(instrument)
+    return select_liquid_universe(
+        candidates,
+        max_instruments=2500,
+        min_avg_turnover_inr=0,
+    )
 
 
 def _render_scanner(
@@ -1293,7 +1384,41 @@ def _render_scanner(
         "missing context is reported without removing scanned rows."
     )
     current_filters = OPEN_FILTERS.copy()
+    history_job_key = f"_history_sync_job_{prefix}"
+    history_job = st.session_state.get(history_job_key)
+    if history_job is not None and history_job.done():
+        try:
+            history_result = history_job.result()
+        except HistorySyncError as error:
+            st.error(str(error))
+        except (
+            OSError,
+            RuntimeError,
+            sqlite3.Error,
+            TimeoutError,
+            ValueError,
+        ) as error:
+            st.error(f"Daily history sync failed: {error}")
+        else:
+            st.success(
+                f"Daily history sync completed for {history_result['synced']} "
+                f"listing(s); skipped {history_result['skipped']} fresh listing(s)."
+            )
+        st.session_state.pop(history_job_key, None)
+        history_job = None
     with st.container(horizontal=True, vertical_alignment="center"):
+        sync_history_clicked = st.button(
+            "Sync daily history",
+            key=f"market_{prefix}_sync_history",
+            icon=":material/history:",
+            disabled=not bool(symbols) or (
+                history_job is not None and not history_job.done()
+            ),
+            help=(
+                "Manually backfill or incrementally sync daily candles for the "
+                "selected watchlist, capped at 2,500 Stage 0 equity listings."
+            ),
+        )
         scan_clicked = st.button(
             "Scan selected stocks",
             key=f"market_{prefix}_scan_button",
@@ -1301,6 +1426,63 @@ def _render_scanner(
             icon=":material/troubleshoot:",
             disabled=not bool(symbols) or prefix in jobs,
             help="Fetch delayed public daily candles and evaluate the selected stocks.",
+        )
+    if sync_history_clicked:
+        stage0_state = st.session_state.get("_stage0_bootstrap")
+        try:
+            snapshot = read_stage0_cache()
+        except sqlite3.Error as error:
+            st.error(f"Could not read the Stage 0 instrument cache: {error}")
+            snapshot = None
+        stage0_universe = (
+            stage0_state.get("universe")
+            if isinstance(stage0_state, dict)
+            and isinstance(stage0_state.get("universe"), list)
+            else snapshot.get("universe")
+            if isinstance(snapshot, dict)
+            else None
+        )
+        if not isinstance(stage0_universe, list):
+            st.error(
+                "Stage 0's cached instrument master is unavailable; refresh it "
+                "before syncing daily history."
+            )
+        else:
+            instrument_keys = _selected_history_instrument_keys(
+                list(symbols), stage0_universe
+            )
+            broker_name = str(st.session_state.get("broker_name") or "")
+            token = (
+                st.session_state.get("token")
+                if broker_name.casefold() == "upstox"
+                else configured_value("UPSTOX_ANALYTICS_TOKEN", "")
+            )
+            token = token.strip() if isinstance(token, str) else ""
+            if not instrument_keys:
+                st.warning(
+                    "No selected watchlist symbols match the cached NSE/BSE "
+                    "equity instrument master."
+                )
+            elif not token:
+                st.warning(
+                    "Connect Upstox or configure UPSTOX_ANALYTICS_TOKEN to sync "
+                    "daily history."
+                )
+            else:
+                st.session_state[history_job_key] = _HISTORY_SYNC_EXECUTOR.submit(
+                    sync_daily_history_sync,
+                    instrument_keys,
+                    token,
+                )
+                st.info(
+                    f"Started a manual history sync for {len(instrument_keys):,} "
+                    "selected equity listing(s). Completed symbols checkpoint in "
+                    "SQLite as the sync runs."
+                )
+    elif history_job is not None and not history_job.done():
+        st.info(
+            "Daily history sync is running in the background. Completed symbols "
+            "are checkpointed and will be skipped on the next sync."
         )
 
     results_key = f"market_{prefix}_scan_results"
@@ -1420,7 +1602,307 @@ def _render_scanner(
                 session_key = uuid4().hex
                 st.session_state["_scanner_table_session_key"] = session_key
             config["tableKey"] = f"scanner:{session_key}:{prefix}"
-            show_scan_table(payload, config)
+            table_key = config["tableKey"]
+
+            def load_selected_stock_enrichment() -> None:
+                component_state = st.session_state.get(table_key)
+                event = (
+                    component_state.get("select_stock")
+                    if isinstance(component_state, dict)
+                    else None
+                )
+                if isinstance(event, str):
+                    try:
+                        event = json.loads(event)
+                    except json.JSONDecodeError:
+                        return
+                if not isinstance(event, dict):
+                    return
+                ticker = str(event.get("ticker") or "").strip().upper()
+                if not ticker:
+                    return
+                row = next(
+                    (
+                        item
+                        for item in matches
+                        if str(item.get("Ticker", "")).strip().upper() == ticker
+                    ),
+                    None,
+                )
+                if row is None:
+                    return
+                identity = (
+                    context_keys.get(ticker)
+                    if isinstance(context_keys, dict)
+                    else None
+                )
+                instrument_key = (
+                    identity[1]
+                    if isinstance(identity, tuple)
+                    and len(identity) == 3
+                    and isinstance(identity[1], str)
+                    else ""
+                )
+                exchange = "BSE" if ticker.endswith(".BO") else "NSE"
+                broker_name = str(st.session_state.get("broker_name") or "")
+                token = (
+                    st.session_state.get("token")
+                    if broker_name.casefold() == "upstox"
+                    else configured_value("UPSTOX_ANALYTICS_TOKEN", "")
+                )
+                try:
+                    enrichment = get_stage3_enrichment_cached(
+                        instrument_key=instrument_key,
+                        symbol=ticker,
+                        access_token=token if isinstance(token, str) else "",
+                        exchange=exchange,
+                        spot_price=_num(row, "Price"),
+                    )
+                except (
+                    OSError,
+                    RuntimeError,
+                    sqlite3.Error,
+                    TimeoutError,
+                    ValueError,
+                ) as error:
+                    enrichment = {"error": str(error)}
+                state = st.session_state.setdefault("_stage3_stock_enrichment", {})
+                if isinstance(state, dict):
+                    state[ticker] = enrichment
+                    st.session_state[f"_stage3_selected_{prefix}"] = ticker
+
+            show_scan_table(
+                payload, config, on_select_stock=load_selected_stock_enrichment
+            )
+            selected_ticker = st.session_state.get(f"_stage3_selected_{prefix}")
+            enrichment_state = st.session_state.get("_stage3_stock_enrichment", {})
+            selected_enrichment = (
+                enrichment_state.get(selected_ticker)
+                if isinstance(enrichment_state, dict)
+                else None
+            )
+            if isinstance(selected_enrichment, dict):
+                with st.expander(
+                    f"On-demand options, news & analyst data — {selected_ticker}",
+                    expanded=True,
+                ):
+                    if selected_enrichment.get("error"):
+                        st.warning(str(selected_enrichment["error"]))
+                    else:
+                        ai_clicked = st.button(
+                            "Run AI thesis",
+                            key=f"stage4_run_ai_{prefix}_{selected_ticker}",
+                            type="primary",
+                            help=(
+                                "Runs only after an explicit click and only when fresh "
+                                "Stage 1 and passing Stage 2 snapshots are available."
+                            ),
+                        )
+                        if ai_clicked:
+                            st.session_state.pop(
+                                f"_stage4_thesis_{prefix}_{selected_ticker}", None
+                            )
+                            identity = (
+                                context_keys.get(selected_ticker)
+                                if isinstance(context_keys, dict)
+                                else None
+                            )
+                            instrument_key = (
+                                identity[1]
+                                if isinstance(identity, tuple)
+                                and len(identity) == 3
+                                and isinstance(identity[1], str)
+                                else ""
+                            )
+                            stage1_snapshot = next(
+                                (
+                                    value
+                                    for name, value in st.session_state.items()
+                                    if name.startswith("_stage1_live_pulse_")
+                                    and isinstance(value, dict)
+                                    and isinstance(value.get("quotes"), dict)
+                                    and instrument_key in value["quotes"]
+                                ),
+                                None,
+                            )
+                            stage1_quote = (
+                                stage1_snapshot["quotes"][instrument_key]
+                                if isinstance(stage1_snapshot, dict)
+                                else None
+                            )
+                            decisions = st.session_state.get(
+                                "_stage2_gatekeeper_decisions", {}
+                            )
+                            stage2_decision = (
+                                decisions.get(instrument_key)
+                                if isinstance(decisions, dict)
+                                else None
+                            )
+                            try:
+                                stage0_snapshot = read_stage0_cache()
+                                macro = (
+                                    stage0_snapshot.get("macro")
+                                    if isinstance(stage0_snapshot, dict)
+                                    else None
+                                )
+                                governed_context = build_governed_ai_payload(
+                                    instrument_key=instrument_key,
+                                    symbol=selected_ticker,
+                                    exchange=(
+                                        "BSE"
+                                        if selected_ticker.endswith(".BO")
+                                        else "NSE"
+                                    ),
+                                    stage0_macro=macro,
+                                    stage0_macro_fetched_at=(
+                                        stage0_snapshot.get("macro_updated_at")
+                                        if isinstance(stage0_snapshot, dict)
+                                        else None
+                                    ),
+                                    stage1_quote=stage1_quote,
+                                    stage1_quote_fetched_at=(
+                                        stage1_snapshot.get("fetched_at")
+                                        if isinstance(stage1_snapshot, dict)
+                                        else None
+                                    ),
+                                    stage2_decision=stage2_decision,
+                                    stage3_enrichment=selected_enrichment,
+                                    fundamentals=get_fundamental_snapshot(
+                                        selected_ticker
+                                    ),
+                                    allow_stale_quote=True,
+                                )
+                                api_key = str(
+                                    configured_value("GEMINI_API_KEY", "") or ""
+                                ).strip()
+                                with st.spinner("Generating governed AI thesis…"):
+                                    result = generate_governed_ai_thesis_cached(
+                                        governed_context,
+                                        api_key=api_key,
+                                    )
+                                thesis = result["thesis"]
+                                st.session_state[
+                                    f"_stage4_thesis_{prefix}_{selected_ticker}"
+                                ] = result
+                            except (
+                                JevFirewallError,
+                                OSError,
+                                RuntimeError,
+                                sqlite3.Error,
+                                TimeoutError,
+                                ValueError,
+                            ) as error:
+                                st.warning(str(error))
+                        thesis_result = st.session_state.get(
+                            f"_stage4_thesis_{prefix}_{selected_ticker}"
+                        )
+                        if isinstance(thesis_result, dict):
+                            thesis = thesis_result.get("thesis")
+                            if isinstance(thesis, dict):
+                                st.caption(
+                                    f"AI thesis · {thesis_result.get('cache_source', 'unknown')} "
+                                    "· informational only"
+                                )
+                                st.markdown(
+                                    f"**{thesis.get('stance', '—')}** · "
+                                    f"confidence {float(thesis.get('confidence_score', 0)):.0%} "
+                                    f"· {thesis.get('time_horizon', '—')}"
+                                )
+                                st.write(thesis.get("executive_thesis", ""))
+                                if thesis.get("entry_price") is not None:
+                                    st.caption(
+                                        f"Entry ₹{thesis['entry_price']:,.2f} · "
+                                        f"stop ₹{thesis['stop_loss']:,.2f}"
+                                        if thesis.get("stop_loss") is not None
+                                        else f"Entry ₹{thesis['entry_price']:,.2f}"
+                                    )
+                                    if thesis.get("target_price") is not None:
+                                        st.caption(
+                                            f"Target ₹{thesis['target_price']:,.2f} · "
+                                            f"risk/reward {thesis.get('risk_reward_ratio') or '—'}"
+                                        )
+                                for warning in thesis.get("data_gap_warnings", []):
+                                    st.warning(str(warning))
+                        st.caption(
+                            "Cache: "
+                            f"{selected_enrichment.get('cache_source', 'unknown')} · "
+                            "Data is provider-supplied and may be delayed or incomplete."
+                        )
+                        derivatives = selected_enrichment.get("derivatives")
+                        derivatives = derivatives if isinstance(derivatives, dict) else {}
+                        st.markdown(
+                            f"**Derivatives — {derivatives.get('status', 'UNAVAILABLE')}**"
+                        )
+                        if derivatives.get("status") == "NOT_FNO":
+                            st.info("No active options expiry is available for this listing.")
+                        elif derivatives.get("status") == "RATE_LIMITED":
+                            st.warning("Upstox rate-limited the options request; retry after a pause.")
+                        elif derivatives.get("status") == "EMPTY_CHAIN":
+                            st.info("An active expiry exists, but the provider returned no option rows.")
+                        elif derivatives.get("status") == "OK":
+                            greeks = derivatives.get("atm_greeks") or {}
+                            def metric_or_dash(value: object) -> object:
+                                return value if value is not None else "—"
+
+                            cols = st.columns(4)
+                            cols[0].metric(
+                                "PCR (OI)", metric_or_dash(derivatives.get("pcr_oi"))
+                            )
+                            cols[1].metric(
+                                "PCR (volume)",
+                                metric_or_dash(derivatives.get("pcr_volume")),
+                            )
+                            cols[2].metric(
+                                "Max pain",
+                                metric_or_dash(derivatives.get("max_pain_strike")),
+                            )
+                            cols[3].metric(
+                                "ATM IV", metric_or_dash(greeks.get("atm_iv"))
+                            )
+                            st.caption(
+                                f"Expiry: {derivatives.get('expiry', '—')} · "
+                                f"Max pain strike: {derivatives.get('max_pain_strike', '—')} · "
+                                f"Delta C/P: {greeks.get('call_delta', '—')} / "
+                                f"{greeks.get('put_delta', '—')} · Gamma: "
+                                f"{greeks.get('gamma', '—')} · Theta: "
+                                f"{greeks.get('theta', '—')} · Vega: {greeks.get('vega', '—')}"
+                            )
+                        elif derivatives.get("error"):
+                            st.warning(str(derivatives["error"]))
+
+                        news = selected_enrichment.get("news_and_consensus")
+                        news = news if isinstance(news, dict) else {}
+                        st.markdown(
+                            f"**News & analyst consensus — {news.get('status', 'UNAVAILABLE')}**"
+                        )
+                        if news.get("status") == "OK":
+                            cols = st.columns(3)
+                            cols[0].metric(
+                                "Mean target",
+                                news.get("target_mean_price")
+                                if news.get("target_mean_price") is not None
+                                else "—",
+                            )
+                            cols[1].metric(
+                                "Rating",
+                                news.get("recommendation_key")
+                                or "—",
+                            )
+                            cols[2].metric(
+                                "Analysts",
+                                news.get("analyst_count")
+                                if news.get("analyst_count") is not None
+                                else "—",
+                            )
+                            if news.get("business_summary"):
+                                st.write(news["business_summary"])
+                            for headline in news.get("recent_headlines", []):
+                                st.write(
+                                    f"- {headline.get('title', 'Untitled')} "
+                                    f"({headline.get('publisher') or 'Unknown publisher'})"
+                                )
+                        elif news.get("error"):
+                            st.warning(str(news["error"]))
             failed_contexts = sum(
                 not isinstance(contexts.get(str(row["Ticker"])), dict)
                 or not contexts[str(row["Ticker"])].get("context")
@@ -1495,20 +1977,12 @@ def render_market_scanner(
     scope: str,
     symbols: list[str] | None = None,
 ) -> None:
-    if not broker_connected:
+    if scope != "Equities":
         st.info(
-            "No broker is connected. The public NSE watchlist scanner remains "
-            "available without account credentials."
-        )
-    st.caption(
-        "Public data can be delayed. Signals are rules-based historical research, "
-        "not personalized investment advice or order instructions."
-    )
-    st.markdown("[Market data source: Yahoo Finance ↗](https://finance.yahoo.com/)")
-    if scope not in {"Equities", "Trading", "Market watchlist"}:
-        st.info(
-            f"The NSE equity scanner cannot provide valid {scope.lower()} contract "
-            "or NAV data. Instrument-specific feeds are not currently configured."
+            "The governed Stage 0–4 pipeline is available only in the Equities "
+            "market scanner."
         )
         return
-    _render_scanner(scope=scope, suggested_symbols=symbols)
+    from features.equities.pipeline import render_equity_pipeline
+
+    render_equity_pipeline(scope=scope, suggested_symbols=symbols)
