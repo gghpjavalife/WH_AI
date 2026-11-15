@@ -211,9 +211,9 @@ const $=id=>parentElement.querySelector('#'+id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const RANK={'STRONG BUY':4,'BUY':3,'HOLD':2,'SELL':1,'STRONG SELL':0,'NOT RATED':-1};
 const PILL={'STRONG BUY':'SB','BUY':'B','HOLD':'H','SELL':'S','STRONG SELL':'SS','NOT RATED':'NR'};
-const st={f:{q:'',pmin:'',pmax:'',chg:'',rmin:'',rmax:'',sig:'',m1:'',vol:'',str:'',pass:''},ranges:Object.create(null),extra:Object.create(null),key:'signal',dir:-1,page:1,size:10,open:new Set(),panelOpen:new Set(),selected:new Set()};
+const st={f:{q:'',pmin:'',pmax:'',chg:'',rmin:'',rmax:'',sig:'',m1:'',vol:'',str:'',pass:''},ranges:Object.create(null),extra:Object.create(null),key:CFG.defaultSort?.key||'signal',dir:CFG.defaultSort?.dir??-1,page:1,size:10,open:new Set(),panelOpen:new Set(),selected:new Set()};
 const sortVal={
- stock:r=>r.label.toLowerCase(),price:r=>r.price,chg:r=>r.chg,m1:r=>r.m1,vol:r=>r.vol,rsi:r=>r.rsi,
+ stock:r=>r.label.toLowerCase(),ai_confidence:r=>r.ai_confidence,price:r=>r.price,chg:r=>r.chg,m1:r=>r.m1,vol:r=>r.vol,rsi:r=>r.rsi,
  signal:r=>(RANK[r.signal]??-1)*1000+(Number(r.score)||0),strength:r=>r.total?r.pos/r.total:0,
  pass:r=>r.pass?1:0};
 let COLS;
@@ -334,13 +334,17 @@ const panelCategories={
  'Analyst consensus':'Fundamentals & outlook','Fundamental screen':'Fundamentals & outlook',
  'Corporate actions':'News & events','Recent company headlines':'News & events','Context headlines':'News & events',
  'Company profile':'Company & ownership','Ownership and trading activity':'Company & ownership',
+ 'Company and listing':'Company & ownership','Live quote':'Live market data',
+ 'Technical indicators':'Trend & momentum','Jev screening':'Jev screening',
+ 'Derivatives and options':'Derivatives','Analyst outlook':'Fundamentals & outlook',
+ 'Recent news':'News & events','AI thesis':'AI research',
  'Market and sector':'Market context','Options':'Derivatives','Futures':'Derivatives',
  'Local stock context':'Data availability','Unavailable context sections':'Data availability',
- 'Technical indicators':'Data availability','Data availability':'Data availability'
+ 'Data availability':'Data availability'
 };
-const panelOrder=['Company & ownership','Risk & intraday','Trend & momentum','Performance & volume',
- 'Fundamentals & outlook','News & events','Market context','Derivatives',
- 'Holding details','Data availability'];
+const panelOrder=['Company & ownership','Live market data','Risk & intraday','Trend & momentum',
+ 'Performance & volume','Jev screening','Fundamentals & outlook','News & events',
+ 'Market context','Derivatives','AI research','Holding details','Data availability'];
 const panelCountFields=new Set([
  'context_profile_full_time_employees','context_fundamentals_shares_outstanding',
  'context_shareholders_total_institutional_holders','context_shareholders_net_shares_bought_quarterly',
@@ -381,7 +385,7 @@ function detail(r){
   entry.parts.push({title,body});
   entry.positive+=positive;entry.rated+=rated;
  };
- [...(CFG.groups||[]),...(r.extraGroups||[])].forEach(([title,items])=>{
+ [...(r.replaceGroups?[]:(CFG.groups||[])),...(r.extraGroups||[])].forEach(([title,items])=>{
   const holdingColumns={holding_quantity:'quantity',holding_average:'average',holding_value:'holdingValue',
    holding_pnl:'pnl',holding_return:'returnPct',holding_allocation:'allocationPct'};
   const present=items.filter(([k])=>r.ind[k]&&(title!=='Holding details'||
@@ -426,7 +430,11 @@ function detail(r){
   add(section.title,`${section.note?`<p>${esc(section.note)}</p>`:''}${links}${values?`<div class="metrics-grid">${values}</div>`:''}`,
    directional.filter(item=>item.sentiment===1).length,directional.length);
  });
- if(r.checks.length)add('Research signal checks',`<details class="check-details"><summary>How the research signal was scored (${Number(r.pos)||0} positive of ${Number(r.total)||0} assessed)</summary><p>These are the original research checks and inputs; they can differ from the newer context values above.</p>${checks}</details>`);
+ if(r.checks.length&&!r.replaceGroups){
+  const unavailable=r.checks.filter(check=>check[2]==='u').length;
+  const unavailableText=unavailable?`, ${unavailable} unavailable`:'';
+  add('Research signal checks',`<details class="check-details"><summary>Technical indicators: ${Number(r.pos)||0} positive of ${Number(r.total)||0}${unavailableText}</summary><p>Values and interpretations for each calculated indicator. Unavailable values are not treated as zero.</p>${checks}</details>`);
+ }
  const groups=[...categories.entries()].sort(([a],[b])=>{
   const ai=panelOrder.indexOf(a),bi=panelOrder.indexOf(b);
   return (ai<0?panelOrder.length:ai)-(bi<0?panelOrder.length:bi)||a.localeCompare(b);
@@ -450,6 +458,7 @@ function render(){
   fields.map(f=>`<th data-k="raw:${f.index}" class="raw-head ${f.type==='number'?'num':''}" title="${esc(f.label)}">${esc(f.header)}<span class="arrow">${st.key==='raw:'+f.index?(st.dir>0?'&#9650;':'&#9660;'):''}</span><button type="button" class="remove-field" data-remove-field="${f.index}" aria-label="Remove ${esc(f.label)} column" title="Remove ${esc(f.label)} column">&times;</button></th>`).join('');
  const cell=(key,type,r)=>{
   if(key==='stock')return `<td class="name">${esc(r.displayTicker||r.ticker)}</td>`;
+  if(key==='ai_confidence')return `<td class="num ${r.ai_confidence==null?'missing':'neu'}">${r.ai_confidence==null?'—':Number(r.ai_confidence).toFixed(1)+'%'}</td>`;
   if(key==='signal')return `<td><span class="signal-value ${PILL[r.signal]||'H'}">${esc(r.signal)}</span></td>`;
   if(key==='strength')return `<td><div class="meter"><i><b style="width:${r.total?Math.round(r.pos/r.total*100):0}%"></b></i><span>${r.pos}/${r.total}</span></div></td>`;
   if(key==='pass')return `<td class="${r.pass?'pos':'neg'}">${r.pass?'&#10003;':'&#10007;'}</td>`;
@@ -615,7 +624,11 @@ $('body').onclick=e=>{
   return;
  }
  const tr=e.target.closest('tr.row');if(!tr)return;const t=tr.dataset.t;
- st.open.has(t)?st.open.delete(t):st.open.add(t);render();};
+ const opening=!st.open.has(t);
+ opening?st.open.add(t):st.open.delete(t);
+ render();
+ if(opening)setTriggerValue('select_stock',JSON.stringify({ticker:t,request_id:Date.now()}));
+};
 $('body').onchange=e=>{
  const input=e.target.closest('[data-row-select]');if(!input)return;
  const index=Number(input.dataset.rowSelect);
@@ -652,6 +665,7 @@ return {
    }
   }
   DATA=next.payload;CFG=next.config;st.selected.clear();$('cartWarning').hidden=true;buildColumns();buildFields();
+  $('addToCart').hidden=CFG.showCart===false;
   CELL.signal='<select data-f="sig" aria-label="Signal">'+opt('','All')+CFG.signals.map(s=>opt(s,s)).join('')+'</select>';
   for(const index of Object.keys(st.extra)){
    const field=rawFields.find(f=>f.index===Number(index));
@@ -857,6 +871,7 @@ def show_scan_table(
     payload: list[dict[str, object]],
     config: dict[str, object],
     on_refresh: Callable[[], None] | None = None,
+    on_select_stock: Callable[[], None] | None = None,
 ) -> None:
     """Mount the table; tableKey must uniquely identify each mounted instance."""
     key = str(config.get("tableKey", "equities-scan-table"))
@@ -882,4 +897,5 @@ def show_scan_table(
         },
         on_refresh_change=on_refresh or (lambda: None),
         on_add_to_cart_change=add_to_cart,
+        on_select_stock_change=on_select_stock or (lambda: None),
     )

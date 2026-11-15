@@ -12,6 +12,10 @@
       const DB_VERSION = 1;
       const STORE = "records";
       const DEVICE_STORE = "device_metadata";
+      const STAGE0_DB_NAME = "GGHP_LocalStore";
+      const STAGE0_DB_VERSION = 1;
+      const STAGE0_STORE = "stage0_cache";
+      const STAGE0_TTL_SECONDS = 12 * 60 * 60;
       let lastRequestId = null;
 
       function post(type, data) {
@@ -39,6 +43,120 @@
           request.onsuccess = () => resolve(request.result);
           request.onerror = () => reject(request.error);
         });
+      }
+
+      function openStage0Database() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(STAGE0_DB_NAME, STAGE0_DB_VERSION);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(STAGE0_STORE)) {
+              database.createObjectStore(STAGE0_STORE, { keyPath: "key" });
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function stage0Hydrate() {
+        const database = await openStage0Database();
+        try {
+          const record = await transactionResult(
+            database, STAGE0_STORE, "readonly",
+            store => requestValue(store.get("universe_master"))
+          );
+          let epoch = 0;
+          let macro = null;
+          try {
+            epoch = Number(localStorage.getItem("gghp_stage0_epoch") || 0);
+            macro = JSON.parse(localStorage.getItem("gghp_macro_anchors") || "null");
+          } catch (error) {
+            return { fresh: false, error: "Stage 0 browser storage is unavailable." };
+          }
+          const age = Date.now() / 1000 - epoch;
+          const fresh = epoch > 0 && age >= 0 &&
+            age < STAGE0_TTL_SECONDS &&
+            record && Array.isArray(record.value) && record.value.length > 0 &&
+            macro && typeof macro === "object";
+          return {
+            fresh: Boolean(fresh),
+            server_epoch: epoch,
+            macro,
+            universe: record && Array.isArray(record.value) ? record.value : null
+          };
+        } finally {
+          database.close();
+        }
+      }
+
+      async function stage0Store(value) {
+        if (!value || !Array.isArray(value.universe) || !value.macro ||
+            !Number.isFinite(Number(value.server_epoch))) {
+          throw new Error("Stage 0 bootstrap data is incomplete.");
+        }
+        const database = await openStage0Database();
+        try {
+          await transactionResult(
+            database, STAGE0_STORE, "readwrite",
+            store => requestValue(store.put({
+              key: "universe_master",
+              value: value.universe
+            }))
+          );
+          localStorage.setItem("gghp_macro_anchors", JSON.stringify(value.macro));
+          localStorage.setItem("gghp_stage0_epoch", String(value.server_epoch));
+          return true;
+        } finally {
+          database.close();
+        }
+      }
+
+      async function stage0StockDetail(action, value) {
+        if (!value || typeof value.symbol !== "string" ||
+            !/^[A-Z0-9&.-]{1,24}$/.test(value.symbol)) {
+          throw new Error("A valid Stage 0 stock symbol is required.");
+        }
+        const key = `stock_detail_${value.symbol}`;
+        const database = await openStage0Database();
+        try {
+          if (action === "stage0_get_stock_detail") {
+            const record = await transactionResult(
+              database, STAGE0_STORE, "readonly",
+              store => requestValue(store.get(key))
+            );
+            return record ? record.value : null;
+          }
+          if (action === "stage0_store_stock_detail") {
+            if (!value.detail || typeof value.detail !== "object") {
+              throw new Error("Stage 0 stock detail must be an object.");
+            }
+            await transactionResult(
+              database, STAGE0_STORE, "readwrite",
+              store => requestValue(store.put({
+                key,
+                value: {
+                  ...value.detail,
+                  cached_at: Date.now() / 1000
+                }
+              }))
+            );
+            return true;
+          }
+          throw new Error("Unsupported Stage 0 stock-detail operation.");
+        } finally {
+          database.close();
+        }
+      }
+
+      async function executeStage0(command) {
+        if (command.action === "stage0_hydrate") return await stage0Hydrate();
+        if (command.action === "stage0_store") return await stage0Store(command.value);
+        if (command.action === "stage0_get_stock_detail" ||
+            command.action === "stage0_store_stock_detail") {
+          return await stage0StockDetail(command.action, command.value);
+        }
+        throw new Error("Unsupported Stage 0 browser storage operation.");
       }
 
       function transactionResult(database, storeName, mode, action) {
@@ -266,7 +384,10 @@
         const command = event.data.args && event.data.args.request;
         if (!command || command.request_id === lastRequestId) return;
         lastRequestId = command.request_id;
-        execute(command).then(
+        const operation = command.action.startsWith("stage0_")
+          ? executeStage0(command)
+          : execute(command);
+        operation.then(
           value => post("streamlit:setComponentValue", {
             dataType: "json",
             value: { request_id: command.request_id, value }

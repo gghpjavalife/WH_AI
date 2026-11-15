@@ -507,8 +507,14 @@ class ContextTableFilterTests(unittest.TestCase):
 class TableMountTests(unittest.TestCase):
     def test_mount_wires_key_data_and_refresh_callback(self):
         callback = lambda: None
+        on_select = lambda: None
         with patch("features.equities.scan_table._COMPONENT") as component:
-            show_scan_table([], {"tableKey": "holdings:one"}, on_refresh=callback)
+            show_scan_table(
+                [],
+                {"tableKey": "holdings:one"},
+                on_refresh=callback,
+                on_select_stock=on_select,
+            )
             self.assertEqual(component.call_args.kwargs["key"], "holdings:one")
             self.assertTrue(component.call_args.kwargs["data"]["canRefresh"])
             self.assertIs(component.call_args.kwargs["on_refresh_change"], callback)
@@ -516,6 +522,7 @@ class TableMountTests(unittest.TestCase):
             self.assertFalse(component.call_args.kwargs["data"]["canRefresh"])
             self.assertTrue(callable(component.call_args.kwargs["on_refresh_change"]))
             self.assertTrue(callable(component.call_args.kwargs["on_add_to_cart_change"]))
+            self.assertTrue(callable(component.call_args.kwargs["on_select_stock_change"]))
 
     def test_cart_add_preserves_existing_edits_and_holding_quantity(self):
         state = {"stock_cart_review": True}
