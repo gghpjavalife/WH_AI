@@ -61,6 +61,81 @@ class Stage0Tests(unittest.TestCase):
         self.assertEqual([row["symbol"] for row in actual], ["ABC", "ABC.BO"])
         self.assertEqual(actual[0]["instrument_key"], "NSE_EQ|INE000A01001")
 
+    def test_bse_master_augments_the_shared_universe_without_duplicate_isins(self):
+        upstream = [
+            {
+                "symbol": "ABC.BO",
+                "segment": "BSE_EQ",
+                "instrument_key": "BSE_EQ|INE000A01001",
+                "isin": "INE000A01001",
+            },
+            {
+                "symbol": "ABC",
+                "segment": "NSE_EQ",
+                "instrument_key": "NSE_EQ|INE000A01001",
+                "isin": "INE000A01001",
+            },
+        ]
+        bse_master = pd.DataFrame(
+            [
+                {
+                    "Symbol": "ABC.BO",
+                    "Ticker": "ABC",
+                    "Company": "ABC Limited",
+                    "ISIN": "INE000A01001",
+                    "Code": "500001",
+                    "Exchange": "BSE",
+                },
+                {
+                    "Symbol": "NEWCO.BO",
+                    "Ticker": "NEWCO",
+                    "Company": "NewCo Limited",
+                    "ISIN": "INE000A01002",
+                    "Code": "500002",
+                    "Exchange": "BSE",
+                },
+            ]
+        )
+
+        result = stage0._augment_bse_listings(upstream, bse_master)
+
+        self.assertEqual(len(result), 3)
+        added = result[-1]
+        self.assertEqual(added["symbol"], "NEWCO.BO")
+        self.assertEqual(added["instrument_key"], "BSE_EQ|INE000A01002")
+        self.assertEqual(added["exchange_token"], "500002")
+        self.assertEqual(added["segment"], "BSE_EQ")
+
+    def test_bootstrap_persists_bse_fallback_listings(self):
+        bse_master = pd.DataFrame(
+            [
+                {
+                    "Symbol": "NEWCO.BO",
+                    "Ticker": "NEWCO",
+                    "Company": "NewCo Limited",
+                    "ISIN": "INE000A01002",
+                    "Code": "500002",
+                    "Exchange": "BSE",
+                }
+            ]
+        )
+        with (
+            patch.object(
+                stage0,
+                "fetch_upstox_universe",
+                side_effect=OSError("Upstox master unavailable"),
+            ),
+            patch.object(stage0, "fetch_bse_equity_master", return_value=bse_master),
+            patch.object(stage0, "_renew_bootstrap_lease"),
+            patch.object(stage0, "fetch_macro_anchors", return_value={}),
+            patch.object(stage0, "_save_bootstrap") as save,
+            patch.object(stage0, "_release_bootstrap_lease"),
+        ):
+            stage0._refresh_bootstrap("owner")
+
+        saved_universe = save.call_args.args[0]
+        self.assertEqual(saved_universe[0]["instrument_key"], "BSE_EQ|INE000A01002")
+
     def test_macro_extraction_keeps_all_anchor_keys(self):
         columns = pd.MultiIndex.from_product(
             [stage0.MACRO_SYMBOLS, ["Close"]], names=["Ticker", "Price"]
@@ -127,6 +202,10 @@ class Stage0Tests(unittest.TestCase):
                         "freeCashflow": {"raw": 1234},
                     },
                     "defaultKeyStatistics": {"mostRecentQuarter": 123},
+                    "summaryProfile": {
+                        "sector": "Financial Services",
+                        "industry": "Commercial Banks",
+                    },
                     "calendarEvents": {},
                 }
             },
@@ -138,6 +217,10 @@ class Stage0Tests(unittest.TestCase):
                 "returnOnEquity"
             ]["raw"],
             0.12,
+        )
+        self.assertEqual(
+            stage0.get_fundamental_snapshot("STOCK0")["summaryProfile"]["industry"],
+            "Commercial Banks",
         )
         self.assertEqual(stage0.get_fundamentals_status("STOCK9"), "PENDING")
 

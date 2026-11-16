@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import hashlib
 from html import escape
 import json
+import math
 from queue import Empty, Queue
 import sqlite3
 from typing import Any
@@ -56,7 +57,7 @@ _STAGE_NAMES = (
     "AI thesis",
 )
 _STAGE_DESCRIPTIONS = (
-    "INPUT: selected NSE/BSE equity universe (capped at 2,500 deduplicated listings). "
+    "INPUT: selected NSE/BSE equity listings. "
     "LOADS: Upstox instrument master and macro anchors from the local cache; refreshes "
     "Stage 0 when stale; syncs daily OHLCV candles into SQLite. A first sync requests "
     "380 calendar days; later syncs request only the checkpoint delta. No live quotes "
@@ -148,6 +149,48 @@ def _symbol_base(symbol: Any) -> str:
     return str(symbol or "").strip().upper().removesuffix(".NS").removesuffix(".BO")
 
 
+def _nifty_market_regime(snapshot: dict[str, Any] | None) -> dict[str, float | None]:
+    macro = snapshot.get("macro") if isinstance(snapshot, dict) else None
+    nifty = macro.get("^NSEI") if isinstance(macro, dict) else None
+    nifty = nifty if isinstance(nifty, dict) else {}
+    values: dict[str, float | None] = {}
+    for output_key, input_key in (
+        ("nifty_price", "close"),
+        ("nifty_dma_200", "dma_200"),
+    ):
+        try:
+            value = float(nifty.get(input_key))
+        except (TypeError, ValueError, OverflowError):
+            value = None
+        values[output_key] = value if value is not None and math.isfinite(value) else None
+    return values
+
+
+def _symbols_for_exchange(master: pd.DataFrame, exchange: str) -> set[str]:
+    if not {"Exchange", "Symbol"}.issubset(master.columns):
+        return set()
+    exchange = exchange.strip().upper()
+    exchange_values = master["Exchange"].astype(str).str.strip().str.upper()
+    listings = master
+    if exchange == "BSE" and "ISIN" in master.columns:
+        nse_isins = {
+            str(isin).strip().upper()
+            for isin in master.loc[
+                exchange_values.eq("NSE"), "ISIN"
+            ].dropna()
+            if str(isin).strip()
+        }
+        bse_rows = master.loc[exchange_values.eq("BSE")]
+        listings = bse_rows.loc[
+            ~bse_rows["ISIN"].astype(str).str.upper().isin(nse_isins)
+            | bse_rows["ISIN"].isna()
+            | bse_rows["ISIN"].astype(str).str.strip().eq("")
+        ]
+    else:
+        listings = master.loc[exchange_values.eq(exchange)]
+    return set(listings["Symbol"].dropna().astype(str))
+
+
 def _selected_instruments(
     symbols: list[str], stage0_universe: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -189,7 +232,7 @@ def _selected_instruments(
     selected_keys = set(
         select_liquid_universe(
             candidates,
-            max_instruments=2500,
+            max_instruments=len(candidates),
             min_avg_turnover_inr=0,
         )
     )
@@ -202,6 +245,14 @@ def _selected_instruments(
         .replace(":", "|")
         in selected_keys
     ]
+
+
+def _has_bse_listing(universe: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(instrument, dict)
+        and str(instrument.get("segment") or "").strip().upper() == "BSE_EQ"
+        for instrument in universe
+    )
 
 
 def _friendly_error(index: int, error: Exception, symbol: str | None = None) -> str:
@@ -231,6 +282,7 @@ def _advance_automatic_stages(
     state: dict[str, Any],
     symbols: list[str],
     instruments: list[dict[str, Any]],
+    market_regime: dict[str, float | None] | None = None,
 ) -> None:
     """Run Stages 0–3 automatically for a selected universe."""
     if not symbols:
@@ -258,6 +310,7 @@ def _advance_automatic_stages(
             state,
             instruments,
             GatekeeperConfig(**state.get("gatekeeper_config", {})),
+            market_regime,
         )
 
     if state.get("stage2_attempted"):
@@ -279,7 +332,16 @@ def _advance_automatic_stages(
 
 def _stage0_prepare(symbols: list[str], token: str) -> dict[str, Any]:
     snapshot = read_stage0_cache()
-    if not stage0_cache_is_fresh(snapshot):
+    cached_universe = snapshot.get("universe") or [] if isinstance(snapshot, dict) else []
+    selected_instruments = _selected_instruments(symbols, cached_universe)
+    missing_selected_bse = bool(symbols) and all(
+        str(symbol).strip().upper().endswith(".BO") for symbol in symbols
+    ) and not selected_instruments
+    regime = _nifty_market_regime(snapshot)
+    missing_nifty_dma = (
+        regime["nifty_price"] is None or regime["nifty_dma_200"] is None
+    )
+    if not stage0_cache_is_fresh(snapshot) or missing_selected_bse or missing_nifty_dma:
         refresh_future = request_stage0_refresh(force=True)
         if refresh_future is not None:
             refresh_future.result()
@@ -290,8 +352,9 @@ def _stage0_prepare(symbols: list[str], token: str) -> dict[str, Any]:
     if symbols and not instruments:
         if all(str(symbol).strip().upper().endswith(".BO") for symbol in symbols):
             raise RuntimeError(
-                "BSE listing data is not loaded. Refresh the Stage 0 instrument "
-                "master and try again."
+                "The refreshed Stage 0 master still has no matching BSE listing. "
+                "Check whether the BSE listing feed and Upstox instrument service "
+                "are available, then retry."
             )
         raise RuntimeError(
             "The selected stocks are not available in the Stage 0 instrument "
@@ -357,11 +420,14 @@ def _new_pipeline_state(signature: str) -> dict[str, Any]:
         "messages": [""] * 5,
         "stage0_future": None,
         "stage0_result": None,
+        "bse_catalog_future": None,
+        "bse_catalog_refresh_failed": False,
         "stage1_result": None,
         "stage1_attempted": False,
         "stage2_attempted": False,
         "stage2_decisions": {},
         "stage2_rows": [],
+        "stage2_all_rows": [],
         "stage2_fundamentals": {},
         "stage3_results": {},
         "stage3_errors": {},
@@ -555,6 +621,8 @@ def _stage2_table_rows(
     instruments: list[dict[str, Any]],
     quotes: dict[str, Any],
     gatekeeper_config: GatekeeperConfig | None = None,
+    *,
+    include_rejected: bool = False,
 ) -> list[dict[str, Any]]:
     by_key = {
         str(instrument.get("instrument_key") or instrument.get("key") or "")
@@ -565,7 +633,7 @@ def _stage2_table_rows(
     }
     rows = []
     for decision in decisions:
-        if not decision.passed or not decision.features:
+        if not include_rejected and not decision.passed:
             continue
         instrument = by_key.get(decision.instrument_key, {})
         symbol = str(
@@ -575,7 +643,8 @@ def _stage2_table_rows(
         ).strip().upper()
         if instrument.get("segment") == "BSE_EQ" and not symbol.endswith(".BO"):
             symbol += ".BO"
-        features = decision.features
+        features = decision.features or {}
+        classification = decision.investment_classification or {}
         quote = quotes.get(decision.instrument_key) or {}
         previous_close = quote.get("close")
         current_price = features.get("last_price") or quote.get("last_price")
@@ -623,6 +692,15 @@ def _stage2_table_rows(
                 "Instrument_key": decision.instrument_key,
                 **indicator_values,
                 "Recommendation": recommendation,
+                "Investment_tag": classification.get("investment_tag", "REJECT"),
+                "Pass_short": bool(classification.get("pass_short")),
+                "Pass_long": bool(classification.get("pass_long")),
+                "Investment_partial_data_warning": bool(
+                    classification.get("partial_data_warning")
+                ),
+                "Market_regime_warning": bool(
+                    classification.get("market_regime_warning")
+                ),
                 "Signal_score": decision.score,
                 "Positive_signals": sum(
                     item[2] == "Positive" for item in checks
@@ -640,6 +718,28 @@ def _stage2_table_rows(
             }
         )
     return rows
+
+
+def _visible_stage2_rows(
+    state: dict[str, Any], selected_universe: str
+) -> list[dict[str, Any]]:
+    source_key = (
+        "stage2_all_rows"
+        if selected_universe == "Pick individual stocks"
+        else "stage2_rows"
+    )
+    rows = state.get(source_key)
+    if not isinstance(rows, list) and source_key == "stage2_all_rows":
+        rows = state.get("stage2_rows")
+    if not isinstance(rows, list):
+        return []
+    if selected_universe == "Pick individual stocks":
+        return [row for row in rows if isinstance(row, dict)]
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict) and row.get("Investment_tag") != "REJECT"
+    ]
 
 
 def _detail_scalar(value: Any) -> str | None:
@@ -714,7 +814,7 @@ def _pipeline_details_for_rows(
         decision = decisions.get(key) if isinstance(decisions, dict) else None
         quote = quotes.get(key, {})
         quote = quote if isinstance(quote, dict) else {}
-        feature_data = decision.features if decision else {}
+        feature_data = (decision.features or {}) if decision else {}
         symbol = str(row.get("Ticker") or "")
         fundamentals = (
             fundamentals_by_symbol.get(_symbol_base(symbol), {})
@@ -872,6 +972,54 @@ def _pipeline_details_for_rows(
             )
         )
         add_group("Jev screening", jev_values)
+
+        classification = (
+            decision.investment_classification
+            if decision and isinstance(decision.investment_classification, dict)
+            else {}
+        )
+        investment_values = [
+            ("Automatic investment tag", classification.get("investment_tag", "REJECT"), "neu", None),
+            ("Short-term gate (3–12 months)", classification.get("pass_short"), "neu", None),
+            ("Long-term gate (3+ years)", classification.get("pass_long"), "neu", None),
+            (
+                "Broad market regime",
+                "Bear Market Regime: Stagger Entries"
+                if classification.get("market_regime_warning")
+                else (
+                    "Above Nifty 50 200-DMA"
+                    if classification.get("nifty_price") is not None
+                    and classification.get("nifty_dma_200") is not None
+                    else "Unavailable"
+                ),
+                "missing"
+                if classification.get("market_regime_warning")
+                else "pos",
+                "Nifty 50 price must be above its 200-day moving average for "
+                "short-term investment classification.",
+            ),
+            ("Lender rules", classification.get("is_lender"), "neu", None),
+            ("Partial data warning", classification.get("partial_data_warning"), "missing" if classification.get("partial_data_warning") else "pos", None),
+            (
+                "Missing expected metrics",
+                ", ".join(classification.get("missing_metrics", [])) or "None",
+                "missing" if classification.get("missing_metrics") else "pos",
+                None,
+            ),
+            (
+                "Short-term failed rules",
+                ", ".join(classification.get("failed_short", [])) or "None",
+                "neg" if classification.get("failed_short") else "pos",
+                None,
+            ),
+            (
+                "Long-term failed rules",
+                ", ".join(classification.get("failed_long", [])) or "None",
+                "neg" if classification.get("failed_long") else "pos",
+                None,
+            ),
+        ]
+        add_group("Investment classification", investment_values)
 
         fundamental_values = _flatten_detail_values(fundamentals)
         if fundamental_values:
@@ -1093,6 +1241,7 @@ def _handle_stage2(
     state: dict[str, Any],
     instruments: list[dict[str, Any]],
     config: GatekeeperConfig | None = None,
+    market_regime: dict[str, float | None] | None = None,
 ) -> None:
     keys = [
         str(instrument.get("instrument_key") or instrument.get("key") or "")
@@ -1109,6 +1258,7 @@ def _handle_stage2(
     )
     if not keys:
         state["stage2_rows"] = []
+        state["stage2_all_rows"] = []
         _set_stage(state, 2, "refresh_required", "Load Stage 0 before screening.")
         return
     try:
@@ -1149,6 +1299,7 @@ def _handle_stage2(
                 min_avg_turnover_inr=0,
                 config=config or GatekeeperConfig(),
                 session_state=st.session_state,
+                market_regime=market_regime,
             )
             progress.update(
                 label="Technical screening completed.",
@@ -1170,6 +1321,13 @@ def _handle_stage2(
         instruments,
         quotes,
         config,
+    )
+    state["stage2_all_rows"] = _stage2_table_rows(
+        decisions,
+        instruments,
+        quotes,
+        config,
+        include_rejected=True,
     )
     feature_count = sum(bool(decision.features) for decision in decisions)
     passed_count = len(passed_decisions)
@@ -2049,11 +2207,7 @@ def render_equity_pipeline(
         symbols = sorted(listed_symbols or available_symbols)
     elif selected_universe in {"NSE-listed stocks", "BSE-listed stocks"}:
         exchange = selected_universe.split("-", 1)[0]
-        symbols = sorted(
-            set(master.loc[master["Exchange"].eq(exchange), "Symbol"].astype(str))
-            if "Exchange" in master and "Symbol" in master
-            else set()
-        )
+        symbols = sorted(_symbols_for_exchange(master, exchange))
     elif selected_universe == "Portfolio holdings":
         symbols = []
         for key in ("equity_holdings", "portfolio"):
@@ -2080,10 +2234,13 @@ def render_equity_pipeline(
             key=watchlist_key,
         )
 
-    bse_data_missing = (
-        selected_universe == "BSE-listed stocks"
-        and not master["Exchange"].eq("BSE").any()
-    )
+    bse_catalog_needed = selected_universe in {
+        "All listed stocks (NSE + BSE)",
+        "BSE-listed stocks",
+        "Portfolio holdings",
+        "Pick individual stocks",
+    }
+    bse_data_missing = bse_catalog_needed and not _has_bse_listing(universe)
     instruments = _selected_instruments(symbols, universe) if universe else []
     signature = _key_signature(symbols)
     pipeline_state = st.session_state.setdefault("_equity_pipeline_state", {})
@@ -2109,14 +2266,94 @@ def render_equity_pipeline(
                 "Stage 0 data is stale or only partially available; refresh it.",
             )
         pipeline_state[prefix] = state
+    if bse_data_missing and state.get("bse_catalog_refresh_failed"):
+        if st.button(
+            "Retry BSE listing refresh",
+            key=f"{prefix}_retry_bse_catalog",
+            type="secondary",
+        ):
+            state["bse_catalog_refresh_failed"] = False
     if bse_data_missing:
-        _set_stage(
-            state,
-            0,
-            "failure",
-            "BSE data is not loaded in the Stage 0 instrument master. Refresh "
-            "Stage 0 and try again.",
-        )
+        bse_future = state.get("bse_catalog_future")
+        if isinstance(bse_future, Future) and bse_future.done():
+            try:
+                bse_future.result()
+                refreshed_snapshot = read_stage0_cache()
+            except (
+                OSError,
+                RuntimeError,
+                sqlite3.Error,
+                TimeoutError,
+                ValueError,
+            ) as error:
+                state["bse_catalog_future"] = None
+                state["bse_catalog_refresh_failed"] = True
+                _set_stage(
+                    state,
+                    0,
+                    "failure",
+                    f"BSE stock-list refresh failed: {error}",
+                )
+            else:
+                state["bse_catalog_future"] = None
+                if isinstance(refreshed_snapshot, dict) and _has_bse_listing(
+                    refreshed_snapshot.get("universe") or []
+                ):
+                    state["bse_catalog_refresh_failed"] = False
+                    _set_stage(
+                        state,
+                        0,
+                        "refresh_required",
+                        "BSE stock list loaded; preparing the selected universe.",
+                    )
+                else:
+                    state["bse_catalog_refresh_failed"] = True
+                    _set_stage(
+                        state,
+                        0,
+                        "failure",
+                        "The refreshed catalog still contains no BSE listings. "
+                        "Check the public BSE feed and retry.",
+                    )
+        elif isinstance(bse_future, Future):
+            _set_stage(
+                state,
+                0,
+                "running",
+                "Loading the BSE stock list into the shared Stage 0 catalog.",
+            )
+        elif not state.get("bse_catalog_refresh_failed"):
+            try:
+                bse_future = request_stage0_refresh(force=True)
+            except (OSError, RuntimeError, sqlite3.Error, TimeoutError, ValueError) as error:
+                state["bse_catalog_refresh_failed"] = True
+                _set_stage(
+                    state,
+                    0,
+                    "failure",
+                    f"Could not start the BSE stock-list refresh: {error}",
+                )
+            else:
+                if isinstance(bse_future, Future):
+                    state["bse_catalog_future"] = bse_future
+                    state["bse_catalog_refresh_failed"] = False
+                    _set_stage(
+                        state,
+                        0,
+                        "running",
+                        "Loading the BSE stock list into the shared Stage 0 catalog.",
+                    )
+                else:
+                    _set_stage(
+                        state,
+                        0,
+                        "refresh_required",
+                        "Another worker is refreshing the shared Stage 0 catalog; "
+                        "waiting for BSE listings.",
+                    )
+    elif _has_bse_listing(universe):
+        state["bse_catalog_future"] = None
+        state["bse_catalog_refresh_failed"] = False
     _consume_stage0_future(state)
     if state.get("gatekeeper_settings_version") != 4:
         migrated_config = {
@@ -2155,6 +2392,7 @@ def render_equity_pipeline(
         state["stage2_attempted"] = False
         state["stage2_decisions"] = {}
         state["stage2_rows"] = []
+        state["stage2_all_rows"] = []
         state["stage2_fundamentals"] = {}
         state["stage3_results"] = {}
         state["stage4_results"] = {}
@@ -2591,6 +2829,41 @@ def render_equity_pipeline(
                                     ),
                                     disabled=state["statuses"][3] == "running",
                                 )
+                        st.divider()
+                        st.markdown("**Automatic investment classification**")
+                        st.caption(
+                            "These investment rules run automatically and stay "
+                            "independent from Jev's technical/trading gate; they "
+                            "do not add manual toggles."
+                        )
+                        investment_columns = st.columns(2)
+                        with investment_columns[0]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    "**Short-term · 3–12 months**\n\n"
+                                    "- Price above DMA 200\n"
+                                    "- YoY sales / PAT / operating-profit growth: "
+                                    "≥12% / ≥15% / ≥10%\n"
+                                    "- PEG: >0 and ≤1.5; otherwise forward P/E ≤25 "
+                                    "when PAT growth is >20%\n"
+                                    "- Daily turnover ≥₹1 crore; promoter pledge ≤15%"
+                                )
+                        with investment_columns[1]:
+                            with st.container(border=True):
+                                st.markdown(
+                                    "**Long-term · 3+ years**\n\n"
+                                    "- 3-year sales / profit CAGR: ≥10% / ≥12%\n"
+                                    "- Lenders: ROA ≥1.2%, net NPA ≤1.2%, CAR ≥15%; "
+                                    "skip debt/equity, OCF/PAT, Altman and Piotroski\n"
+                                    "- Other industries: ROCE (or ROE) ≥15%, "
+                                    "debt/equity ≤0.6, 3-year OCF/PAT ≥0.8\n"
+                                    "- Pledge ≤5%; P/B or P/E ≤120% of its 5-year median"
+                                )
+                        st.caption(
+                            "A horizon passes when at least 80% of its available "
+                            "checks pass. Missing metrics are excluded and shown "
+                            "as a partial-data warning."
+                        )
 
     stage1_result = state.get("stage1_result")
     quotes = (
@@ -2615,8 +2888,14 @@ def render_equity_pipeline(
         )
         _consume_stage4_future(state)
 
+    market_regime = _nifty_market_regime(stage0_snapshot)
     if symbols:
-        _advance_automatic_stages(state, symbols, instruments)
+        _advance_automatic_stages(
+            state,
+            symbols,
+            instruments,
+            market_regime,
+        )
 
     for index, message in enumerate(state["messages"]):
         if message:
@@ -2627,8 +2906,20 @@ def render_equity_pipeline(
             elif state["statuses"][index] == "running":
                 st.info(f"{_STAGE_NAMES[index]}: {message}")
 
+    if symbols:
+        nifty_price = market_regime["nifty_price"]
+        nifty_dma_200 = market_regime["nifty_dma_200"]
+        if nifty_price is not None and nifty_dma_200 is not None:
+            if nifty_price <= nifty_dma_200:
+                st.warning("Bear Market Regime: Stagger Entries")
+        else:
+            st.info(
+                "Nifty 50 200-DMA is unavailable; short-term investment "
+                "classifications are held back until benchmark data is available."
+            )
+
     rows = _pipeline_details_for_rows(
-        state["stage2_rows"],
+        _visible_stage2_rows(state, selected_universe),
         state,
         instruments,
         stage0_snapshot.get("macro")
@@ -2639,6 +2930,7 @@ def render_equity_pipeline(
     payload, config = build_scan_table_payload(rows, labels)
     config["columns"] = [
         ["stock", "Stock", 0],
+        ["investment_tag", "Investment horizon", 0],
         ["ai_confidence", "AI confidence", 1],
         ["signal", "Signal", 0],
         ["price", "Price", 1],

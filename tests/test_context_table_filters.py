@@ -77,6 +77,40 @@ class ContextTableFilterTests(unittest.TestCase):
             assert.ok($('head').innerHTML.indexOf('>Signal') < $('head').innerHTML.indexOf('>Price'));
         """)
 
+    def test_investment_fit_column_has_a_working_filter(self):
+        html = self.run_table(
+            [
+                row("A", [], investment_tag="SHORT-TERM"),
+                row("B", [], investment_tag="LONG-TERM"),
+                row("C", [], investment_tag="SHORT + LONG"),
+                row("D", [], investment_tag="REJECT"),
+            ],
+            {
+                "columns": [
+                    ["stock", "Stock", 0],
+                    ["investment_tag", "Investment horizon", 0],
+                    ["signal", "Signal", 0],
+                ]
+            },
+            r"""
+            assert.ok($('head').innerHTML.includes('Investment horizon'));
+            assert.ok($('filt').innerHTML.includes('data-f="investment"'));
+            assert.ok($('filt').innerHTML.includes('3–12M'));
+            assert.ok($('filt').innerHTML.includes('3Y+'));
+            assert.ok($('body').innerHTML.includes('3–12M &amp; 3Y+') ||
+                      $('body').innerHTML.includes('3–12M & 3Y+'));
+            assert.deepStrictEqual(
+             new Set(VIEW.rows.map(r=>r.investment_tag)),
+             new Set(['SHORT-TERM','LONG-TERM','SHORT + LONG','REJECT']));
+            $('filt').onchange({target:{dataset:{f:'investment'},value:'LONG-TERM'}});
+            assert.deepStrictEqual(VIEW.rows.map(r=>r.ticker),['B']);
+            $('clearFilters').onclick();
+            assert.strictEqual(st.f.investment,'');
+            assert.strictEqual(VIEW.rows.length,4);
+            """,
+        )
+        self.assertIn('aria-label="Investment horizon"', html)
+
     def test_allocation_is_neutral_while_returns_remain_directional(self):
         self.run_table(
             [row("A", [], allocationPct=12.5, returnPct=5),

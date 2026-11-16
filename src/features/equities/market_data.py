@@ -156,7 +156,7 @@ def fetch_bse_equity_master() -> pd.DataFrame:
     if active.empty:
         raise MarketDataError("The BSE equity list contains no active equity stocks.")
     active["Exchange"] = "BSE"
-    return active[["Symbol", "Company", "ISIN", "Exchange", "Ticker"]]
+    return active[["Symbol", "Company", "ISIN", "Exchange", "Ticker", "Code"]]
 
 
 @st.cache_data(ttl=86_400, max_entries=1, show_spinner=False)

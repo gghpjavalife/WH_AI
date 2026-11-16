@@ -6,6 +6,7 @@ import pandas as pd
 from services.stage2_feature_gatekeeper import (
     GatekeeperConfig,
     compute_22_technical_features,
+    evaluate_investment_classification,
     evaluate_jev_gatekeeper,
     run_stage2_batch,
     select_liquid_universe,
@@ -27,6 +28,25 @@ def _history(rows=260):
         },
         index=pd.date_range("2025-01-01", periods=rows, freq="B"),
     )
+
+
+def _investment_fundamentals():
+    return {
+        "sector": "Technology",
+        "industry": "Software",
+        "quarterly_yoy_sales_growth_pct": 15,
+        "quarterly_yoy_net_profit_growth_pct": 22,
+        "quarterly_yoy_operating_profit_growth_pct": 12,
+        "peg_ratio": 1.2,
+        "promoter_pledge_pct": 4,
+        "sales_cagr_3y_pct": 11,
+        "profit_cagr_3y_pct": 13,
+        "roce_pct": 20,
+        "debt_to_equity": 0.5,
+        "ocf_to_pat_3y": 1,
+        "trailing_pe": 15,
+        "five_year_median_pe": 15,
+    }
 
 
 class Stage2FeatureGatekeeperTests(unittest.TestCase):
@@ -169,6 +189,120 @@ class Stage2FeatureGatekeeperTests(unittest.TestCase):
         self.assertIsNone(compute_22_technical_features(_history(49)))
         with self.assertRaisesRegex(ValueError, "missing required columns"):
             compute_22_technical_features(pd.DataFrame({"close": [1]}))
+
+    def test_investment_classification_assigns_both_horizons_independently(self):
+        result = evaluate_investment_classification(
+            {"last_price": 120, "volume": 100_000},
+            {"sma_200": 100},
+            _investment_fundamentals(),
+        )
+
+        self.assertTrue(result["pass_short"])
+        self.assertTrue(result["pass_long"])
+        self.assertEqual(result["investment_tag"], "SHORT + LONG")
+        self.assertEqual(result["failed_short"], [])
+        self.assertEqual(result["failed_long"], [])
+        self.assertFalse(result["partial_data_warning"])
+
+    def test_investment_classification_uses_available_checks_and_80_percent_gate(self):
+        fundamentals = _investment_fundamentals()
+        fundamentals["quarterly_yoy_operating_profit_growth_pct"] = 0
+        fundamentals.pop("quarterly_yoy_net_profit_growth_pct")
+        fundamentals.pop("peg_ratio")
+        fundamentals["forward_pe"] = 20
+        result = evaluate_investment_classification(
+            {"last_price": 120, "volume": 100_000},
+            {"sma_200": 100},
+            fundamentals,
+        )
+
+        self.assertTrue(result["pass_short"])
+        self.assertEqual(result["short_checks_passed"], 4)
+        self.assertEqual(result["short_checks_available"], 5)
+        self.assertEqual(result["failed_short"], ["quarterly_operating_profit_growth"])
+        self.assertTrue(result["partial_data_warning"])
+
+        fundamentals["quarterly_yoy_sales_growth_pct"] = 0
+        result = evaluate_investment_classification(
+            {"last_price": 120, "volume": 100_000},
+            {"sma_200": 100},
+            fundamentals,
+        )
+        self.assertFalse(result["pass_short"])
+        self.assertEqual(result["short_checks_passed"], 3)
+
+    def test_lender_rules_ignore_altman_and_piotroski_while_nonlender_finance_is_not_lender(self):
+        fundamentals = _investment_fundamentals()
+        fundamentals.update(
+            {
+                "sector": "Financial Services",
+                "industry": "Commercial Banks",
+                "piotroski_f_score": 0,
+                "altman_z_score": 0,
+                "roa_pct": 1.5,
+                "net_npa_pct": 0.8,
+                "capital_adequacy_ratio_pct": 16,
+                "price_to_book": 2,
+                "five_year_median_pb": 2,
+            }
+        )
+        decision = evaluate_jev_gatekeeper(
+            "NSE_EQ|BANK",
+            "BANK",
+            {"last_price": 120, "volume": 100_000, "bid_ask_spread_pct": 0.1},
+            {"last_price": 120, "sma_50": 110, "sma_200": 100, "adx_14": 25, "choppiness_14": 50},
+            fundamentals,
+        )
+        self.assertTrue(decision.investment_classification["is_lender"])
+        self.assertTrue(decision.is_lender)
+        self.assertEqual(decision.investment_tag, "SHORT + LONG")
+        self.assertEqual(decision.failed_short, [])
+        self.assertNotIn("WEAK_PIOTROSKI<4", decision.reject_reasons)
+        self.assertNotIn("DISTRESS_ALTMAN_Z<1.81", decision.reject_reasons)
+
+        fundamentals["industry"] = "Asset Management"
+        nonlender = evaluate_investment_classification(
+            {"last_price": 120, "volume": 100_000},
+            {"sma_200": 100},
+            fundamentals,
+        )
+        self.assertFalse(nonlender["is_lender"])
+
+    def test_investment_classification_handles_missing_nan_and_all_missing_metrics(self):
+        result = evaluate_investment_classification(
+            {"last_price": float("nan"), "volume": None},
+            {"sma_200": float("nan")},
+            {
+                "industry": "Housing Finance",
+                "returnOnAssets": 0.015,
+                "net_npa_pct": 0.9,
+                "capitalAdequacyRatio": 0.16,
+                "priceToBook": float("nan"),
+            },
+        )
+
+        self.assertTrue(result["is_lender"])
+        self.assertFalse(result["pass_short"])
+        self.assertTrue(result["pass_long"])
+        self.assertEqual(result["investment_tag"], "LONG-TERM")
+        self.assertTrue(result["partial_data_warning"])
+        self.assertNotIn("capital_adequacy_ratio", result["missing_metrics"])
+
+    def test_investment_classification_reports_short_term_only(self):
+        fundamentals = _investment_fundamentals()
+        fundamentals["sales_cagr_3y_pct"] = 0
+        fundamentals["profit_cagr_3y_pct"] = 0
+        fundamentals["debt_to_equity"] = 2
+        fundamentals["ocf_to_pat_3y"] = 0
+        result = evaluate_investment_classification(
+            {"last_price": 120, "volume": 100_000},
+            {"sma_200": 100},
+            fundamentals,
+        )
+
+        self.assertTrue(result["pass_short"])
+        self.assertFalse(result["pass_long"])
+        self.assertEqual(result["investment_tag"], "SHORT-TERM")
 
     def test_gatekeeper_rejects_bad_microstructure_and_choppy_market(self):
         quote = {

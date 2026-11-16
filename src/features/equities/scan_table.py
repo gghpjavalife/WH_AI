@@ -43,6 +43,7 @@ th{background:var(--bg);padding:.55rem .8rem;text-align:left;
  font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--gold);
  border-bottom:2px solid var(--gold);cursor:pointer;white-space:nowrap;user-select:none;
  }
+th[data-k="investment_tag"],td.investment-horizon{min-width:9.25rem;}
 .filt td{padding:.4rem .8rem;background:rgba(201,162,39,.08);border-bottom:2px solid var(--gold);}
 .filt input,.filt select{width:100%;min-width:0;padding:.25rem .4rem;border-radius:6px;border:1px solid var(--line);background:var(--soft);color:var(--fg);font:inherit;font-size:.82rem;}
 .filt select option{color:#111;}
@@ -211,9 +212,9 @@ const $=id=>parentElement.querySelector('#'+id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const RANK={'STRONG BUY':4,'BUY':3,'HOLD':2,'SELL':1,'STRONG SELL':0,'NOT RATED':-1};
 const PILL={'STRONG BUY':'SB','BUY':'B','HOLD':'H','SELL':'S','STRONG SELL':'SS','NOT RATED':'NR'};
-const st={f:{q:'',pmin:'',pmax:'',chg:'',rmin:'',rmax:'',sig:'',m1:'',vol:'',str:'',pass:''},ranges:Object.create(null),extra:Object.create(null),key:CFG.defaultSort?.key||'signal',dir:CFG.defaultSort?.dir??-1,page:1,size:10,open:new Set(),panelOpen:new Set(),selected:new Set()};
+const st={f:{q:'',pmin:'',pmax:'',chg:'',rmin:'',rmax:'',sig:'',investment:'',m1:'',vol:'',str:'',pass:''},ranges:Object.create(null),extra:Object.create(null),key:CFG.defaultSort?.key||'signal',dir:CFG.defaultSort?.dir??-1,page:1,size:10,open:new Set(),panelOpen:new Set(),selected:new Set()};
 const sortVal={
- stock:r=>r.label.toLowerCase(),ai_confidence:r=>r.ai_confidence,price:r=>r.price,chg:r=>r.chg,m1:r=>r.m1,vol:r=>r.vol,rsi:r=>r.rsi,
+ stock:r=>r.label.toLowerCase(),investment_tag:r=>r.investment_tag,ai_confidence:r=>r.ai_confidence,price:r=>r.price,chg:r=>r.chg,m1:r=>r.m1,vol:r=>r.vol,rsi:r=>r.rsi,
  signal:r=>(RANK[r.signal]??-1)*1000+(Number(r.score)||0),strength:r=>r.total?r.pos/r.total:0,
  pass:r=>r.pass?1:0};
 let COLS;
@@ -297,6 +298,7 @@ function filtered(){
   (!f.chg||(number(r.chg)!==null&&(f.chg==='up'?number(r.chg)>=0:number(r.chg)<0)))&&
   inRange(r.rsi,rmin,rmax)&&
   (!f.sig||r.signal===f.sig)&&
+  (!f.investment||r.investment_tag===f.investment)&&
   (smin==null||(number(r.total)>0&&number(r.pos)!==null&&r.pos/r.total*100>=smin))&&
   (!f.pass||(f.pass==='y')===r.pass)&&
   Object.entries(st.ranges).every(([key,range])=>inRange(r[key],range.min,range.max))&&
@@ -336,6 +338,7 @@ const panelCategories={
  'Company profile':'Company & ownership','Ownership and trading activity':'Company & ownership',
  'Company and listing':'Company & ownership','Live quote':'Live market data',
  'Technical indicators':'Trend & momentum','Jev screening':'Jev screening',
+ 'Investment classification':'Investment classification',
  'Derivatives and options':'Derivatives','Analyst outlook':'Fundamentals & outlook',
  'Recent news':'News & events','AI thesis':'AI research',
  'Market and sector':'Market context','Options':'Derivatives','Futures':'Derivatives',
@@ -343,7 +346,8 @@ const panelCategories={
  'Data availability':'Data availability'
 };
 const panelOrder=['Company & ownership','Live market data','Risk & intraday','Trend & momentum',
- 'Performance & volume','Jev screening','Fundamentals & outlook','News & events',
+ 'Performance & volume','Jev screening','Investment classification',
+ 'Fundamentals & outlook','News & events',
  'Market context','Derivatives','AI research','Holding details','Data availability'];
 const panelCountFields=new Set([
  'context_profile_full_time_employees','context_fundamentals_shares_outstanding',
@@ -458,6 +462,7 @@ function render(){
   fields.map(f=>`<th data-k="raw:${f.index}" class="raw-head ${f.type==='number'?'num':''}" title="${esc(f.label)}">${esc(f.header)}<span class="arrow">${st.key==='raw:'+f.index?(st.dir>0?'&#9650;':'&#9660;'):''}</span><button type="button" class="remove-field" data-remove-field="${f.index}" aria-label="Remove ${esc(f.label)} column" title="Remove ${esc(f.label)} column">&times;</button></th>`).join('');
  const cell=(key,type,r)=>{
   if(key==='stock')return `<td class="name">${esc(r.displayTicker||r.ticker)}</td>`;
+  if(key==='investment_tag')return `<td class="investment-horizon ${r.investment_tag==='REJECT'?'neg':'pos'}">${esc(INVESTMENT_LABELS[r.investment_tag]||r.investment_tag||'REJECT')}</td>`;
   if(key==='ai_confidence')return `<td class="num ${r.ai_confidence==null?'missing':'neu'}">${r.ai_confidence==null?'—':Number(r.ai_confidence).toFixed(1)+'%'}</td>`;
   if(key==='signal')return `<td><span class="signal-value ${PILL[r.signal]||'H'}">${esc(r.signal)}</span></td>`;
   if(key==='strength')return `<td><div class="meter"><i><b style="width:${r.total?Math.round(r.pos/r.total*100):0}%"></b></i><span>${r.pos}/${r.total}</span></div></td>`;
@@ -508,6 +513,11 @@ function toast(msg){
  toastTimer=setTimeout(()=>{t.classList.remove('show');toastTimer=null;},1800);
 }
 const opt=(v,l)=>`<option value="${esc(v)}">${esc(l)}</option>`;
+const INVESTMENT_LABELS={
+ 'SHORT-TERM':'3–12M',
+ 'LONG-TERM':'3Y+',
+ 'SHORT + LONG':'3–12M & 3Y+',
+ 'REJECT':'REJECT'};
 const CELL={
  stock:'<input data-f="q" type="search" placeholder="Search symbol or company" aria-label="Search symbol or company">',
  ticker:'<input data-f="q" type="search" placeholder="Search ticker" aria-label="Search ticker">',
@@ -515,6 +525,7 @@ const CELL={
  chg:'<select data-f="chg" aria-label="Day change">'+opt('','All')+opt('up','Gainers')+opt('down','Losers')+'</select>',
  rsi:'<div class="rng"><input data-f="rmin" type="number" placeholder="Min" aria-label="Minimum RSI"><input data-f="rmax" type="number" placeholder="Max" aria-label="Maximum RSI"></div>',
  signal:'<select data-f="sig" aria-label="Signal">'+opt('','All')+CFG.signals.map(s=>opt(s,s)).join('')+'</select>',
+ investment_tag:'<select data-f="investment" aria-label="Investment horizon">'+opt('','All')+Object.entries(INVESTMENT_LABELS).map(([tag,label])=>opt(tag,label)).join('')+'</select>',
  strength:'<select data-f="str" aria-label="Strength">'+opt('','Any')+opt('25','25%+')+opt('50','50%+')+opt('75','75%+')+'</select>',
  m1:'<select data-f="m1" aria-label="One month change">'+opt('','All')+opt('0','Positive')+opt('10','10%+')+'</select>',
  vol:'<select data-f="vol" aria-label="Volume">'+opt('','All')+opt('1','1x+')+opt('2','2x+')+'</select>',
