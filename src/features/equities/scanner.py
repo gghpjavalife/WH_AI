@@ -718,6 +718,7 @@ def build_scan_table_payload(
                 "rsi": _num(row, "RSI_14"),
                 "rsiTone": _TONE_CLASS.get(_tone(row, "RSI_14"), "neu"),
                 "signal": str(row["Recommendation"]),
+                "investment_tag": str(row.get("Investment_tag") or "REJECT"),
                 "score": int(row.get("Signal_score", 0) or 0),
                 "pos": int(row.get("Positive_signals", 0) or 0),
                 "total": int(row.get("Total_signals", 0) or 0),
@@ -1249,7 +1250,7 @@ def _selected_history_instrument_keys(
             candidates.append(instrument)
     return select_liquid_universe(
         candidates,
-        max_instruments=2500,
+        max_instruments=len(candidates),
         min_avg_turnover_inr=0,
     )
 

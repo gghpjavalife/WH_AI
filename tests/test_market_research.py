@@ -351,6 +351,7 @@ class MarketResearchTests(unittest.TestCase):
         self.assertEqual(master["Symbol"].tolist(), ["ABB.BO", "AEGISLOG.BO"])
         self.assertEqual(master["Exchange"].tolist(), ["BSE", "BSE"])
         self.assertEqual(master.loc[0, "Ticker"], "ABB")
+        self.assertEqual(master.loc[0, "Code"], "500002")
         self.assertEqual(get.call_args.kwargs["params"]["segment"], "Equity")
         self.assertEqual(get.call_args.kwargs["params"]["status"], "Active")
 

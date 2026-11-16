@@ -7,7 +7,10 @@ from streamlit.testing.v1 import AppTest
 
 from features.analysis.stock_context import CONTEXT_TTL
 from features.equities.scanner import (
-    _append_scan_context, _scanner_identities, build_scan_table_payload,
+    _append_scan_context,
+    _scanner_identities,
+    _selected_history_instrument_keys,
+    build_scan_table_payload,
 )
 from services.stock_context_models import InvestmentHorizon, StockSignalContext
 
@@ -52,7 +55,12 @@ def _universe_mock(load):
 class ScannerStockContextTests(unittest.TestCase):
     def test_scan_payload_preserves_currency_and_uses_listed_exchange(self):
         listed, _ = build_scan_table_payload(
-            [{"Ticker": "PGIL", "Recommendation": "HOLD", "AI_confidence": 87.5}],
+            [{
+                "Ticker": "PGIL",
+                "Recommendation": "HOLD",
+                "AI_confidence": 87.5,
+                "Investment_tag": "SHORT + LONG",
+            }],
             {"PGIL": "PGIL · Pearl Global Industries Limited (NSE)"},
         )
         unknown, _ = build_scan_table_payload(
@@ -68,6 +76,7 @@ class ScannerStockContextTests(unittest.TestCase):
         )
         self.assertEqual(listed[0]["currency"], "INR")
         self.assertEqual(listed[0]["ai_confidence"], 87.5)
+        self.assertEqual(listed[0]["investment_tag"], "SHORT + LONG")
         self.assertIsNone(unknown[0]["currency"])
         self.assertEqual(explicit[0]["currency"], "USD")
 
@@ -89,6 +98,23 @@ class ScannerStockContextTests(unittest.TestCase):
         self.assertEqual(identities["MISMATCH.BO"], ("MISMATCH.BO", None, h))
         self.assertEqual(_scanner_identities(rows, master, "Equities")["RELIANCE"][2],
                          InvestmentHorizon.LONG_TERM_EQUITY)
+
+    def test_history_selection_has_no_fixed_2500_cap(self):
+        universe = [
+            {
+                "symbol": f"STOCK{i}",
+                "segment": "NSE_EQ",
+                "isin": f"IN{i}",
+                "instrument_key": f"NSE_EQ|IN{i}",
+            }
+            for i in range(2501)
+        ]
+
+        selected = _selected_history_instrument_keys(
+            [item["symbol"] for item in universe], universe
+        )
+
+        self.assertEqual(len(selected), 2501)
 
     def test_payload_context_fields_and_missing_rows_remain_aligned(self):
         first = {**_row("RELIANCE"), "SMA_20": 100, "RSI_14": 45, "As_of": "2026-01-01"}

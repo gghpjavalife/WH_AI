@@ -3,9 +3,12 @@ from __future__ import annotations
 from concurrent.futures import Future
 from queue import Queue
 from threading import Lock
+from types import SimpleNamespace
 import time
 from unittest.mock import patch
 
+import pytest
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from features.equities import pipeline
@@ -82,6 +85,156 @@ def test_pipeline_controls_and_results_table_render_before_data_is_loaded():
     payload, config = show_table.call_args.args
     assert payload == []
     assert config["showCart"] is False
+
+
+def test_individual_picks_keep_all_rows_while_bulk_universes_hide_rejects():
+    rows = [
+        {"Ticker": "AAA", "Investment_tag": "REJECT"},
+        {"Ticker": "BBB", "Investment_tag": "SHORT-TERM"},
+    ]
+    state = {"stage2_all_rows": rows, "stage2_rows": rows}
+
+    individual_rows = pipeline._visible_stage2_rows(
+        state, "Pick individual stocks"
+    )
+    bulk_rows = pipeline._visible_stage2_rows(
+        state, "All listed stocks (NSE + BSE)"
+    )
+
+    assert [row["Ticker"] for row in individual_rows] == ["AAA", "BBB"]
+    assert [row["Ticker"] for row in bulk_rows] == ["BBB"]
+
+
+def test_bse_exchange_selection_excludes_isins_also_listed_on_nse():
+    master = pd.DataFrame(
+        [
+            {"Symbol": "DUAL", "ISIN": "IN_DUAL", "Exchange": "NSE"},
+            {"Symbol": "DUAL.BO", "ISIN": "IN_DUAL", "Exchange": "BSE"},
+            {"Symbol": "BSEONLY.BO", "ISIN": "IN_BSE", "Exchange": "BSE"},
+        ]
+    )
+
+    assert pipeline._symbols_for_exchange(master, "BSE") == {"BSEONLY.BO"}
+    assert pipeline._symbols_for_exchange(master, "NSE") == {"DUAL"}
+
+
+def test_pipeline_instrument_selection_has_no_fixed_2500_cap():
+    universe = [
+        {
+            "symbol": f"STOCK{i}",
+            "segment": "BSE_EQ",
+            "isin": f"IN{i}",
+            "instrument_key": f"BSE_EQ|IN{i}",
+        }
+        for i in range(2501)
+    ]
+
+    selected = pipeline._selected_instruments(
+        [item["symbol"] for item in universe], universe
+    )
+
+    assert len(selected) == 2501
+
+
+def test_stage2_table_can_include_rejected_individual_picks():
+    decision = SimpleNamespace(
+        instrument_key="NSE_EQ|ABC",
+        symbol="ABC",
+        passed=False,
+        features={},
+        investment_classification={"investment_tag": "REJECT"},
+        signal_tier=None,
+        score=0,
+        reject_reasons=["Jev rule failed"],
+    )
+    instrument = {
+        "instrument_key": "NSE_EQ|ABC",
+        "symbol": "ABC",
+        "segment": "NSE_EQ",
+    }
+
+    rows = pipeline._stage2_table_rows(
+        [decision], [instrument], {}, include_rejected=True
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["Ticker"] == "ABC"
+    assert rows[0]["Investment_tag"] == "REJECT"
+    assert rows[0]["Passes_filters"] is False
+
+
+@pytest.mark.parametrize(
+    "selection",
+    (
+        "BSE-listed stocks",
+        "All listed stocks (NSE + BSE)",
+        "Pick individual stocks",
+    ),
+)
+def test_missing_bse_catalog_starts_stage0_refresh_instead_of_failing(selection):
+    app = AppTest.from_string(_APP)
+    snapshot = {
+        "universe": _UNIVERSE,
+        "macro": {},
+        "updated_at": time.time(),
+    }
+    refresh = Future()
+    with (
+        patch.object(pipeline, "read_stage0_cache", return_value=snapshot),
+        patch.object(pipeline, "stage0_cache_is_fresh", return_value=True),
+        patch.object(pipeline, "request_stage0_refresh", return_value=refresh) as request,
+        patch("features.equities.scan_table.show_scan_table"),
+        patch.object(pipeline, "_advance_automatic_stages"),
+    ):
+        app.run(timeout=10)
+        app.selectbox[0].select(selection).run(timeout=10)
+
+    state = app.session_state["_equity_pipeline_state"]["equities"]
+    assert not app.exception
+    request.assert_called_once_with(force=True)
+    assert state["statuses"][0] == "running"
+    assert "BSE stock list" in state["messages"][0]
+
+
+def test_stage0_refreshes_a_fresh_cache_when_selected_bse_ticker_is_missing():
+    refreshed_universe = [
+        {
+            "symbol": "ABC.BO",
+            "trading_symbol": "ABC",
+            "name": "ABC Limited",
+            "isin": "INABC",
+            "segment": "BSE_EQ",
+            "instrument_type": "EQ",
+            "instrument_key": "BSE_EQ|INABC",
+        }
+    ]
+    initial = {"universe": _UNIVERSE, "macro": {}, "updated_at": time.time()}
+    refreshed = {
+        "universe": refreshed_universe,
+        "macro": {},
+        "updated_at": time.time(),
+    }
+    completed_refresh = Future()
+    completed_refresh.set_result(None)
+    with (
+        patch.object(
+            pipeline,
+            "read_stage0_cache",
+            side_effect=[initial, refreshed],
+        ),
+        patch.object(pipeline, "stage0_cache_is_fresh", return_value=True),
+        patch.object(
+            pipeline,
+            "request_stage0_refresh",
+            return_value=completed_refresh,
+        ) as request,
+    ):
+        result = pipeline._stage0_prepare(["ABC.BO"], "")
+
+    request.assert_called_once_with(force=True)
+    assert [item["instrument_key"] for item in result["instruments"]] == [
+        "BSE_EQ|INABC"
+    ]
 
 
 def test_scanner_requires_explicit_stock_selection_before_editing_jev_rules():
@@ -708,6 +861,7 @@ def test_stage2_rows_convert_gatekeeper_decisions_to_table_contract():
 
     assert rows[0]["Ticker"] == "ABC"
     assert rows[0]["Recommendation"] == "BUY"
+    assert rows[0]["Investment_tag"] == "REJECT"
     assert rows[0]["Passes_filters"] is True
     assert rows[0]["Price"] == 120.0
     assert rows[0]["Total_signals"] == 22
@@ -802,6 +956,7 @@ def test_pipeline_stock_details_are_grouped_for_the_expanded_table_row():
         "Live quote",
         "Technical indicators",
         "Jev screening",
+        "Investment classification",
         "Fundamentals",
         "Derivatives and options",
         "Analyst outlook",

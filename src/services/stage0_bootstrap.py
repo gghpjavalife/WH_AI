@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 
 from core.constants import ProjectPath
+from features.equities.market_data import MarketDataError, fetch_bse_equity_master
 from services.stock_context_sources import json_value
 
 logger = logging.getLogger(__name__)
@@ -280,12 +281,58 @@ def fetch_upstox_universe(
     return universe
 
 
+def _augment_bse_listings(
+    universe: list[dict[str, Any]],
+    bse_master: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Include active BSE equities absent from the broker instrument master."""
+    known_bse_isins = {
+        str(item.get("isin") or "").strip().upper()
+        for item in universe
+        if str(item.get("segment") or "").strip().upper() == "BSE_EQ"
+    }
+    known_bse_keys = {
+        str(item.get("instrument_key") or "").strip().upper()
+        for item in universe
+        if str(item.get("segment") or "").strip().upper() == "BSE_EQ"
+    }
+    additions = []
+    for row in bse_master.to_dict(orient="records"):
+        if str(row.get("Exchange") or "").strip().upper() != "BSE":
+            continue
+        isin = str(row.get("ISIN") or "").strip().upper()
+        ticker = str(row.get("Ticker") or row.get("Symbol") or "").strip().upper()
+        ticker = ticker.removesuffix(".BO")
+        if not isin or not ticker or ticker in {"NAN", "NONE"}:
+            continue
+        instrument_key = f"BSE_EQ|{isin}"
+        if isin in known_bse_isins or instrument_key in known_bse_keys:
+            continue
+        additions.append(
+            {
+                "symbol": f"{ticker}.BO",
+                "trading_symbol": ticker,
+                "name": str(row.get("Company") or ticker).strip(),
+                "isin": isin,
+                "segment": "BSE_EQ",
+                "instrument_type": "EQ",
+                "instrument_key": instrument_key,
+                "exchange_token": str(row.get("Code") or ""),
+                "lot_size": 1,
+                "tick_size": None,
+            }
+        )
+        known_bse_isins.add(isin)
+        known_bse_keys.add(instrument_key)
+    return [*universe, *additions]
+
+
 def _download_macro() -> dict[str, dict[str, Any]]:
     import yfinance as yf
 
     frame = yf.download(
         tickers=list(MACRO_SYMBOLS),
-        period="5d",
+        period="1y",
         interval="1d",
         group_by="ticker",
         progress=False,
@@ -309,16 +356,29 @@ def _download_macro() -> dict[str, dict[str, Any]]:
             observed_at = close.index[-1]
             if hasattr(observed_at, "isoformat"):
                 observed_at = observed_at.isoformat()
-            output[symbol] = {
+            anchor = {
                 "close": float(close.iloc[-1]),
                 "observed_at": str(observed_at),
             }
+            if symbol == "^NSEI":
+                dma_200 = close.rolling(window=200, min_periods=200).mean().iloc[-1]
+                anchor["dma_200"] = (
+                    float(dma_200) if pd.notna(dma_200) else None
+                )
+            output[symbol] = anchor
         except (KeyError, TypeError, ValueError, IndexError):
             output[symbol] = {"close": None, "observed_at": None}
     if not any(anchor["close"] is not None for anchor in output.values()):
         raise ValueError("Yahoo Finance returned no valid macro anchor closes.")
     for symbol in MACRO_SYMBOLS:
-        output.setdefault(symbol, {"close": None, "observed_at": None})
+        output.setdefault(
+            symbol,
+            {
+                "close": None,
+                "observed_at": None,
+                **({"dma_200": None} if symbol == "^NSEI" else {}),
+            },
+        )
     return output
 
 
@@ -362,7 +422,30 @@ def _save_bootstrap(
 
 def _refresh_bootstrap(owner: str) -> None:
     try:
-        universe = fetch_upstox_universe()
+        try:
+            universe = fetch_upstox_universe()
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            logger.warning(
+                "Upstox instrument master unavailable; trying the BSE listing feed: %s",
+                error,
+            )
+            universe = []
+        try:
+            bse_master = fetch_bse_equity_master()
+        except MarketDataError as error:
+            if not universe:
+                raise RuntimeError(
+                    "Neither the Upstox instrument master nor the BSE listing feed "
+                    "is available."
+                ) from error
+            logger.warning(
+                "BSE listing feed unavailable; retaining Upstox BSE listings: %s",
+                error,
+            )
+        else:
+            universe = _augment_bse_listings(universe, bse_master)
+        if not universe:
+            raise RuntimeError("The exchange feeds returned no equity listings.")
         _renew_bootstrap_lease(owner)
         macro_updated_at = None
         try:
@@ -419,6 +502,10 @@ def _extract_fundamental_payload(value: Any) -> dict[str, Any]:
             "profitMargins",
             "returnOnEquity",
             "returnOnAssets",
+            "revenueGrowth",
+            "earningsGrowth",
+            "operatingCashflow",
+            "capitalAdequacyRatio",
             "freeCashflow",
             "totalCash",
             "totalDebt",
@@ -426,6 +513,7 @@ def _extract_fundamental_payload(value: Any) -> dict[str, Any]:
         ),
         "defaultKeyStatistics": (
             "trailingEps",
+            "trailingPE",
             "forwardEps",
             "forwardPE",
             "pegRatio",
@@ -437,6 +525,7 @@ def _extract_fundamental_payload(value: Any) -> dict[str, Any]:
             "shortPercentOfFloat",
             "piotroskiFScore",
         ),
+        "summaryProfile": ("sector", "industry", "longBusinessSummary"),
         "calendarEvents": ("exDividendDate", "earnings"),
     }
     extracted: dict[str, Any] = {}
@@ -587,7 +676,12 @@ def _fetch_yahooquery_batch(batch: list[tuple[str, str | None]]) -> Any:
         for symbol, _ in batch
     ]
     results = Ticker(" ".join(symbols), asynchronous=False, progress=False).get_modules(
-        ["financialData", "defaultKeyStatistics", "calendarEvents"]
+        [
+            "financialData",
+            "defaultKeyStatistics",
+            "summaryProfile",
+            "calendarEvents",
+        ]
     )
     if isinstance(results, dict):
         error = next(

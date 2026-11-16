@@ -118,13 +118,28 @@ metrics remain unknown and are not treated as zero.
 Pass `session_state=st.session_state` to publish the decisions by instrument
 key for the scanner's explicit Stage 4 action.
 
+Every decision also carries an independent equity-investment classification;
+it does not change Jev's existing technical `passed` result. The short-term
+gate (3–12 months) checks price above the 200-day average, quarterly sales/PAT/
+operating-profit growth of at least 12%/15%/10%, PEG up to 1.5 (or the
+forward-PE fallback), ₹1 crore daily turnover, and promoter pledge up to 15%.
+The long-term gate (3+ years) checks 3-year sales/profit CAGR of at least
+10%/12%, sector-aware capital efficiency and balance-sheet rules, pledge up to
+5%, and valuation no more than 20% above the 5-year median. Lender treatment is
+based only on lender keywords in industry; non-lending financial-services
+companies use standard balance-sheet rules, and lenders bypass Piotroski and
+Altman checks. The output includes both pass flags, failed-rule lists, lender
+status, a final investment tag, and a partial-data warning. Missing metrics are
+excluded from each bucket's denominator; at least 80% of the available checks
+must pass, and a bucket with no available checks fails. Unavailable quarterly
+and multi-year metrics are not inferred or fabricated.
+
 The selector filters to NSE/BSE equity instruments, ranks by observed average
 turnover when supplied, and prefers NSE when turnover is unavailable. Stage 0
-currently does not cache daily history, turnover rankings, Altman Z scores, or
-promoter pledges, so those must be provided by a future local-cache stage;
-without turnover observations the selector cannot attest that a symbol is
-liquid or active. The technicals therefore require caller-provided history, and
-the gatekeeper's fundamental checks run only when those values are present.
+does not yet provide every input needed by the investment gates, including
+quarterly growth, multi-year CAGR/OCF-to-PAT, lender CAR/net NPA, and promoter
+pledge data. Those checks remain unavailable until supplied through a local
+cache; the classification warning makes those data gaps explicit.
 Runtime depends on candidate count, history length and machine; Stage 2 does
 not promise a sub-500 ms run for a 2,500-symbol universe.
 
@@ -142,14 +157,18 @@ Stage 0 refreshes the Stage 0 universe only when stale and incrementally syncs
 daily candles for the selected subset when an Upstox token is available. The
 action uses the cached Stage 0 NSE/BSE equity master, ranks/deduplicates it
 with the Stage 2 liquid-universe selector, and caps the request at 2,500
-listings. Selecting a universe starts Stages 0, 1, and 2 in sequence; Stage 0
-runs in a background job and checkpoints each completed symbol. Stage 3
+listings. Stage 0 combines the Upstox instrument master with the active public
+BSE equity list by ISIN; selecting BSE-listed stocks automatically refreshes
+an incomplete catalog instead of failing against an older local cache. Selecting
+a universe starts Stages 0, 1, and 2 in sequence; Stage 0 runs in a background
+job and checkpoints each completed symbol. Stage 3
 automatically enriches all stocks that pass Stage 2, with ten stocks fetched
 concurrently and live progress; concurrency is fixed at ten to protect provider
 rate limits. Only Stage 2-passed stocks are shown
 in the table. Expanding a stock row shows its information in category panels:
 company/listing, live quote, all 22 technical indicators with explanations,
-Jev rules and decision, fundamentals, options, analyst outlook, news, market
+Jev rules and decision, investment classification, fundamentals, options,
+analyst outlook, news, market
 context, and any generated AI thesis. Details stay inside the expanded stock
 row rather than appearing as a separate page section.
 The first four stage controls are progress indicators; the Stage 4 AI thesis is
@@ -167,6 +186,10 @@ starts with the current Jev thresholds (price ₹20, spread 0.75%, daily volume
 pledge 25%). Each rejection rule can be enabled or disabled independently;
 each toggle and threshold applies immediately without an update button.
 Minimum history remains a required data-quality threshold of at least 50 bars.
+The results table's **Investment horizon** column has a matching filter for
+`SHORT + LONG`, `SHORT-TERM`, `LONG-TERM`, and `REJECT`. The editor also
+documents the automatic investment thresholds; these remain fixed and separate
+from Jev's editable trading rules.
 The table's Strength column reports positive checks against the 22 calculated
 indicator slots; unavailable values are not represented as zero.
 

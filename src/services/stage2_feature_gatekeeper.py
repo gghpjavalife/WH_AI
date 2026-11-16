@@ -49,6 +49,15 @@ class GatekeeperDecision:
     score: float
     reject_reasons: list[str] = field(default_factory=list)
     features: dict[str, Any] = field(default_factory=dict)
+    investment_classification: dict[str, Any] = field(default_factory=dict)
+    pass_short: bool = False
+    pass_long: bool = False
+    failed_short: list[str] = field(default_factory=list)
+    failed_long: list[str] = field(default_factory=list)
+    partial_data_warning: bool = False
+    investment_tag: str = "REJECT"
+    is_lender: bool = False
+    market_regime_warning: bool = False
 
 
 @dataclass
@@ -67,6 +76,343 @@ def _finite_number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _key_token(value: Any) -> str:
+    return "".join(character for character in str(value).lower() if character.isalnum())
+
+
+def _metric_value(
+    data: Mapping[str, Any],
+    aliases: Sequence[str],
+    *,
+    percent: bool = False,
+) -> float | None:
+    alias_tokens = {_key_token(alias) for alias in aliases}
+    fractional_percent_tokens = {
+        _key_token(alias)
+        for alias in (
+            "returnOnAssets",
+            "returnOnEquity",
+            "quarterlyRevenueGrowth",
+            "revenueGrowth",
+            "quarterlyEarningsGrowth",
+            "earningsGrowth",
+            "capitalAdequacyRatio",
+        )
+    }
+
+    def values(mapping: Mapping[str, Any]):
+        for key, value in mapping.items():
+            yield key, value
+            if isinstance(value, Mapping):
+                yield from values(value)
+
+    for key, value in values(data):
+        token = _key_token(key)
+        if token not in alias_tokens:
+            continue
+        if isinstance(value, Mapping):
+            raw_value = value.get("raw")
+            value = raw_value if raw_value is not None else value.get("value")
+        number = _finite_number(value)
+        if number is None:
+            continue
+        if percent and token in fractional_percent_tokens:
+            if token != _key_token("capitalAdequacyRatio") or abs(number) <= 1:
+                number *= 100.0
+        elif token == _key_token("debtToEquity"):
+            number /= 100.0
+        return number
+    return None
+
+
+def _is_lender(fundamentals: Mapping[str, Any]) -> bool:
+    industry = _metric_text(fundamentals, ("industry",))
+    if industry is None:
+        return False
+    industry = industry.lower()
+    return any(
+        keyword in industry
+        for keyword in (
+            "bank",
+            "nbfc",
+            "consumer finance",
+            "housing finance",
+            "microfinance",
+            "credit",
+        )
+    )
+
+
+def _metric_text(data: Mapping[str, Any], aliases: Sequence[str]) -> str | None:
+    alias_tokens = {_key_token(alias) for alias in aliases}
+
+    def values(mapping: Mapping[str, Any]):
+        for key, value in mapping.items():
+            yield key, value
+            if isinstance(value, Mapping):
+                yield from values(value)
+
+    for key, value in values(data):
+        if _key_token(key) in alias_tokens and isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _investment_check(
+    checks: list[tuple[str, bool]],
+    missing: list[str],
+    name: str,
+    passed: bool | None,
+) -> None:
+    if passed is None:
+        missing.append(name)
+    else:
+        checks.append((name, passed))
+
+
+def evaluate_investment_classification(
+    live_quote: Mapping[str, Any] | None,
+    tech_features: Mapping[str, Any] | None,
+    fundamentals: Mapping[str, Any] | None,
+    market_regime: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate independent short- and long-horizon investment rules."""
+    quote = live_quote if isinstance(live_quote, Mapping) else {}
+    features = tech_features if isinstance(tech_features, Mapping) else {}
+    fundamentals = fundamentals if isinstance(fundamentals, Mapping) else {}
+    market_regime = market_regime if isinstance(market_regime, Mapping) else {}
+    is_lender = _is_lender(fundamentals)
+    short_checks: list[tuple[str, bool]] = []
+    long_checks: list[tuple[str, bool]] = []
+    missing: list[str] = []
+    nifty_price = _finite_number(
+        market_regime.get("nifty_price", market_regime.get("close"))
+    )
+    nifty_dma_200 = _finite_number(
+        market_regime.get("nifty_dma_200", market_regime.get("dma_200"))
+    )
+    market_regime_pass = (
+        nifty_price > nifty_dma_200
+        if nifty_price is not None and nifty_dma_200 is not None
+        else None
+    )
+    _investment_check(
+        short_checks,
+        missing,
+        "broad_market_regime",
+        market_regime_pass,
+    )
+    for field in ("sector", "industry"):
+        if _metric_text(fundamentals, (field,)) is None:
+            missing.append(field)
+
+    current_price = _finite_number(quote.get("last_price"))
+    if current_price is None:
+        current_price = _finite_number(features.get("last_price"))
+    dma_200 = _finite_number(features.get("dma_200"))
+    if dma_200 is None:
+        dma_200 = _finite_number(features.get("sma_200"))
+    _investment_check(
+        short_checks,
+        missing,
+        "structural_trend",
+        current_price > dma_200 if current_price is not None and dma_200 is not None else None,
+    )
+
+    sales_growth = _metric_value(
+        fundamentals,
+        (
+            "quarterly_yoy_sales_growth_pct",
+            "quarterly_sales_growth_yoy_pct",
+            "quarterly_revenue_growth_yoy_pct",
+            "sales_growth_yoy_pct",
+            "revenue_growth_yoy_pct",
+            "quarterlyRevenueGrowth",
+            "revenueGrowth",
+        ),
+        percent=True,
+    )
+    profit_growth = _metric_value(
+        fundamentals,
+        (
+            "quarterly_yoy_net_profit_growth_pct",
+            "quarterly_pat_growth_yoy_pct",
+            "quarterly_profit_growth_yoy_pct",
+            "net_profit_growth_yoy_pct",
+            "quarterlyEarningsGrowth",
+            "earningsGrowth",
+        ),
+        percent=True,
+    )
+    operating_profit_growth = _metric_value(
+        fundamentals,
+        (
+            "quarterly_yoy_operating_profit_growth_pct",
+            "quarterly_operating_profit_growth_yoy_pct",
+            "quarterly_ebit_growth_yoy_pct",
+            "quarterly_ebitda_growth_yoy_pct",
+            "operating_profit_growth_yoy_pct",
+            "ebit_growth_yoy_pct",
+        ),
+        percent=True,
+    )
+    _investment_check(short_checks, missing, "quarterly_sales_growth", sales_growth >= 12 if sales_growth is not None else None)
+    _investment_check(short_checks, missing, "quarterly_pat_growth", profit_growth >= 15 if profit_growth is not None else None)
+    _investment_check(short_checks, missing, "quarterly_operating_profit_growth", operating_profit_growth >= 10 if operating_profit_growth is not None else None)
+
+    peg = _metric_value(fundamentals, ("peg_ratio", "pegRatio"))
+    if peg is not None:
+        valuation_pass: bool | None = 0 < peg <= 1.5
+    else:
+        missing.append("peg_ratio")
+        forward_pe = _metric_value(fundamentals, ("forward_pe", "forwardPE"))
+        valuation_pass = (
+            forward_pe <= 25
+            if forward_pe is not None and profit_growth is not None and profit_growth > 20
+            else False
+            if profit_growth is not None and profit_growth <= 20
+            else None
+        )
+    _investment_check(short_checks, missing, "growth_valuation", valuation_pass)
+
+    volume = _finite_number(quote.get("volume"))
+    turnover = current_price * volume if current_price is not None and volume is not None else None
+    _investment_check(short_checks, missing, "daily_rupee_turnover", turnover >= 10_000_000 if turnover is not None else None)
+    pledge = _metric_value(
+        fundamentals,
+        ("promoter_pledge_pct", "promoter_pledge", "promoterPledgePct"),
+    )
+    _investment_check(short_checks, missing, "short_term_promoter_pledge", pledge <= 15 if pledge is not None else None)
+
+    sales_cagr = _metric_value(
+        fundamentals,
+        ("sales_cagr_3y_pct", "three_year_sales_cagr_pct", "sales_3y_cagr_pct"),
+        percent=True,
+    )
+    profit_cagr = _metric_value(
+        fundamentals,
+        ("profit_cagr_3y_pct", "three_year_profit_cagr_pct", "pat_3y_cagr_pct"),
+        percent=True,
+    )
+    _investment_check(long_checks, missing, "three_year_sales_cagr", sales_cagr >= 10 if sales_cagr is not None else None)
+    _investment_check(long_checks, missing, "three_year_profit_cagr", profit_cagr >= 12 if profit_cagr is not None else None)
+
+    if is_lender:
+        roa = _metric_value(fundamentals, ("roa_pct", "return_on_assets_pct", "returnOnAssets"), percent=True)
+        net_npa = _metric_value(fundamentals, ("net_npa_pct", "net_npa", "netNpa"))
+        _investment_check(long_checks, missing, "lender_roa", roa >= 1.2 if roa is not None else None)
+        _investment_check(long_checks, missing, "lender_net_npa", net_npa <= 1.2 if net_npa is not None else None)
+        car = _metric_value(
+            fundamentals,
+            ("capital_adequacy_ratio_pct", "car_pct", "capitalAdequacyRatio"),
+            percent=True,
+        )
+        _investment_check(long_checks, missing, "capital_adequacy_ratio", car >= 15 if car is not None else None)
+        current_valuation = _metric_value(fundamentals, ("price_to_book", "priceToBook", "pb_ratio"))
+        median_valuation = _metric_value(
+            fundamentals,
+            ("five_year_median_pb", "pb_5y_median", "price_to_book_5y_median"),
+        )
+    else:
+        roce = _metric_value(fundamentals, ("roce_pct", "return_on_capital_employed_pct", "roce"), percent=True)
+        roe = _metric_value(fundamentals, ("roe_pct", "return_on_equity_pct", "returnOnEquity"), percent=True)
+        if roce is not None:
+            efficiency = roce >= 15
+        else:
+            if roe is None:
+                missing.append("capital_efficiency_roce_or_roe")
+                efficiency = None
+            else:
+                missing.append("capital_efficiency_roce")
+                efficiency = roe >= 15
+        if roce is not None or roe is not None:
+            long_checks.append(("capital_efficiency", bool(efficiency)))
+        debt_to_equity = _metric_value(
+            fundamentals,
+            ("debt_to_equity", "debtToEquity"),
+        )
+        _investment_check(
+            long_checks,
+            missing,
+            "debt_to_equity",
+            debt_to_equity <= 0.6 if debt_to_equity is not None else None,
+        )
+        ocf_pat = _metric_value(
+            fundamentals,
+            ("ocf_to_pat_3y", "three_year_ocf_pat_ratio", "cumulative_ocf_pat_ratio"),
+        )
+        if ocf_pat is None:
+            ocf = _metric_value(fundamentals, ("operating_cash_flow_3y", "cumulative_operating_cash_flow_3y"))
+            pat = _metric_value(fundamentals, ("cumulative_pat_3y", "pat_3y_cumulative"))
+            if ocf is not None and pat is not None and pat != 0:
+                ocf_pat = ocf / pat
+        _investment_check(long_checks, missing, "three_year_ocf_pat", ocf_pat >= 0.8 if ocf_pat is not None else None)
+        current_valuation = _metric_value(fundamentals, ("trailing_pe", "trailingPE", "current_pe", "pe_ratio"))
+        median_valuation = _metric_value(
+            fundamentals,
+            ("five_year_median_pe", "pe_5y_median", "price_earnings_5y_median"),
+        )
+
+    _investment_check(
+        long_checks,
+        missing,
+        "long_term_promoter_pledge",
+        pledge <= 5 if pledge is not None else None,
+    )
+    valuation_pass = (
+        current_valuation <= 1.2 * median_valuation
+        if current_valuation is not None and median_valuation is not None
+        else None
+    )
+    _investment_check(long_checks, missing, "five_year_median_valuation", valuation_pass)
+
+    def bucket_passes(checks: list[tuple[str, bool]]) -> bool:
+        return bool(checks) and sum(passed for _, passed in checks) / len(checks) >= 0.8
+
+    pass_short = bucket_passes(short_checks) and market_regime_pass is True
+    pass_long = bucket_passes(long_checks)
+    tag = (
+        "SHORT + LONG"
+        if pass_short and pass_long
+        else "SHORT-TERM"
+        if pass_short
+        else "LONG-TERM"
+        if pass_long
+        else "REJECT"
+    )
+    return {
+        "pass_short": pass_short,
+        "pass_long": pass_long,
+        "failed_short": [name for name, passed in short_checks if not passed],
+        "failed_long": [name for name, passed in long_checks if not passed],
+        "partial_data_warning": bool(missing),
+        "market_regime_warning": market_regime_pass is False,
+        "nifty_price": nifty_price,
+        "nifty_dma_200": nifty_dma_200,
+        "is_lender": is_lender,
+        "investment_tag": tag,
+        "short_checks_passed": sum(passed for _, passed in short_checks),
+        "short_checks_available": len(short_checks),
+        "long_checks_passed": sum(passed for _, passed in long_checks),
+        "long_checks_available": len(long_checks),
+        "missing_metrics": list(dict.fromkeys(missing)),
+    }
+
+
+def _investment_decision_fields(classification: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "investment_classification": dict(classification),
+        "pass_short": bool(classification.get("pass_short")),
+        "pass_long": bool(classification.get("pass_long")),
+        "failed_short": list(classification.get("failed_short") or []),
+        "failed_long": list(classification.get("failed_long") or []),
+        "partial_data_warning": bool(classification.get("partial_data_warning")),
+        "investment_tag": str(classification.get("investment_tag") or "REJECT"),
+        "is_lender": bool(classification.get("is_lender")),
+        "market_regime_warning": bool(classification.get("market_regime_warning")),
+    }
 
 
 def _normalized_key(value: Any) -> str | None:
@@ -381,15 +727,32 @@ def evaluate_jev_gatekeeper(
     tech_features: Mapping[str, Any] | None,
     fundamentals: Mapping[str, Any] | None = None,
     config: GatekeeperConfig = GatekeeperConfig(),
+    market_regime: Mapping[str, Any] | None = None,
 ) -> GatekeeperDecision:
     """Apply deterministic microstructure, trend and available-solvency gates."""
+    fundamentals = fundamentals or {}
+    investment = evaluate_investment_classification(
+        live_quote, tech_features, fundamentals, market_regime
+    )
     if not live_quote or _finite_number(live_quote.get("last_price")) is None:
         return GatekeeperDecision(
-            instrument_key, symbol, False, "REJECTED", 0.0, ["MISSING_LIVE_QUOTE"]
+            instrument_key,
+            symbol,
+            False,
+            "REJECTED",
+            0.0,
+            ["MISSING_LIVE_QUOTE"],
+            **_investment_decision_fields(investment),
         )
     if not tech_features:
         return GatekeeperDecision(
-            instrument_key, symbol, False, "REJECTED", 0.0, ["INSUFFICIENT_HISTORY"]
+            instrument_key,
+            symbol,
+            False,
+            "REJECTED",
+            0.0,
+            ["INSUFFICIENT_HISTORY"],
+            **_investment_decision_fields(investment),
         )
 
     reasons: list[str] = []
@@ -428,17 +791,20 @@ def evaluate_jev_gatekeeper(
     ):
         reasons.append(f"CHOPPY_REGIME>{config.max_choppiness_index}")
 
-    fundamentals = fundamentals or {}
     f_score = _finite_number(_fundamental_value(fundamentals, "piotroski_f_score"))
     z_score = _finite_number(_fundamental_value(fundamentals, "altman_z_score"))
     pledge = _finite_number(_fundamental_value(fundamentals, "promoter_pledge_pct"))
     if (
+        not investment["is_lender"]
+        and
         config.enable_min_piotroski_score
         and f_score is not None
         and f_score < config.min_piotroski_score
     ):
         reasons.append(f"WEAK_PIOTROSKI<{config.min_piotroski_score}")
     if (
+        not investment["is_lender"]
+        and
         config.enable_min_altman_z_score
         and z_score is not None
         and z_score < config.min_altman_z_score
@@ -460,6 +826,7 @@ def evaluate_jev_gatekeeper(
             score=0.0,
             reject_reasons=reasons,
             features=dict(tech_features),
+            **_investment_decision_fields(investment),
         )
 
     score = 50.0
@@ -492,6 +859,7 @@ def evaluate_jev_gatekeeper(
         signal_tier=tier,
         score=score,
         features=dict(tech_features),
+        **_investment_decision_fields(investment),
     )
 
 
@@ -506,6 +874,7 @@ def run_stage2_batch(
     min_avg_turnover_inr: float = 5_000_000.0,
     config: GatekeeperConfig = GatekeeperConfig(),
     session_state: MutableMapping[str, Any] | None = None,
+    market_regime: Mapping[str, Any] | None = None,
 ) -> Stage2BatchResult:
     """Run Stage 2 using caller-supplied local snapshots only.
 
@@ -554,13 +923,22 @@ def run_stage2_batch(
             quote,
             min_history_bars=config.min_history_bars,
         )
+        fundamental_snapshot = fundamentals_by_symbol.get(symbol)
+        if not isinstance(fundamental_snapshot, Mapping):
+            fundamental_snapshot = {}
+        else:
+            fundamental_snapshot = dict(fundamental_snapshot)
+        for field in ("sector", "industry"):
+            if field not in fundamental_snapshot and instrument.get(field) is not None:
+                fundamental_snapshot[field] = instrument[field]
         decision = evaluate_jev_gatekeeper(
             key,
             symbol,
             quote,
             features,
-            fundamentals_by_symbol.get(symbol),
+            fundamental_snapshot,
             config,
+            market_regime,
         )
         decisions.append(decision)
     decisions.sort(key=lambda decision: (-decision.score, decision.instrument_key))
