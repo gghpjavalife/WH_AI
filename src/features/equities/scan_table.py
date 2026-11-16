@@ -516,7 +516,7 @@ const opt=(v,l)=>`<option value="${esc(v)}">${esc(l)}</option>`;
 const INVESTMENT_LABELS={
  'SHORT-TERM':'3–12M',
  'LONG-TERM':'3Y+',
- 'SHORT + LONG':'3–12M & 3Y+',
+ 'SHORT + LONG':'3–12M / 3Y+',
  'REJECT':'REJECT'};
 const CELL={
  stock:'<input data-f="q" type="search" placeholder="Search symbol or company" aria-label="Search symbol or company">',
