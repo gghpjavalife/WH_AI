@@ -97,8 +97,8 @@ class ContextTableFilterTests(unittest.TestCase):
             assert.ok($('filt').innerHTML.includes('data-f="investment"'));
             assert.ok($('filt').innerHTML.includes('3–12M'));
             assert.ok($('filt').innerHTML.includes('3Y+'));
-            assert.ok($('body').innerHTML.includes('3–12M &amp; 3Y+') ||
-                      $('body').innerHTML.includes('3–12M & 3Y+'));
+            assert.ok($('body').innerHTML.includes('3–12M / 3Y+') ||
+                      $('body').innerHTML.includes('3–12M / 3Y+'));
             assert.deepStrictEqual(
              new Set(VIEW.rows.map(r=>r.investment_tag)),
              new Set(['SHORT-TERM','LONG-TERM','SHORT + LONG','REJECT']));
